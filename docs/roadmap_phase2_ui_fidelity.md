@@ -341,7 +341,7 @@ pub fn nudge_corner(roi: &Roi, a: Arrow, img_w: u32, img_h: u32) -> Roi;
 
 - **ゴール**: Polygon ツールでクリックごとに頂点が増え、ダブルクリックまたは始点付近クリックで閉じて `Command::MakePolygonRoi` が出る。
 - **最初に読むもの**: `PolygonRoi.java` の構築中のマウス処理（`handleMouseUp`, `addPoint`, 閉じる判定）。
-- **編集してよいファイル**: `crates/ij-app/src/tool.rs`（Polygon を有効化）, `crates/ij-app/src/app/image_window.rs`, `crates/ij-app/tests/polygon_tool_test.rs`（新規）
+- **編集してよいファイル**: `crates/ij-app/src/tool.rs`（Polygon を有効化）, `crates/ij-app/src/app/image_window.rs`, `crates/ij-app/tests/polygon_tool_test.rs`（新規）, `crates/ij-app/tests/ui_model_test.rs`, `crates/ij-app/tests/desktop_ui_test.rs`（Polygon の旧「未対応」期待値を更新）
 - **先に書くテスト**: クリック4回 + ダブルクリック → session の ROI が4頂点の多角形。その ROI で `Measure` した Area がオラクルの `makePolygon(...)` と一致（既存パリティ基盤を流用）。構築中は始点からのラバーバンドを描く。
 - **受け入れ条件**: `VERIFY_ALL_OK`。
 

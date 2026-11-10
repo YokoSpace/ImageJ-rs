@@ -1,11 +1,26 @@
 use super::*;
 use crate::roi_edit::{RoiHit, drag_handle, hit_test, move_by};
+use crate::tool::{polygon_closes_at_start, polygon_preview_segments};
 
 #[derive(Clone)]
 struct RoiDrag {
     original: Roi,
     hit: RoiHit,
     start_pixel: (i32, i32),
+}
+
+/// An in-progress Polygon tool selection. ImageJ keeps the ROI in
+/// `CONSTRUCTING` state until the user double-clicks or clicks in the start
+/// box (PolygonRoi.handleMouseUp 1073-1118); the Rust UI keeps it out of the
+/// document until then so the selection stays transient.
+#[derive(Clone, Default)]
+struct PolygonBuild {
+    vertices: Vec<(i32, i32)>,
+    cursor: Option<(i32, i32)>,
+}
+
+fn polygon_build_id(image_id: ImageId) -> egui::Id {
+    egui::Id::new(("ij_polygon_build", image_id.0))
 }
 
 impl ImageJApp {
@@ -591,6 +606,51 @@ impl ImageJApp {
             }
         }
 
+        // Polygon tool: every click appends a vertex; a double-click or a click
+        // in the 10x10 screen-pixel start box finishes the open polyline
+        // (PolygonRoi.handleMouseUp 1100-1118). Nothing is written to the
+        // document until the selection closes.
+        let build_key = polygon_build_id(image_id);
+        let mut polygon_finish: Option<Vec<(i32, i32)>> = None;
+        if tool == Tool::Polygon {
+            let mut build = ui
+                .ctx()
+                .data(|data| data.get_temp::<PolygonBuild>(build_key))
+                .unwrap_or_default();
+            if let Some(pos) = response.hover_pos().filter(|pos| img_rect.contains(*pos)) {
+                let (px, py) =
+                    view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y);
+                build.cursor = Some((px, py));
+            }
+            if response.clicked() {
+                if let Some(pos) = response
+                    .interact_pointer_pos()
+                    .filter(|pos| img_rect.contains(*pos))
+                {
+                    let rel = (pos.x - img_rect.min.x, pos.y - img_rect.min.y);
+                    let (px, py) = view.screen_to_pixel(rel.0, rel.1);
+                    let closes = build.vertices.len() >= 3
+                        && (response.double_clicked()
+                            || polygon_closes_at_start(build.vertices[0], rel, view.zoom as f32));
+                    if closes {
+                        polygon_finish = Some(build.vertices.clone());
+                    } else {
+                        build.vertices.push((px, py));
+                    }
+                    let _ = self.set_active_window(image_id);
+                }
+            }
+            if polygon_finish.is_some() {
+                ui.ctx()
+                    .data_mut(|data| data.remove::<PolygonBuild>(build_key));
+            } else {
+                ui.ctx().data_mut(|data| data.insert_temp(build_key, build));
+            }
+        } else {
+            ui.ctx()
+                .data_mut(|data| data.remove::<PolygonBuild>(build_key));
+        }
+
         // Draw active ROI overlay (classic ImageJ yellow outline)
         let stroke = Stroke::new(1.0_f32, Color32::from_rgb(255, 255, 0));
         let z = view.zoom as f32;
@@ -705,6 +765,34 @@ impl ImageJApp {
             }
         }
 
+        // Transient Polygon tool rubber band: open edges plus the live edge to
+        // the cursor, and the start box that closes the selection
+        // (PolygonRoi.draw 228, drawStartBox 190-193).
+        if tool == Tool::Polygon {
+            if let Some(build) = ui
+                .ctx()
+                .data(|data| data.get_temp::<PolygonBuild>(build_key))
+            {
+                let to_screen = |p: (i32, i32)| {
+                    Pos2::new(
+                        p.0 as f32 * z + img_rect.min.x,
+                        p.1 as f32 * z + img_rect.min.y,
+                    )
+                };
+                for (from, to) in polygon_preview_segments(&build.vertices, build.cursor) {
+                    painter.line_segment([to_screen(from), to_screen(to)], stroke);
+                }
+                if let Some(&start) = build.vertices.first() {
+                    painter.rect_stroke(
+                        Rect::from_center_size(to_screen(start), Vec2::splat(8.0)),
+                        CornerRadius::ZERO,
+                        stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            }
+        }
+
         // Put the view back into self.image_views
         self.image_views.insert(image_id, view);
 
@@ -736,6 +824,22 @@ impl ImageJApp {
                 }
             }
         }
+
+        if let Some(points) = polygon_finish {
+            let _ = self.set_active_window(image_id);
+            let _ = self.dispatch_polygon_roi(points);
+        }
+    }
+
+    /// The open rubber-band segments of the polygon currently being
+    /// constructed for `image_id`, or `None` when no polygon is in progress.
+    /// The image window paints exactly these segments while the tool is active.
+    pub fn polygon_construction_preview(
+        ctx: &egui::Context,
+        image_id: ImageId,
+    ) -> Option<Vec<((i32, i32), (i32, i32))>> {
+        ctx.data(|data| data.get_temp::<PolygonBuild>(polygon_build_id(image_id)))
+            .map(|build| polygon_preview_segments(&build.vertices, build.cursor))
     }
 }
 

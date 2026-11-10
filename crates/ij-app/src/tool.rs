@@ -80,12 +80,47 @@ impl Tool {
     pub fn is_supported(&self) -> bool {
         matches!(
             self,
-            Self::Rectangle
-                | Self::Oval
-                // Polygon is nonfunctional until click/drag vertex creation is implemented
-                | Self::Line
-                | Self::Magnifier
-                | Self::Hand
+            Self::Rectangle | Self::Oval | Self::Polygon | Self::Line | Self::Magnifier | Self::Hand
         )
     }
+}
+
+/// Open polyline segments for a polygon that is still being constructed.
+///
+/// ImageJ paints the in-progress polygon as an open polyline through the
+/// committed vertices plus the cursor position (PolygonRoi.paint, which uses
+/// `g.drawPolyline` while `state==CONSTRUCTING`, PolygonRoi.java 228).
+pub fn polygon_preview_segments(
+    vertices: &[(i32, i32)],
+    cursor: Option<(i32, i32)>,
+) -> Vec<((i32, i32), (i32, i32))> {
+    let mut segments: Vec<((i32, i32), (i32, i32))> = vertices
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .collect();
+    if let (Some(&last), Some(current)) = (vertices.last(), cursor) {
+        if current != last {
+            segments.push((last, current));
+        }
+    }
+    segments
+}
+
+/// True when a click closes a polygon by landing in the start box.
+///
+/// `handleMouseUp` accepts a 10x10 *screen* pixel box centred on the start
+/// point (`new Rectangle(screenXD(startXD)-5, screenYD(startYD)-5, 10, 10)`,
+/// PolygonRoi.java 1100) and `Rectangle.contains` is half-open, so the box
+/// covers `[-5, 5)` screen pixels around the start *regardless of zoom*.
+pub fn polygon_closes_at_start(
+    start_pixel: (i32, i32),
+    pointer_rel: (f32, f32),
+    zoom: f32,
+) -> bool {
+    if zoom <= 0.0 {
+        return false;
+    }
+    let dx = pointer_rel.0 - start_pixel.0 as f32 * zoom;
+    let dy = pointer_rel.1 - start_pixel.1 as f32 * zoom;
+    dx >= -5.0 && dx < 5.0 && dy >= -5.0 && dy < 5.0
 }
