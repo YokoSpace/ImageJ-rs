@@ -1,6 +1,8 @@
 use super::*;
 use crate::roi_edit::{RoiHit, drag_handle, hit_test, move_by};
-use crate::tool::{polygon_closes_at_start, polygon_preview_segments};
+use crate::tool::{
+    freehand_is_valid, freehand_push, polygon_closes_at_start, polygon_preview_segments,
+};
 
 #[derive(Clone)]
 struct RoiDrag {
@@ -21,6 +23,20 @@ struct PolygonBuild {
 
 fn polygon_build_id(image_id: ImageId) -> egui::Id {
     egui::Id::new(("ij_polygon_build", image_id.0))
+}
+
+/// The integer drag path of an in-progress Freehand selection.
+///
+/// ImageJ builds the polygon while the mouse is down (`FreehandRoi.grow`) and
+/// only commits it on mouse-up (`handleMouseUp` 90-96), so the Rust UI keeps
+/// the vertices transient until the drag stops.
+#[derive(Clone, Default)]
+struct FreehandBuild {
+    points: Vec<(i32, i32)>,
+}
+
+fn freehand_build_id(image_id: ImageId) -> egui::Id {
+    egui::Id::new(("ij_freehand_build", image_id.0))
 }
 
 impl ImageJApp {
@@ -498,6 +514,18 @@ impl ImageJApp {
                         }
                     }
                 }
+                if tool == Tool::Freehand {
+                    // FreehandRoi's constructor seeds the polygon with the
+                    // press point and nPoints=1 (FreehandRoi.java 10-17).
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            freehand_build_id(image_id),
+                            FreehandBuild {
+                                points: vec![(px, py)],
+                            },
+                        )
+                    });
+                }
             }
         }
 
@@ -507,6 +535,17 @@ impl ImageJApp {
                 if tool != Tool::Hand {
                     let (px, py) = view.screen_to_pixel(pos.x - rect.min.x, pos.y - rect.min.y);
                     view.drag_current_pixel = Some((px, py));
+                }
+            }
+            if tool == Tool::Freehand {
+                if let Some(curr) = view.drag_current_pixel {
+                    let mut build = ui
+                        .ctx()
+                        .data(|data| data.get_temp::<FreehandBuild>(freehand_build_id(image_id)))
+                        .unwrap_or_default();
+                    freehand_push(&mut build.points, curr, doc_w, doc_h);
+                    ui.ctx()
+                        .data_mut(|data| data.insert_temp(freehand_build_id(image_id), build));
                 }
             }
             let edit = ui
@@ -540,6 +579,7 @@ impl ImageJApp {
         }
 
         let mut drag_action = None;
+        let mut freehand_finish: Option<Vec<(i32, i32)>> = None;
         if response.drag_stopped() {
             view.is_dragging = false;
             let edit = ui.ctx().data_mut(|data| {
@@ -589,8 +629,28 @@ impl ImageJApp {
                     _ => {}
                 }
             }
+            if tool == Tool::Freehand {
+                let build = ui.ctx().data_mut(|data| {
+                    data.remove_temp::<FreehandBuild>(freehand_build_id(image_id))
+                });
+                if let Some(mut build) = build {
+                    if let Some(curr) = view.drag_current_pixel {
+                        freehand_push(&mut build.points, curr, doc_w, doc_h);
+                    }
+                    // handleMouseUp finishes the polygon, and finishPolygon
+                    // discards degenerate selections (FreehandRoi.java 90-96,
+                    // PolygonRoi.java 591-593).
+                    if freehand_is_valid(&build.points) {
+                        freehand_finish = Some(build.points);
+                    }
+                }
+            }
             view.drag_start_pixel = None;
             view.drag_current_pixel = None;
+        }
+        if tool != Tool::Freehand {
+            ui.ctx()
+                .data_mut(|data| data.remove::<FreehandBuild>(freehand_build_id(image_id)));
         }
 
         let mut was_clicked = false;
@@ -698,6 +758,27 @@ impl ImageJApp {
                             curr.1 as f32 * z + img_rect.min.y,
                         );
                         painter.line_segment([p1, p2], stroke);
+                    }
+                    Tool::Freehand => {
+                        // FreehandRoi.drawLine repaints the growing path while
+                        // the mouse is down (FreehandRoi.java 61-88).
+                        if let Some(build) = ui.ctx().data(|data| {
+                            data.get_temp::<FreehandBuild>(freehand_build_id(image_id))
+                        }) {
+                            let pts: Vec<Pos2> = build
+                                .points
+                                .iter()
+                                .map(|&(x, y)| {
+                                    Pos2::new(
+                                        x as f32 * z + img_rect.min.x,
+                                        y as f32 * z + img_rect.min.y,
+                                    )
+                                })
+                                .collect();
+                            for pair in pts.windows(2) {
+                                painter.line_segment([pair[0], pair[1]], stroke);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -826,6 +907,11 @@ impl ImageJApp {
         }
 
         if let Some(points) = polygon_finish {
+            let _ = self.set_active_window(image_id);
+            let _ = self.dispatch_polygon_roi(points);
+        }
+
+        if let Some(points) = freehand_finish {
             let _ = self.set_active_window(image_id);
             let _ = self.dispatch_polygon_roi(points);
         }

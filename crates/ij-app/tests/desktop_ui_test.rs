@@ -138,7 +138,6 @@ fn wired_session_commands_execute_and_record_macros() {
 fn unsupported_actions_guardrail() {
     // Verify that unsupported tools are correctly flagged so UI can disable them
     let unsupported_tools = [
-        Tool::Freehand,
         Tool::Polyline,
         Tool::Freeline,
         Tool::Point,

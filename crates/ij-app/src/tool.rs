@@ -80,9 +80,48 @@ impl Tool {
     pub fn is_supported(&self) -> bool {
         matches!(
             self,
-            Self::Rectangle | Self::Oval | Self::Polygon | Self::Line | Self::Magnifier | Self::Hand
+            Self::Rectangle
+                | Self::Oval
+                | Self::Polygon
+                | Self::Freehand
+                | Self::Line
+                | Self::Magnifier
+                | Self::Hand
         )
     }
+}
+
+/// Appends one freehand vertex using ImageJ's integer construction rules.
+///
+/// `FreehandRoi.grow` clamps the offscreen point to `[0, width]`/`[0, height]`
+/// (`Roi.setImage` 322-323) and appends it only when it differs from the
+/// previous vertex (FreehandRoi.java 24-33), so consecutive duplicate pixels
+/// never enter the polygon.
+pub fn freehand_push(points: &mut Vec<(i32, i32)>, point: (i32, i32), img_w: u32, img_h: u32) {
+    let ox = point.0.clamp(0, img_w as i32);
+    let oy = point.1.clamp(0, img_h as i32);
+    if points.last().copied() != Some((ox, oy)) {
+        points.push((ox, oy));
+    }
+}
+
+/// True when `finishPolygon` would keep a FreehandRoi.
+///
+/// `PolygonRoi.finishPolygon` deletes the selection when `nPoints<3` or when
+/// the polygon bounds have zero width/height (PolygonRoi.java 591-593).
+pub fn freehand_is_valid(points: &[(i32, i32)]) -> bool {
+    if points.len() < 3 {
+        return false;
+    }
+    let (mut min_x, mut max_x) = (i32::MAX, i32::MIN);
+    let (mut min_y, mut max_y) = (i32::MAX, i32::MIN);
+    for &(x, y) in points {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    max_x > min_x && max_y > min_y
 }
 
 /// Open polyline segments for a polygon that is still being constructed.
