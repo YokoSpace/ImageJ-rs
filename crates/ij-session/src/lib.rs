@@ -67,6 +67,10 @@ pub enum Command {
         min: f64,
         max: f64,
     },
+    PreviewDisplayRange {
+        min: f64,
+        max: f64,
+    },
     MakeRectRoi {
         x: i32,
         y: i32,
@@ -247,6 +251,7 @@ pub struct Session {
     pub results: ResultsTable,
     pub macro_recorder: Vec<String>,
     dirty_images: BTreeSet<ImageId>,
+    preview_display_ranges: BTreeMap<ImageId, DisplayRange>,
     /// Last TIFF path this document was opened from or successfully saved to.
     /// `FileSaver.save()` re-saves a TIFF opened from disk at this path instead
     /// of showing a Save dialog (original_imagej/ij/io/FileSaver.java 42-69).
@@ -448,10 +453,12 @@ impl Session {
                 Ok(CommandOutcome::Saved(path))
             }
             Command::SetDisplayRange { min, max } => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let preview_original = self.preview_display_ranges.remove(&id);
                 let changed = {
                     let doc = self.active_doc_mut()?;
                     let range = DisplayRange { min, max };
-                    let changed = doc.display_range != range;
+                    let changed = preview_original.unwrap_or(doc.display_range) != range;
                     doc.display_range = range;
                     changed
                 };
@@ -460,6 +467,13 @@ impl Session {
                 }
                 self.macro_recorder
                     .push(format!("setMinAndMax({min}, {max});"));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::PreviewDisplayRange { min, max } => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let original = self.images.get(&id).ok_or(SessionError::NoActiveImage)?.display_range;
+                self.preview_display_ranges.entry(id).or_insert(original);
+                self.active_doc_mut()?.display_range = DisplayRange { min, max };
                 Ok(CommandOutcome::Updated)
             }
             Command::MakeRectRoi {
@@ -914,6 +928,7 @@ impl Session {
     }
 
     pub fn close_image(&mut self, id: ImageId) -> bool {
+        self.preview_display_ranges.remove(&id);
         self.dirty_images.remove(&id);
         self.saved_tiff_paths.remove(&id);
         self.image_revisions.remove(&id);
@@ -925,6 +940,7 @@ impl Session {
     }
 
     pub fn close_all_images(&mut self) {
+        self.preview_display_ranges.clear();
         self.dirty_images.clear();
         self.saved_tiff_paths.clear();
         self.image_revisions.clear();
