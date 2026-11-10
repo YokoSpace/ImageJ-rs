@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "bc_palette.rs"]
+mod bc_palette;
+
 impl ImageJApp {
     pub fn render_dialogs(&mut self, ctx: &egui::Context) {
         if self.dialogs.show_about {
@@ -83,66 +86,7 @@ impl ImageJApp {
         }
 
         if self.dialogs.show_brightness_contrast {
-            let mut close_dialog = false;
-            let mut apply_range = None;
-            let can_bc = self
-                .active_image_id()
-                .and_then(|id| self.session.get_image(id))
-                .map(|d| !matches!(d.plane(), PixelPlane::ColorRgb(_)))
-                .unwrap_or(false);
-
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("ij_bc_dialog"),
-                egui::ViewportBuilder::default()
-                    .with_title("B&C")
-                    .with_inner_size([300.0, 170.0])
-                    .with_resizable(false),
-                |ctx, class| {
-                    let is_embedded = matches!(class, egui::ViewportClass::Embedded);
-                    if (!is_embedded && ctx.input(|i| i.viewport().close_requested()))
-                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                    {
-                        close_dialog = true;
-                    }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        if !can_bc {
-                            ui.colored_label(
-                                Color32::from_rgb(220, 80, 80),
-                                "B&C is not supported on RGB images.",
-                            );
-                            ui.separator();
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label("Minimum:");
-                            ui.add(egui::DragValue::new(&mut self.dialogs.bc_min).speed(1.0));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Maximum:");
-                            ui.add(egui::DragValue::new(&mut self.dialogs.bc_max).speed(1.0));
-                        });
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(can_bc, egui::Button::new("Apply")).clicked() {
-                                apply_range = Some((self.dialogs.bc_min, self.dialogs.bc_max));
-                            }
-                            if ui.add_enabled(can_bc, egui::Button::new("Reset")).clicked() {
-                                self.dialogs.bc_min = 0.0;
-                                self.dialogs.bc_max = 255.0;
-                                apply_range = Some((0.0, 255.0));
-                            }
-                            if ui.button("Close").clicked() {
-                                close_dialog = true;
-                            }
-                        });
-                    });
-                },
-            );
-            if let Some((min, max)) = apply_range {
-                let _ = self.set_display_range_active(min, max);
-            }
-            if close_dialog {
-                self.dialogs.show_brightness_contrast = false;
-            }
+            self.render_bc_palette(ctx);
         }
 
         if self.dialogs.show_threshold {

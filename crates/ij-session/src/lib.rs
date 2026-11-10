@@ -71,6 +71,15 @@ pub enum Command {
         min: f64,
         max: f64,
     },
+    AutoDisplayRange {
+        min: f64,
+        max: f64,
+    },
+    ResetDisplayRange {
+        min: f64,
+        max: f64,
+    },
+    ApplyDisplayLut,
     MakeRectRoi {
         x: i32,
         y: i32,
@@ -474,6 +483,47 @@ impl Session {
                 let original = self.images.get(&id).ok_or(SessionError::NoActiveImage)?.display_range;
                 self.preview_display_ranges.entry(id).or_insert(original);
                 self.active_doc_mut()?.display_range = DisplayRange { min, max };
+                Ok(CommandOutcome::Updated)
+            }
+            Command::ApplyDisplayLut => {
+                if let Some(id) = self.active_image {
+                    self.preview_display_ranges.remove(&id);
+                }
+                self.active_doc_mut()?.apply_display_lut()?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Apply LUT\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::AutoDisplayRange { min, max } => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let preview_original = self.preview_display_ranges.remove(&id);
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let range = DisplayRange { min, max };
+                    let changed = preview_original.unwrap_or(doc.display_range) != range;
+                    doc.display_range = range;
+                    changed
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push("run(\"Enhance Contrast\", \"saturated=0.35\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::ResetDisplayRange { min, max } => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let preview_original = self.preview_display_ranges.remove(&id);
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let range = DisplayRange { min, max };
+                    let changed = preview_original.unwrap_or(doc.display_range) != range;
+                    doc.display_range = range;
+                    changed
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push("resetMinAndMax();".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::MakeRectRoi {

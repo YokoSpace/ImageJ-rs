@@ -279,7 +279,7 @@ impl ImageJApp {
 
 - **ゴール**: スライダーをドラッグしている間、画像表示がフレームごとに更新される。マクロ記録はドラッグ終了時に1行だけ。
 - **最初に読むもの**: `ContrastAdjuster.java` 全体の UI 構成と 1264（`ContrastPlot`、128×64）。記録のタイミングは `Recorder.record` 呼び出し箇所を検索して確認。
-- **編集してよいファイル**: `crates/ij-session/src/lib.rs`（下記コマンド追加）, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/bc_palette.rs`（新規）, `crates/ij-app/tests/bc_palette_test.rs`（新規）
+- **編集してよいファイル**: `crates/ij-session/src/lib.rs`（下記コマンド追加）, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/bc_palette.rs`（新規）, `crates/ij-app/tests/bc_palette_test.rs`（新規）, `crates/ij-core/src/contrast.rs`, `crates/ij-core/src/lib.rs`（Auto の純粋関数）
 - **サブタスク**:
   1. `Command::PreviewDisplayRange { min, max }` を追加する。display range を変えるが、マクロ記録しない。dirty フラグも変えない。既存の `SetDisplayRange` は記録する。
   2. パレットの見た目を作る。上に A1 のヒストグラム（128×64、egui painter で縦棒）、その下に min/max の数値、4本のスライダー、`Auto` / `Reset` / `Set` / `Apply` ボタン。

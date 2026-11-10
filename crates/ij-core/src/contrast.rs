@@ -1,8 +1,149 @@
+use crate::{display_histogram, CoreError, DisplayRange, ImageDocument, PixelPlane};
 use serde::{Deserialize, Serialize};
 
 /// Fixed slider range used by ImageJ 1.54u `ContrastAdjuster`
 /// (`original_imagej/ij/plugin/frame/ContrastAdjuster.java` line 33).
 pub const SLIDER_RANGE: f64 = 256.0;
+
+pub fn slider_range_for(default_min: f64, default_max: f64, min: f64, max: f64) -> i32 {
+    let value_range = (default_max - default_min) as i32;
+    let mut slider_range = value_range;
+    if slider_range > 640 && slider_range < 1280 {
+        slider_range /= 2;
+    } else if slider_range >= 1280 {
+        slider_range /= 5;
+    }
+    slider_range = slider_range.clamp(256, 1024);
+    if value_range >= 1280 && value_range != 0 && (max - min) / (value_range as f64) < 0.25 {
+        slider_range = (slider_range as f64 * 1.6666) as i32;
+    }
+    slider_range
+}
+
+pub fn default_contrast_range(doc: &ImageDocument) -> DisplayRange {
+    match doc.plane() {
+        PixelPlane::Gray16(pixels) => {
+            let min = pixels.iter().copied().min().unwrap_or(0) as f64;
+            let max = pixels.iter().copied().max().unwrap_or(0) as f64;
+            DisplayRange { min, max }
+        }
+        PixelPlane::Gray32(pixels) => {
+            let mut min = f64::MAX;
+            let mut max = -f64::MAX;
+            for &pixel in pixels {
+                if pixel.is_finite() {
+                    min = min.min(pixel as f64);
+                    max = max.max(pixel as f64);
+                }
+            }
+            DisplayRange { min, max }
+        }
+        _ => DisplayRange {
+            min: 0.0,
+            max: 255.0,
+        },
+    }
+}
+
+/// Returns the range selected by one B&C Auto click and the next threshold state.
+/// `None` means ImageJ takes the Reset branch.
+pub fn auto_contrast_range(
+    doc: &ImageDocument,
+    previous_threshold: u32,
+) -> (Option<DisplayRange>, u32) {
+    let histogram = display_histogram(doc);
+    let pixel_count: u64 = histogram.counts.iter().sum();
+    let next_threshold = if previous_threshold < 10 {
+        5000
+    } else {
+        previous_threshold / 2
+    };
+    let threshold = pixel_count / u64::from(next_threshold);
+    let limit = pixel_count / 10;
+    let eligible = |count: u64| count <= limit && count > threshold;
+    let hmin = histogram.counts.iter().position(|&count| eligible(count));
+    let hmax = histogram.counts.iter().rposition(|&count| eligible(count));
+    let (Some(hmin), Some(hmax)) = (hmin, hmax) else {
+        return (None, next_threshold);
+    };
+    if hmax < hmin {
+        return (None, next_threshold);
+    }
+    let bin_size = match doc.plane() {
+        PixelPlane::Gray16(_) => (histogram.hmax - histogram.hmin + 1.0) / 256.0,
+        PixelPlane::Gray32(_) => (histogram.hmax - histogram.hmin) / 256.0,
+        _ => 1.0,
+    };
+    let mut min = histogram.hmin + hmin as f64 * bin_size;
+    let mut max = histogram.hmin + hmax as f64 * bin_size;
+    if min == max {
+        min = histogram.hmin;
+        max = histogram.hmax;
+    }
+    (Some(DisplayRange { min, max }), next_threshold)
+}
+
+impl ImageDocument {
+    /// Applies the current 8-bit display range to pixels in the active ROI.
+    pub fn apply_display_lut(&mut self) -> Result<(), CoreError> {
+        if !matches!(
+            self.plane(),
+            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. }
+        ) {
+            let pixel_type = match self.plane() {
+                PixelPlane::Gray16(_) => "16-bit",
+                PixelPlane::Gray32(_) => "32-bit",
+                PixelPlane::ColorRgb(_) => "RGB",
+                _ => unreachable!(),
+            };
+            return Err(CoreError::UnsupportedFilter {
+                filter: "Apply LUT",
+                pixel_type,
+            });
+        }
+        let width = self.width;
+        let height = self.height;
+        let (rx, ry, rw, rh, mask) = match self.roi.as_ref().filter(|roi| roi.is_area()) {
+            Some(roi) => {
+                let (x, y, w, h) = roi.clipped_bounds(width, height).unwrap_or((0, 0, 0, 0));
+                (x, y, w, h, roi.raster_mask(width, height)?)
+            }
+            None => (0, 0, width, height, None),
+        };
+        let min = self.display_range.min as i32;
+        let max = self.display_range.max as i32;
+        let mut table = [0u8; 256];
+        for (i, output) in table.iter_mut().enumerate() {
+            let value = i as i32;
+            *output = if value <= min {
+                0
+            } else if value >= max {
+                255
+            } else {
+                (((value - min) as f64 / (max - min) as f64) * 256.0) as u8
+            };
+        }
+        self.snapshot = Some(self.slices.clone());
+        let pixels = match self.plane_mut() {
+            PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => pixels,
+            _ => unreachable!(),
+        };
+        for y in ry..ry + rh {
+            for x in rx..rx + rw {
+                if mask.as_ref().is_some_and(|mask| !mask.contains(x, y)) {
+                    continue;
+                }
+                let index = (y * width + x) as usize;
+                pixels[index] = table[pixels[index] as usize];
+            }
+        }
+        self.display_range = DisplayRange {
+            min: 0.0,
+            max: 255.0,
+        };
+        Ok(())
+    }
+}
 
 /// State of Brightness & Contrast display range adjustments, matching ImageJ 1.54u
 /// `ContrastAdjuster` (`original_imagej/ij/plugin/frame/ContrastAdjuster.java`).
@@ -12,6 +153,7 @@ pub struct ContrastState {
     pub default_max: f64,
     pub min: f64,
     pub max: f64,
+    pub slider_range: f64,
 }
 
 impl ContrastState {
@@ -22,6 +164,7 @@ impl ContrastState {
             default_max,
             min,
             max,
+            slider_range: SLIDER_RANGE,
         }
     }
 
@@ -32,7 +175,13 @@ impl ContrastState {
             default_max,
             min: default_min,
             max: default_max,
+            slider_range: SLIDER_RANGE,
         }
+    }
+
+    pub fn with_slider_range(mut self, slider_range: i32) -> Self {
+        self.slider_range = slider_range as f64;
+        self
     }
 
     /// Sets the current display range directly (`ContrastAdjuster.java` line 432: `setMinAndMax`).
@@ -44,7 +193,7 @@ impl ContrastState {
     /// Adjusts the minimum slider value (`ContrastAdjuster.java` lines 541-553: `adjustMin`).
     pub fn adjust_min(&mut self, minvalue: f64) {
         let range = self.default_max - self.default_min;
-        self.min = self.default_min + minvalue * range / (SLIDER_RANGE - 1.0);
+        self.min = self.default_min + minvalue * range / (self.slider_range - 1.0);
         if self.max > self.default_max {
             self.max = self.default_max;
         }
@@ -56,7 +205,7 @@ impl ContrastState {
     /// Adjusts the maximum slider value (`ContrastAdjuster.java` lines 555-568: `adjustMax`).
     pub fn adjust_max(&mut self, maxvalue: f64) {
         let range = self.default_max - self.default_min;
-        self.max = self.default_min + maxvalue * range / (SLIDER_RANGE - 1.0);
+        self.max = self.default_min + maxvalue * range / (self.slider_range - 1.0);
         if self.min < self.default_min {
             self.min = self.default_min;
         }
@@ -68,7 +217,7 @@ impl ContrastState {
     /// Adjusts brightness slider value (`ContrastAdjuster.java` lines 579-589: `adjustBrightness`).
     pub fn adjust_brightness(&mut self, bvalue: f64) {
         let range = self.default_max - self.default_min;
-        let center = self.default_min + range * ((SLIDER_RANGE - bvalue) / SLIDER_RANGE);
+        let center = self.default_min + range * ((self.slider_range - bvalue) / self.slider_range);
         let width = self.max - self.min;
         self.min = center - width / 2.0;
         self.max = center + width / 2.0;
@@ -78,11 +227,11 @@ impl ContrastState {
     pub fn adjust_contrast(&mut self, cvalue: f64) {
         let center = self.min + (self.max - self.min) / 2.0;
         let range = self.default_max - self.default_min;
-        let mid = SLIDER_RANGE / 2.0;
+        let mid = self.slider_range / 2.0;
         let slope = if cvalue <= mid {
             cvalue / mid
         } else {
-            mid / (SLIDER_RANGE - cvalue)
+            mid / (self.slider_range - cvalue)
         };
         if slope > 0.0 {
             self.min = center - (0.5 * range) / slope;
@@ -109,7 +258,7 @@ impl ContrastState {
             if v > self.default_max {
                 v = self.default_max;
             }
-            ((v - self.default_min) * (SLIDER_RANGE - 1.0) / range) as i32
+            ((v - self.default_min) * (self.slider_range - 1.0) / range) as i32
         };
 
         let min_pos = scale_down(self.min);
@@ -118,14 +267,14 @@ impl ContrastState {
         // ContrastAdjuster.java lines 500-502: brightness
         let level = self.min + (self.max - self.min) / 2.0;
         let normalized_level = 1.0 - (level - self.default_min) / range;
-        let brightness_pos = (normalized_level * SLIDER_RANGE) as i32;
+        let brightness_pos = (normalized_level * self.slider_range) as i32;
 
         // ContrastAdjuster.java lines 487-491: contrast
-        let mid = SLIDER_RANGE / 2.0;
+        let mid = self.slider_range / 2.0;
         let span = self.max - self.min;
         let mut contrast = (range / span) * mid;
         if contrast > mid {
-            contrast = SLIDER_RANGE - (span / range) * mid;
+            contrast = self.slider_range - (span / range) * mid;
         }
         let contrast_pos = contrast as i32;
 
@@ -197,7 +346,30 @@ mod tests {
 
         // The same Java expressions produce NaN when both defaults are zero;
         // Java's `(int)Double.NaN` conversion yields zero for each slider.
-        assert_eq!(ContrastState::with_defaults(0.0, 0.0).slider_positions(), [0; 4]);
+        assert_eq!(
+            ContrastState::with_defaults(0.0, 0.0).slider_positions(),
+            [0; 4]
+        );
+    }
+
+    #[test]
+    fn table_test_dynamic_slider_range() {
+        // ContrastAdjuster.java lines 383-397, including Java's integer truncation.
+        assert_eq!(slider_range_for(0.0, 255.0, 0.0, 255.0), 256);
+        assert_eq!(slider_range_for(0.0, 4095.0, 0.0, 4095.0), 819);
+        assert_eq!(slider_range_for(0.0, 4095.0, 1000.0, 2000.0), 1364);
+    }
+
+    #[test]
+    fn auto_click_threshold_halves_then_resets() {
+        // ContrastAdjuster.java lines 845-849.
+        let doc = ImageDocument::new_ramp_8bit("auto", 16, 16).unwrap();
+        let (_, first) = auto_contrast_range(&doc, 0);
+        let (_, second) = auto_contrast_range(&doc, first);
+        let (_, third) = auto_contrast_range(&doc, second);
+        assert_eq!([first, second, third], [5000, 2500, 1250]);
+        assert_eq!(auto_contrast_range(&doc, 10).1, 5);
+        assert_eq!(auto_contrast_range(&doc, 5).1, 5000);
     }
 
     #[test]
