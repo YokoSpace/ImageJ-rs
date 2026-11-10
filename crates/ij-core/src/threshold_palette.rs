@@ -134,14 +134,11 @@ pub fn scale_down(
 /// Scales a slider position in 0-255 to the actual pixel value without full-range snaps.
 /// Parity reference: `original_imagej/ij/plugin/frame/ThresholdAdjuster.java` lines 583-590 (`scaleUp`).
 pub fn scale_up(
-    bit_depth: u8,
+    _bit_depth: u8,
     display_min: f64,
     display_max: f64,
     slider_val: f64,
 ) -> Option<f64> {
-    if bit_depth == 8 {
-        return Some(slider_val.clamp(0.0, 255.0));
-    }
     if display_max > display_min {
         Some(display_min + (slider_val / 255.0) * (display_max - display_min))
     } else {
@@ -256,7 +253,7 @@ pub fn format_threshold_label(value: f64, is_signed_16bit_or_uncalibrated: bool)
     } else if value >= FLOAT_POS_LIMIT {
         "1e30".to_string()
     } else if (value == (value as i64) as f64 && value.abs() < 1e6) || is_signed_16bit_or_uncalibrated {
-        format!("{:.0}", value)
+        format!("{:.0}", value.round())
     } else {
         let abs_x = value.abs();
         let mut digits = if abs_x < 10.0 {
@@ -376,6 +373,10 @@ mod tests {
         // ThresholdAdjuster.java lines 583-590 (scaleUp):
         // Does not snap 0 / 255 to full range limits
         assert_eq!(scale_up(8, 0.0, 255.0, 128.0), Some(128.0));
+        // ThresholdAdjuster.java lines 583-590 also scale ByteProcessor values
+        // against a non-default B&C display range.
+        assert_eq!(scale_up(8, 20.0, 200.0, 0.0), Some(20.0));
+        assert_eq!(scale_up(8, 20.0, 200.0, 255.0), Some(200.0));
         assert_eq!(scale_up(16, 1000.0, 5000.0, 0.0), Some(1000.0));
         assert_eq!(scale_up(16, 1000.0, 5000.0, 255.0), Some(5000.0));
         assert_eq!(scale_up(32, 0.0, 10.0, 0.0), Some(0.0));
@@ -448,6 +449,8 @@ mod tests {
         assert_eq!(format_threshold_label(1e30, false), "1e30");
         assert_eq!(format_threshold_label(100.0, false), "100");
         assert_eq!(format_threshold_label(42.0, true), "42");
+        // ResultsTable.java line 962 sets HALF_UP for zero-decimal formatting.
+        assert_eq!(format_threshold_label(2.5, true), "3");
         assert_eq!(format_threshold_label(3.14159, false), "3.1416");
         assert_eq!(format_threshold_label(-3.14159, false), "-3.142");
         assert_eq!(format_threshold_label(42.5678, false), "42.568");
