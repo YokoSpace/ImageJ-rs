@@ -1,4 +1,5 @@
 use super::*;
+use crate::action::AppAction;
 
 impl ImageJApp {
     /// Handles keyboard shortcuts targeted at a specific image window.
@@ -24,7 +25,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::CTRL, egui::Key::Q)
         });
         if quit {
-            self.request_quit();
+            self.perform(AppAction::Quit, ctx);
             return;
         }
 
@@ -37,9 +38,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::SHIFT, egui::Key::W)
         });
         if close_all {
-            if self.open_window_count() > 0 {
-                self.request_close_all();
-            }
+            self.perform(AppAction::CloseAll, ctx);
             return;
         }
 
@@ -50,7 +49,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::W)
         });
         if close {
-            self.request_close_window(target_id);
+            self.perform(AppAction::CloseImage(target_id), ctx);
             return;
         }
 
@@ -62,7 +61,7 @@ impl ImageJApp {
         });
         if undo {
             let _ = self.set_active_window(target_id);
-            let _ = self.undo_active();
+            self.perform(AppAction::Undo, ctx);
             return;
         }
 
@@ -76,7 +75,7 @@ impl ImageJApp {
         });
         if invert {
             let _ = self.set_active_window(target_id);
-            let _ = self.invert_active();
+            self.perform(AppAction::Invert, ctx);
             return;
         }
 
@@ -88,7 +87,7 @@ impl ImageJApp {
         });
         if measure {
             let _ = self.set_active_window(target_id);
-            let _ = self.measure_active();
+            self.perform(AppAction::Measure, ctx);
             return;
         }
 
@@ -102,7 +101,7 @@ impl ImageJApp {
         });
         if select_none {
             let _ = self.set_active_window(target_id);
-            let _ = self.clear_roi();
+            self.perform(AppAction::SelectNone, ctx);
             return;
         }
 
@@ -116,9 +115,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Equals)
         });
         if zoom_in {
-            if let Some(view) = self.image_views.get_mut(&target_id) {
-                view.zoom_in();
-            }
+            self.perform(AppAction::ZoomIn(target_id), ctx);
             return;
         }
 
@@ -129,9 +126,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Minus)
         });
         if zoom_out {
-            if let Some(view) = self.image_views.get_mut(&target_id) {
-                view.zoom_out();
-            }
+            self.perform(AppAction::ZoomOut(target_id), ctx);
             return;
         }
 
@@ -147,14 +142,7 @@ impl ImageJApp {
                 || (!has_roi && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight))
         });
         if next_slice {
-            if let Some(doc) = self.session.get_image(target_id) {
-                let sz = doc.stack_size();
-                let cur = doc.current_slice;
-                if sz > 1 && (cur as usize) < sz {
-                    let _ = self.set_active_window(target_id);
-                    let _ = self.set_slice_active((cur + 1) as i32);
-                }
-            }
+            self.perform(AppAction::NextSlice(target_id), ctx);
             return;
         }
 
@@ -163,14 +151,7 @@ impl ImageJApp {
                 || (!has_roi && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft))
         });
         if prev_slice {
-            if let Some(doc) = self.session.get_image(target_id) {
-                let sz = doc.stack_size();
-                let cur = doc.current_slice;
-                if sz > 1 && cur > 1 {
-                    let _ = self.set_active_window(target_id);
-                    let _ = self.set_slice_active((cur - 1) as i32);
-                }
-            }
+            self.perform(AppAction::PreviousSlice(target_id), ctx);
         }
     }
 
@@ -191,7 +172,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::CTRL, egui::Key::Q)
         });
         if quit {
-            self.request_quit();
+            self.perform(AppAction::Quit, ctx);
             return;
         }
 
@@ -204,9 +185,7 @@ impl ImageJApp {
                 || i.consume_key(egui::Modifiers::SHIFT, egui::Key::W)
         });
         if close_all {
-            if self.open_window_count() > 0 {
-                self.request_close_all();
-            }
+            self.perform(AppAction::CloseAll, ctx);
             return;
         }
 
@@ -215,5 +194,4 @@ impl ImageJApp {
             self.handle_image_shortcuts(ctx, active_id);
         }
     }
-
 }
