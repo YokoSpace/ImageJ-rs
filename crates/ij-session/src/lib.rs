@@ -160,6 +160,11 @@ pub enum Command {
         lower: f64,
         upper: f64,
     },
+    /// Numeric Set button in the threshold palette.
+    SetThreshold {
+        lower: f64,
+        upper: f64,
+    },
     /// `resetThreshold()` / ThresholdAdjuster's Reset button. Clears the
     /// active threshold without touching pixels.
     ResetThreshold,
@@ -796,7 +801,21 @@ impl Session {
             }
             Command::PreviewThreshold { lower, upper } => {
                 self.active_doc_mut()?.threshold = Some(ThresholdLevels { lower, upper });
-                Ok(CommandOutcome::Thresholded(ThresholdLevels { lower, upper }))
+                Ok(CommandOutcome::Thresholded(ThresholdLevels {
+                    lower,
+                    upper,
+                }))
+            }
+            Command::SetThreshold { lower, upper } => {
+                let upper = upper.max(lower);
+                let levels = ThresholdLevels { lower, upper };
+                self.active_doc_mut()?.threshold = Some(levels);
+                self.macro_recorder.push(format!(
+                    "setThreshold({}, {}, \"raw\");",
+                    ij_core::format_ij_num(lower),
+                    ij_core::format_ij_num(upper)
+                ));
+                Ok(CommandOutcome::Thresholded(levels))
             }
             Command::AutoThreshold {
                 method,

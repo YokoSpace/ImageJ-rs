@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "bc_palette.rs"]
 mod bc_palette;
+#[path = "threshold_palette.rs"]
+mod threshold_palette;
 
 impl ImageJApp {
     pub fn render_dialogs(&mut self, ctx: &egui::Context) {
@@ -90,111 +92,7 @@ impl ImageJApp {
         }
 
         if self.dialogs.show_threshold {
-            let mut close_dialog = false;
-            let mut apply_thresh = None;
-            let mut reset_thresh = false;
-            let threshold_target = self
-                .active_image_id()
-                .and_then(|id| self.session.get_image(id))
-                .map(|d| {
-                    (
-                        matches!(d.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_))
-                            && d.stack_size() == 1,
-                        matches!(d.plane(), PixelPlane::Gray16(_)),
-                    )
-                })
-                .unwrap_or((false, false));
-            let can_thresh = threshold_target.0;
-            let is_16bit = threshold_target.1;
-            if !is_16bit {
-                // ImageJ only shows the "16-bit histogram" checkbox for
-                // 16-bit images (ThresholdAdjuster.java lines 502-503).
-                self.dialogs.threshold_16bit = false;
-            }
-
-            ctx.show_viewport_immediate(
-                egui::ViewportId::from_hash_of("ij_threshold_dialog"),
-                egui::ViewportBuilder::default()
-                    .with_title("Threshold")
-                    .with_inner_size([320.0, 210.0])
-                    .with_resizable(false),
-                |ctx, class| {
-                    let is_embedded = matches!(class, egui::ViewportClass::Embedded);
-                    if (!is_embedded && ctx.input(|i| i.viewport().close_requested()))
-                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-                    {
-                        close_dialog = true;
-                    }
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        if !can_thresh {
-                            ui.colored_label(
-                                Color32::from_rgb(220, 80, 80),
-                                "Requires single-slice 8-bit or 16-bit grayscale image.",
-                            );
-                            ui.separator();
-                        }
-                        ui.horizontal(|ui| {
-                            ui.label("Method:");
-                            egui::ComboBox::from_id_salt("thresh_method")
-                                .selected_text(&self.dialogs.threshold_method)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(
-                                        &mut self.dialogs.threshold_method,
-                                        "IsoData".into(),
-                                        "IsoData",
-                                    );
-                                    ui.selectable_value(
-                                        &mut self.dialogs.threshold_method,
-                                        "Otsu".into(),
-                                        "Otsu",
-                                    );
-                                });
-                        });
-                        ui.checkbox(&mut self.dialogs.threshold_dark_bg, "Dark background");
-                        ui.add_enabled(
-                            is_16bit,
-                            egui::Checkbox::new(
-                                &mut self.dialogs.threshold_16bit,
-                                "16-bit histogram",
-                            ),
-                        )
-                        .on_disabled_hover_text(
-                            "The 16-bit histogram option requires a 16-bit image",
-                        );
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(can_thresh, egui::Button::new("Apply"))
-                                .clicked()
-                            {
-                                apply_thresh = Some((
-                                    self.dialogs.threshold_method.clone(),
-                                    self.dialogs.threshold_dark_bg,
-                                    self.dialogs.threshold_16bit && is_16bit,
-                                ));
-                            }
-                            if ui
-                                .add_enabled(can_thresh, egui::Button::new("Reset"))
-                                .clicked()
-                            {
-                                reset_thresh = true;
-                            }
-                            if ui.button("Close").clicked() {
-                                close_dialog = true;
-                            }
-                        });
-                    });
-                },
-            );
-            if let Some((method, dark, histogram_16)) = apply_thresh {
-                let _ = self.auto_threshold_active_with_options(&method, dark, histogram_16);
-            }
-            if reset_thresh {
-                let _ = self.reset_threshold_active();
-            }
-            if close_dialog {
-                self.dialogs.show_threshold = false;
-            }
+            self.render_threshold_palette(ctx);
         }
 
         // "Process Stack?" decision, matching IJ.setupDialog. Yes is offered
@@ -654,5 +552,4 @@ impl ImageJApp {
 
         self.render_plugin_browser_window(ctx);
     }
-
 }
