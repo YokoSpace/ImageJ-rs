@@ -1,6 +1,11 @@
+pub mod contrast;
 pub mod filters;
 pub mod histogram;
 
+pub use contrast::{
+    adjust_brightness, adjust_contrast, adjust_max, adjust_min, reset, set_min_and_max,
+    slider_positions, ContrastState, SLIDER_RANGE,
+};
 pub use filters::{AutoThresholdMethod, RankFilterKind};
 pub use histogram::{display_histogram, DisplayHistogram};
 
