@@ -913,7 +913,13 @@ impl ImageJApp {
 
         if let Some(points) = freehand_finish {
             let _ = self.set_active_window(image_id);
-            let _ = self.dispatch_polygon_roi(points);
+            match self.session.dispatch(Command::MakeFreehandRoi { points }) {
+                Ok(_) => self.status_message = "Freehand ROI created".into(),
+                Err(error) => {
+                    self.status_message = format!("Freehand ROI failed: {error}");
+                    self.dialogs.last_error = Some(self.status_message.clone());
+                }
+            }
         }
     }
 

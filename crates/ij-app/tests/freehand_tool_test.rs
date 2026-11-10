@@ -170,6 +170,7 @@ fn freehand_drag_builds_integer_polygon_with_oracle_area() {
     let ctx = Context::default();
     let mut app = ImageJApp::new();
     let id = app.open_ramp_8bit("freehand", 100, 100).unwrap();
+    let records_before = app.session.macro_recorder.len();
     let image = canvas(&mut app, &ctx, id);
 
     let path = [(10, 10), (30, 12), (45, 30), (35, 50), (12, 40)];
@@ -184,6 +185,10 @@ fn freehand_drag_builds_integer_polygon_with_oracle_area() {
 
     let stats = app.session.get_image(id).unwrap().measure().unwrap();
     assert_eq!(format_ij_num(stats.area), oracle_freehand_area(&path));
+    // PolygonRoi.finishPolygon records user-created POLYGON but not FREEROI
+    // (PolygonRoi.java:594-596).
+    assert_eq!(app.session.macro_recorder.len(), records_before);
+    assert_eq!(app.status_message, "Freehand ROI created");
 }
 
 #[test]

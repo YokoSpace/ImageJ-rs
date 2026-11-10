@@ -349,7 +349,7 @@ pub fn nudge_corner(roi: &Roi, a: Arrow, img_w: u32, img_h: u32) -> Roi;
 
 - **ゴール**: ドラッグ軌跡が整数座標の多角形 ROI になり、計測がオラクルの `makeSelection("freehand", xs, ys)` と一致する。
 - **注意**: 1.54u の freehand がサブピクセル座標を使うかを `Prefs.subPixelResolution` と `PolygonRoi` で確認すること。連続重複点は除く。
-- **編集してよいファイル**: `tool.rs`, `app/image_window.rs`, `crates/ij-app/tests/freehand_tool_test.rs`（新規）, `crates/ij-app/tests/desktop_ui_test.rs`（Freehand の旧「未対応」期待値を更新）
+- **編集してよいファイル**: `tool.rs`, `app/image_window.rs`, `crates/ij-app/tests/freehand_tool_test.rs`（新規）, `crates/ij-app/tests/desktop_ui_test.rs`（Freehand の旧「未対応」期待値を更新）, `crates/ij-session/src/lib.rs`（Freehand 固有のマクロ記録規則）
 
 ### R5 Wand ツール 🟡
 

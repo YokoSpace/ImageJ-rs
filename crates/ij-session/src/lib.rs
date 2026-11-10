@@ -95,6 +95,11 @@ pub enum Command {
     MakePolygonRoi {
         points: Vec<(i32, i32)>,
     },
+    /// User-drawn freehand selection. It shares polygon geometry, but ImageJ
+    /// does not record FREEROI construction (PolygonRoi.java:594-596).
+    MakeFreehandRoi {
+        points: Vec<(i32, i32)>,
+    },
     MakeLineRoi {
         x1: i32,
         y1: i32,
@@ -590,6 +595,18 @@ impl Session {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.macro_recorder.push(format!("makePolygon({coords});"));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MakeFreehandRoi { points } => {
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let before = doc.roi.clone();
+                    doc.set_polygon_roi(&points)?;
+                    doc.roi != before
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
                 Ok(CommandOutcome::Updated)
             }
             Command::MakeLineRoi { x1, y1, x2, y2 } => {
