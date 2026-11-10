@@ -45,8 +45,8 @@ pub fn display_histogram(doc: &ImageDocument) -> DisplayHistogram {
             },
             PixelPlane::Gray32(_) => DisplayHistogram {
                 counts: [0; 256],
-                hmin: 0.0,
-                hmax: 0.0,
+                hmin: f64::MAX,
+                hmax: -f64::MAX,
             },
             _ => DisplayHistogram {
                 counts: [0; 256],
@@ -137,7 +137,7 @@ pub fn display_histogram(doc: &ImageDocument) -> DisplayHistogram {
                     }
                     let idx = (y * width + x) as usize;
                     let v = pixels[idx] as f64;
-                    if !v.is_nan() {
+                    if v.is_finite() {
                         if v < min {
                             min = v;
                         }
@@ -151,8 +151,8 @@ pub fn display_histogram(doc: &ImageDocument) -> DisplayHistogram {
             if !has_pixel {
                 return DisplayHistogram {
                     counts: [0; 256],
-                    hmin: 0.0,
-                    hmax: 0.0,
+                    hmin: f64::MAX,
+                    hmax: -f64::MAX,
                 };
             }
             let hist_min = min;
@@ -167,7 +167,7 @@ pub fn display_histogram(doc: &ImageDocument) -> DisplayHistogram {
                         }
                         let idx = (y * width + x) as usize;
                         let v = pixels[idx] as f64;
-                        if !v.is_nan() && v >= hist_min && v <= hist_max {
+                        if v.is_finite() && v >= hist_min && v <= hist_max {
                             total += 1;
                         }
                     }
@@ -183,7 +183,7 @@ pub fn display_histogram(doc: &ImageDocument) -> DisplayHistogram {
                         }
                         let idx = (y * width + x) as usize;
                         let v = pixels[idx] as f64;
-                        if !v.is_nan() && v >= hist_min && v <= hist_max {
+                        if v.is_finite() && v >= hist_min && v <= hist_max {
                             let mut index = (scale * (v - hist_min)) as usize;
                             if index >= 256 {
                                 index = 255;
@@ -260,6 +260,29 @@ mod tests {
         }));
         let with_line = display_histogram(&doc);
         assert_eq!(full, with_line);
+    }
+
+    #[test]
+    fn display_histogram_float_excludes_nonfinite_values() {
+        // FloatStatistics.java lines 24-30 bound measurements to +/-Float.MAX_VALUE.
+        let doc = ImageDocument::new(
+            "nonfinite",
+            4,
+            1,
+            PixelPlane::Gray32(vec![1.0, 2.0, f32::INFINITY, f32::NAN]),
+        )
+        .unwrap();
+        let hist = display_histogram(&doc);
+        assert_eq!(hist.hmin, 1.0);
+        assert_eq!(hist.hmax, 2.0);
+        assert_eq!(hist.counts.iter().sum::<u64>(), 2);
+
+        let all_nan = ImageDocument::new("nan", 1, 1, PixelPlane::Gray32(vec![f32::NAN]))
+            .unwrap();
+        let empty = display_histogram(&all_nan);
+        assert_eq!(empty.hmin, f64::MAX);
+        assert_eq!(empty.hmax, -f64::MAX);
+        assert_eq!(empty.counts.iter().sum::<u64>(), 0);
     }
 }
 

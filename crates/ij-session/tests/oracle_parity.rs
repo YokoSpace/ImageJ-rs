@@ -8916,4 +8916,23 @@ fn parity_display_histogram_8bit_oval_roi_matches_java_oracle() {
     );
 }
 
+#[test]
+fn parity_display_histogram_32bit_nonfinite_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new(
+        "nonfinite",
+        4,
+        1,
+        PixelPlane::Gray32(vec![1.0, 2.0, f32::INFINITY, f32::NAN]),
+    )
+    .unwrap();
+    let oracle = bridge
+        .run_macro_on_image(&doc, "getHistogram(values, counts, 256); print('HIST'); Array.print(counts);")
+        .unwrap();
+    let hist = display_histogram(&doc);
+    assert_eq!(hist.hmin, 1.0);
+    assert_eq!(hist.hmax, 2.0);
+    assert_eq!(&hist.counts[..], oracle_histogram(&oracle.stdout).as_slice());
+}
+
 
