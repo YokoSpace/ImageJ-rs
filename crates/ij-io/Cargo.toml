@@ -1,0 +1,10 @@
+[package]
+name = "ij-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ij-core = { path = "../ij-core" }
+serde.workspace = true
+thiserror.workspace = true

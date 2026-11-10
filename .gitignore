@@ -1,0 +1,12 @@
+.DS_Store
+/target/
+/tools/oracle/.build/
+/tools/oracle/ij-oracle.jar
+/tools/oracle/java-applet-shim.jar
+/tools/oracle/.build_stamp.json
+/tools/oracle/.oracle_build.lock
+/verification/evidence/
+__pycache__/
+*.pyc
+/tools/plugin-host/classes/
+/tools/plugin-host/fixtures/classes/
