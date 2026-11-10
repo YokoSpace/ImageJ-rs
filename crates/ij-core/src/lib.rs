@@ -579,6 +579,8 @@ pub struct ImageDocument {
     pub height: u32,
     /// Pixel planes in stack order: `slices[n-1]` is the one-based stack index n.
     pub slices: Vec<PixelPlane>,
+    /// Optional ImageJ slice labels in stack order.
+    pub slice_labels: Vec<Option<String>>,
     /// One-based dimensions matching ImagePlus.nChannels/nSlices/nFrames.
     pub n_channels: u32,
     pub n_slices: u32,
@@ -636,6 +638,7 @@ impl ImageDocument {
             }
         }
         let stack_size = slices.len() as u32;
+        let slice_labels = vec![None; slices.len()];
         let (n_channels, n_slices, n_frames) = if stack_size == 1 {
             (1, 1, 1)
         } else {
@@ -647,6 +650,7 @@ impl ImageDocument {
             width,
             height,
             slices,
+            slice_labels,
             n_channels,
             n_slices,
             n_frames,

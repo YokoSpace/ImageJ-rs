@@ -502,6 +502,59 @@ fn encode_line_roi(line: &LineRoi) -> Result<Vec<u8>, IoError> {
     Ok(out)
 }
 
+fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<u8>)>, IoError> {
+    if doc.slice_labels.len() != doc.slices.len() {
+        return Err(IoError::UnsupportedFormat(
+            "slice label count differs from stack size".into(),
+        ));
+    }
+    let has_labels = doc
+        .slice_labels
+        .iter()
+        .any(|label| label.as_ref().is_some_and(|label| !label.is_empty()));
+    let roi = doc.roi.as_ref().map(encode_roi_metadata).transpose()?;
+    if !has_labels && roi.is_none() {
+        return Ok(None);
+    }
+    let types = u32::from(has_labels) + u32::from(roi.is_some());
+    let header_size = 4 + types * 8;
+    let mut counts = Vec::new();
+    counts.extend_from_slice(&header_size.to_le_bytes());
+    let mut data = Vec::new();
+    data.extend_from_slice(&META_MAGIC.to_le_bytes());
+    if has_labels {
+        data.extend_from_slice(&META_LABELS.to_le_bytes());
+        data.extend_from_slice(&(doc.slice_labels.len() as u32).to_le_bytes());
+    }
+    if roi.is_some() {
+        data.extend_from_slice(&META_ROI.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+    }
+    let mut payload = Vec::new();
+    if has_labels {
+        for label in &doc.slice_labels {
+            let encoded: Vec<u16> = label.as_deref().unwrap_or("").encode_utf16().collect();
+            let byte_len = encoded
+                .len()
+                .checked_mul(2)
+                .and_then(|len| u32::try_from(len).ok())
+                .ok_or_else(|| IoError::TooLarge("slice label exceeds TIFF limits".into()))?;
+            counts.extend_from_slice(&byte_len.to_le_bytes());
+            for unit in encoded {
+                payload.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+    }
+    if let Some(roi) = roi {
+        let byte_len = u32::try_from(roi.len())
+            .map_err(|_| IoError::TooLarge("ROI metadata exceeds TIFF limits".into()))?;
+        counts.extend_from_slice(&byte_len.to_le_bytes());
+        payload.extend_from_slice(&roi);
+    }
+    data.extend_from_slice(&payload);
+    Ok(Some((counts, data)))
+}
+
 /// Writes one uncompressed little-endian TIFF IFD per stack slice. The pixel
 /// arrays are contiguous at the start of the file and the IFD chain follows
 /// them, so ImageJ's `Opener.allSameSizeAndType` sees a contiguous stack
@@ -524,6 +577,7 @@ fn encode_line_roi(line: &LineRoi) -> Result<Vec<u8>, IoError> {
 /// - `roi`: written as an ImageJ ROI record in the private `roi ` metadata
 ///   block (FileSaver.java 117, TiffEncoder.writeMetaData 371-472) for
 ///   rectangular, oval, polygon and line selections.
+/// - `slice_labels`: written as ImageJ's UTF-16 `labl` metadata.
 ///
 /// Unsupported non-default state is rejected instead of dropped silently:
 ///
@@ -539,7 +593,7 @@ fn encode_line_roi(line: &LineRoi) -> Result<Vec<u8>, IoError> {
 ///
 /// Not part of the Rust model and therefore not written: x/y/z origins, time
 /// units/frame interval/fps/loop, y/z units, density calibration (`cf`/
-/// `vunit`), overlays, slice labels, image properties, and per-channel
+/// `vunit`), overlays, image properties, and per-channel
 /// composite display ranges/LUTs.
 pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoError> {
     let path = path.as_ref();
@@ -602,29 +656,7 @@ pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoEr
         text.push('\0');
         text.into_bytes()
     });
-    // TiffEncoder.writeMetaData stores one type code and its payload sizes in
-    // MetaDataByteCounts, then an "IJIJ" header followed by the payloads in
-    // MetaData (TiffEncoder.java 371-472). Only the ROI type is emitted here.
-    let metadata: Option<(Vec<u8>, Vec<u8>)> = doc
-        .roi
-        .as_ref()
-        .map(encode_roi_metadata)
-        .transpose()?
-        .map(|roi| -> Result<_, IoError> {
-            let roi_size = u32::try_from(roi.len()).map_err(|_| {
-                IoError::TooLarge("ROI metadata exceeds classic TIFF limits".into())
-            })?;
-            let mut counts = Vec::with_capacity(8);
-            counts.extend_from_slice(&12u32.to_le_bytes());
-            counts.extend_from_slice(&roi_size.to_le_bytes());
-            let mut data = Vec::with_capacity(12 + roi.len());
-            data.extend_from_slice(&META_MAGIC.to_le_bytes());
-            data.extend_from_slice(&META_ROI.to_le_bytes());
-            data.extend_from_slice(&1u32.to_le_bytes());
-            data.extend_from_slice(&roi);
-            Ok((counts, data))
-        })
-        .transpose()?;
+    let metadata = encode_document_metadata(doc)?;
     let scaled = calibration_is_scaled(doc);
     let num_tags: u16 = NUM_IFD_TAGS
         + u16::from(description.is_some())
@@ -1831,7 +1863,7 @@ fn read_color_map(bytes: &[u8], start: usize, le: bool) -> Result<Box<Lut256>, I
 ///
 /// Metadata that `ImageDocument` cannot represent is rejected instead of being
 /// dropped: custom channel LUTs (`luts`), non-uniform per-channel display
-/// ranges, slice labels, image Info/plot metadata, overlay/property metadata,
+/// ranges, image Info/plot metadata, overlay/property metadata,
 /// and origin/time/yunit/zunit/density calibration keys. A uniform per-channel
 /// display range is restored. A single `roi ` record is restored for rectangle,
 /// oval, polygon and line selections with exact integral coordinates; other
@@ -2667,11 +2699,31 @@ fn apply_imagej_metadata(
                 }
             }
             META_LABELS => {
-                if entry.payloads.iter().any(|payload| !payload.is_empty()) {
-                    return Err(IoError::UnsupportedFormat(
-                        "ImageJ TIFF contains slice-label metadata that ImageDocument cannot represent"
-                            .into(),
+                if entry.payloads.len() > doc.slices.len() {
+                    return Err(IoError::Malformed(
+                        "ImageJ TIFF has more slice labels than slices".into(),
                     ));
+                }
+                for (index, payload) in entry.payloads.iter().enumerate() {
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if payload.len() % 2 != 0 {
+                        return Err(IoError::Malformed(
+                            "ImageJ TIFF slice label has odd UTF-16 byte length".into(),
+                        ));
+                    }
+                    let units = payload.chunks_exact(2).map(|pair| {
+                        if le {
+                            u16::from_le_bytes([pair[0], pair[1]])
+                        } else {
+                            u16::from_be_bytes([pair[0], pair[1]])
+                        }
+                    });
+                    doc.slice_labels[index] =
+                        Some(String::from_utf16(&units.collect::<Vec<_>>()).map_err(|_| {
+                            IoError::Malformed("ImageJ TIFF slice label is invalid UTF-16".into())
+                        })?);
                 }
             }
             META_INFO => {

@@ -71,7 +71,35 @@ impl ImageView {
         let mut s = String::new();
         let stack_size = doc.stack_size();
         if stack_size > 1 {
-            s.push_str(&format!("{}/{}; ", doc.current_slice, stack_size));
+            s.push_str(&format!("{}/{}", doc.current_slice, stack_size));
+            if let Some(label) = doc
+                .slice_labels
+                .get((doc.current_slice - 1) as usize)
+                .and_then(|label| label.as_deref())
+                .and_then(|label| short_slice_label(label, 60))
+            {
+                if !label.is_empty() {
+                    s.push_str(&format!(" ({label})"));
+                }
+            }
+            s.push_str("; ");
+        } else if let Some(label) = doc
+            .slice_labels
+            .first()
+            .and_then(|label| label.as_deref())
+            .filter(|label| !label.is_empty())
+        {
+            let first_line = label
+                .split_once('\n')
+                .and_then(|(first, _)| (!first.is_empty()).then_some(first))
+                .unwrap_or(label);
+            let chars: Vec<char> = first_line.chars().collect();
+            let trimmed = strip_extension(&chars);
+            let mut label: String = trimmed.iter().take(60).collect();
+            if trimmed.len() > 60 {
+                label.push_str("...");
+            }
+            s.push_str(&format!("\"{label}\"; "));
         }
 
         let cal = &doc.calibration;
@@ -146,6 +174,25 @@ impl ImageView {
             s2.truncate(s2.len() - 2);
         }
         format!("{s2}{s3}")
+    }
+}
+
+fn short_slice_label(label: &str, max: usize) -> Option<String> {
+    let first_line = label.split('\n').next()?;
+    if label.starts_with('\n') {
+        return None;
+    }
+    let chars: Vec<char> = first_line.chars().collect();
+    let trimmed = strip_extension(&chars);
+    Some(trimmed.iter().take(max).collect())
+}
+
+fn strip_extension(chars: &[char]) -> &[char] {
+    if chars.len() > 4 && chars[chars.len() - 4] == '.' && !chars[chars.len() - 1].is_ascii_digit()
+    {
+        &chars[..chars.len() - 4]
+    } else {
+        chars
     }
 }
 

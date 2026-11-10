@@ -1,6 +1,7 @@
 use ij_app::image_view::ImageView;
 use ij_bridge::JavaOracleBridge;
-use ij_core::{Calibration, ImageDocument, Lut256, PixelPlane};
+use ij_core::{Calibration, ImageDocument, Lut256, PixelPlane, RectRoi, Roi};
+use ij_io::{load_tiff, save_tiff};
 use std::path::PathBuf;
 
 fn get_bridge() -> JavaOracleBridge {
@@ -13,6 +14,55 @@ fn get_bridge() -> JavaOracleBridge {
 }
 
 #[test]
+fn labeled_stack_tiff_subtitle_matches_imagej() {
+    let mut doc =
+        ImageDocument::new_stack("labels", 2, 2, vec![PixelPlane::Gray8(vec![0; 4]); 3]).unwrap();
+    doc.slice_labels = vec![
+        Some("first.tif\nmetadata".into()),
+        None,
+        Some("third sample.tif".into()),
+    ];
+    doc.roi = Some(Roi::Rect(RectRoi { x: 0, y: 0, width: 1, height: 1 }));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("labels.tif");
+    save_tiff(&path, &doc).unwrap();
+    let mut loaded = load_tiff(&path).unwrap();
+    assert_eq!(loaded.slice_labels, doc.slice_labels);
+    assert_eq!(loaded.roi, doc.roi);
+    assert_eq!(
+        ImageView::create_subtitle(&loaded),
+        "1/3 (first); 2x2 pixels; 8-bit; 0K"
+    );
+    loaded.set_slice(3).unwrap();
+    let rust_subtitle = ImageView::create_subtitle(&loaded);
+    let oracle = get_bridge()
+        .run_macro_on_image(
+            &loaded,
+            "setSlice(3); print(call(\"tools.oracle.UiProbe.subtitle\"));",
+        )
+        .unwrap();
+    assert_eq!(rust_subtitle, oracle.stdout.trim_end());
+}
+
+#[test]
+fn single_image_label_matches_imagej() {
+    let mut doc = ImageDocument::new_ramp_8bit("single", 2, 2).unwrap();
+    doc.slice_labels[0] = Some("sample.tif\nextra".into());
+    let rust_subtitle = ImageView::create_subtitle(&doc);
+    assert_eq!(rust_subtitle, "\"sample\"; 2x2 pixels; 8-bit; 0K");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("single.tif");
+    save_tiff(&path, &doc).unwrap();
+    let oracle = get_bridge()
+        .eval_macro(&format!(
+            "open(\"{}\"); print(call(\"tools.oracle.UiProbe.subtitle\"));",
+            path.display()
+        ))
+        .unwrap();
+    assert_eq!(rust_subtitle, oracle.stdout.trim_end());
+}
+
+#[test]
 fn uncalibrated_four_formats() {
     // 1. Gray8: 16x16 pixels; 8-bit; 0K
     let doc8 = ImageDocument::new_ramp_8bit("ramp8", 16, 16).unwrap();
@@ -20,15 +70,24 @@ fn uncalibrated_four_formats() {
 
     // 2. Gray16: 16x16 pixels; 16-bit; 1K
     let doc16 = ImageDocument::new_ramp_16bit("ramp16", 16, 16).unwrap();
-    assert_eq!(ImageView::create_subtitle(&doc16), "16x16 pixels; 16-bit; 1K");
+    assert_eq!(
+        ImageView::create_subtitle(&doc16),
+        "16x16 pixels; 16-bit; 1K"
+    );
 
     // 3. Gray32: 16x16 pixels; 32-bit; 1K
     let doc32 = ImageDocument::new_ramp_32bit("ramp32", 16, 16).unwrap();
-    assert_eq!(ImageView::create_subtitle(&doc32), "16x16 pixels; 32-bit; 1K");
+    assert_eq!(
+        ImageView::create_subtitle(&doc32),
+        "16x16 pixels; 32-bit; 1K"
+    );
 
     // 4. RGB: 16x16 pixels; RGB; 1K
     let doc_rgb = ImageDocument::new("rgb", 16, 16, PixelPlane::ColorRgb(vec![0; 256])).unwrap();
-    assert_eq!(ImageView::create_subtitle(&doc_rgb), "16x16 pixels; RGB; 1K");
+    assert_eq!(
+        ImageView::create_subtitle(&doc_rgb),
+        "16x16 pixels; RGB; 1K"
+    );
 }
 
 #[test]
@@ -36,7 +95,8 @@ fn rgb_four_byte_accounting() {
     // In ImageJ (ImagePlus.java line 1232), RGB is counted as 4 bytes per pixel.
     // 100x100 RGB is 100 * 100 * 4 = 40,000 bytes = 39.0625 KB -> 39K.
     // (If 3 bytes per pixel were used, 30,000 bytes would yield 29K).
-    let doc_rgb = ImageDocument::new("rgb100", 100, 100, PixelPlane::ColorRgb(vec![0; 10000])).unwrap();
+    let doc_rgb =
+        ImageDocument::new("rgb100", 100, 100, PixelPlane::ColorRgb(vec![0; 10000])).unwrap();
     assert_eq!(
         ImageView::create_subtitle(&doc_rgb),
         "100x100 pixels; RGB; 39K"
@@ -94,7 +154,8 @@ fn three_slice_stack() {
     let plane1 = PixelPlane::Gray8(vec![0; 10000]);
     let plane2 = PixelPlane::Gray8(vec![128; 10000]);
     let plane3 = PixelPlane::Gray8(vec![255; 10000]);
-    let mut doc = ImageDocument::new_stack("stack3", 100, 100, vec![plane1, plane2, plane3]).unwrap();
+    let mut doc =
+        ImageDocument::new_stack("stack3", 100, 100, vec![plane1, plane2, plane3]).unwrap();
 
     assert_eq!(
         ImageView::create_subtitle(&doc),
@@ -183,7 +244,8 @@ fn oracle_ui_probe_subtitle_parity() {
     assert_eq!(rust_sub, out.stdout.trim_end());
 
     // 4. RGB 100x100
-    let doc_rgb = ImageDocument::new("rgb100", 100, 100, PixelPlane::ColorRgb(vec![0; 10000])).unwrap();
+    let doc_rgb =
+        ImageDocument::new("rgb100", 100, 100, PixelPlane::ColorRgb(vec![0; 10000])).unwrap();
     let rust_sub = ImageView::create_subtitle(&doc_rgb);
     let out = bridge
         .run_macro_on_image(&doc_rgb, "print(call(\"tools.oracle.UiProbe.subtitle\"));")
@@ -209,10 +271,14 @@ fn oracle_ui_probe_subtitle_parity() {
     let plane1 = PixelPlane::Gray8(vec![0; 10000]);
     let plane2 = PixelPlane::Gray8(vec![128; 10000]);
     let plane3 = PixelPlane::Gray8(vec![255; 10000]);
-    let doc_stack = ImageDocument::new_stack("stack3", 100, 100, vec![plane1, plane2, plane3]).unwrap();
+    let doc_stack =
+        ImageDocument::new_stack("stack3", 100, 100, vec![plane1, plane2, plane3]).unwrap();
     let rust_sub = ImageView::create_subtitle(&doc_stack);
     let out = bridge
-        .run_macro_on_image(&doc_stack, "print(call(\"tools.oracle.UiProbe.subtitle\"));")
+        .run_macro_on_image(
+            &doc_stack,
+            "print(call(\"tools.oracle.UiProbe.subtitle\"));",
+        )
         .unwrap();
     assert_eq!(rust_sub, out.stdout.trim_end());
 
