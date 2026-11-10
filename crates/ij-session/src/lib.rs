@@ -155,6 +155,11 @@ pub enum Command {
         dark_background: bool,
         histogram_16: bool,
     },
+    /// Interactive threshold slider update; never recorded as a macro command.
+    PreviewThreshold {
+        lower: f64,
+        upper: f64,
+    },
     /// `resetThreshold()` / ThresholdAdjuster's Reset button. Clears the
     /// active threshold without touching pixels.
     ResetThreshold,
@@ -788,6 +793,10 @@ impl Session {
                 }
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
+            }
+            Command::PreviewThreshold { lower, upper } => {
+                self.active_doc_mut()?.threshold = Some(ThresholdLevels { lower, upper });
+                Ok(CommandOutcome::Thresholded(ThresholdLevels { lower, upper }))
             }
             Command::AutoThreshold {
                 method,
