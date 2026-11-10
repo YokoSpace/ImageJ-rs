@@ -100,6 +100,12 @@ pub enum Command {
     MakeFreehandRoi {
         points: Vec<(i32, i32)>,
     },
+    /// Wand shares polygon geometry but records the original click command.
+    MakeWandRoi {
+        x: i32,
+        y: i32,
+        points: Vec<(i32, i32)>,
+    },
     MakeLineRoi {
         x1: i32,
         y1: i32,
@@ -607,6 +613,19 @@ impl Session {
                 if changed {
                     self.mark_active_dirty();
                 }
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MakeWandRoi { x, y, points } => {
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let before = doc.roi.clone();
+                    doc.set_polygon_roi(&points)?;
+                    doc.roi != before
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push(format!("doWand({x}, {y});"));
                 Ok(CommandOutcome::Updated)
             }
             Command::MakeLineRoi { x1, y1, x2, y2 } => {

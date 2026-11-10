@@ -3,6 +3,7 @@ use crate::roi_edit::{RoiHit, drag_handle, hit_test, move_by};
 use crate::tool::{
     freehand_is_valid, freehand_push, polygon_closes_at_start, polygon_preview_segments,
 };
+use ij_core::{Wand, WandMode};
 
 #[derive(Clone)]
 struct RoiDrag {
@@ -654,6 +655,7 @@ impl ImageJApp {
         }
 
         let mut was_clicked = false;
+        let mut wand_click = None;
         if response.clicked() {
             was_clicked = true;
             if tool == Tool::Magnifier {
@@ -662,6 +664,15 @@ impl ImageJApp {
                     view.zoom_out();
                 } else {
                     view.zoom_in();
+                }
+            } else if tool == Tool::Wand {
+                if let Some(pos) = response
+                    .interact_pointer_pos()
+                    .filter(|pos| img_rect.contains(*pos))
+                {
+                    wand_click = Some(
+                        view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y),
+                    );
                 }
             }
         }
@@ -889,6 +900,21 @@ impl ImageJApp {
 
         if was_clicked {
             let _ = self.set_active_window(image_id);
+        }
+
+        if let Some((x, y)) = wand_click {
+            if let Some(doc) = self.session.get_image(image_id) {
+                let points = Wand::auto_outline(doc, x, y, 0.0, WandMode::Legacy);
+                if !points.is_empty() {
+                    match self.session.dispatch(Command::MakeWandRoi { x, y, points }) {
+                        Ok(_) => self.status_message = "Wand ROI created".into(),
+                        Err(error) => {
+                            self.status_message = format!("Wand ROI failed: {error}");
+                            self.dialogs.last_error = Some(self.status_message.clone());
+                        }
+                    }
+                }
+            }
         }
 
         if let Some(action) = drag_action {

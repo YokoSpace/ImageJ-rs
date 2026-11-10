@@ -141,7 +141,6 @@ fn unsupported_actions_guardrail() {
         Tool::Polyline,
         Tool::Freeline,
         Tool::Point,
-        Tool::Wand,
         Tool::Text,
         Tool::Dropper,
         Tool::Angle,

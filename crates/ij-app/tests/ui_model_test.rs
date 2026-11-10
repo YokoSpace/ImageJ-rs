@@ -16,12 +16,12 @@ fn tool_definitions_match_classic_imagej() {
     assert!(Tool::Rectangle.is_supported());
     assert!(Tool::Oval.is_supported());
     assert!(Tool::Polygon.is_supported());
+    assert!(Tool::Wand.is_supported());
     assert!(Tool::Line.is_supported());
     assert!(Tool::Magnifier.is_supported());
     assert!(Tool::Hand.is_supported());
 
     // Unsupported actions must not misleadingly appear functional
-    assert!(!Tool::Wand.is_supported());
     assert!(!Tool::Text.is_supported());
     assert!(!Tool::Angle.is_supported());
 }
