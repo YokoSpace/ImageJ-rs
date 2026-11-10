@@ -1,6 +1,8 @@
 pub mod filters;
+pub mod histogram;
 
 pub use filters::{AutoThresholdMethod, RankFilterKind};
+pub use histogram::{display_histogram, DisplayHistogram};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

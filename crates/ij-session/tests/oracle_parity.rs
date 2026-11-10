@@ -1,7 +1,8 @@
 use ij_bridge::JavaOracleBridge;
 use ij_core::{
-    format_ij_num, DisplayRange, ImageDocument, LineRoi, Lut256, MeasurementSummary, PixelPlane,
-    PolygonRoi, RectRoi, ResultsTable, Roi, ThresholdLevels,
+    display_histogram, format_ij_num, DisplayHistogram, DisplayRange, ImageDocument, LineRoi,
+    Lut256, MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi,
+    ThresholdLevels,
 };
 use ij_io::{load_tiff, save_tiff};
 use ij_session::{Command, Session};
@@ -8724,3 +8725,195 @@ fn big_endian_inline_short_scalar_tags_match_java_oracle() {
         }
     }
 }
+
+#[test]
+fn parity_display_histogram_8bit_ramp_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Full image
+    let oracle_full = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 16, 16, 1); \
+             getHistogram(values, counts, 256); \
+             print('HMIN:0'); print('HMAX:255'); print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let doc_full = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    let hist_full: DisplayHistogram = display_histogram(&doc_full);
+    assert_eq!(hist_full.hmin, 0.0);
+    assert_eq!(hist_full.hmax, 255.0);
+    assert_eq!(
+        &hist_full.counts[..],
+        oracle_histogram(&oracle_full.stdout).as_slice()
+    );
+
+    // Rectangular ROI
+    let oracle_roi = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 16, 16, 1); \
+             makeRectangle(2, 3, 8, 6); \
+             getHistogram(values, counts, 256); \
+             print('HMIN:0'); print('HMAX:255'); print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let mut doc_roi = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    doc_roi.set_rect_roi(2, 3, 8, 6).unwrap();
+    let hist_roi = display_histogram(&doc_roi);
+    assert_eq!(hist_roi.hmin, 0.0);
+    assert_eq!(hist_roi.hmax, 255.0);
+    assert_eq!(
+        &hist_roi.counts[..],
+        oracle_histogram(&oracle_roi.stdout).as_slice()
+    );
+}
+
+#[test]
+fn parity_display_histogram_16bit_ramp_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Full image
+    let oracle_full = bridge
+        .eval_macro(
+            "newImage('test', '16-bit ramp', 16, 16, 1); \
+             getHistogram(values, counts, 256); \
+             n = values.length; inc = (values[n-1]-values[0])/(n-1); \
+             print('HMIN:' + values[0]); print('HMAX:' + (values[0] + inc*n)); \
+             print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let doc_full = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
+    let hist_full = display_histogram(&doc_full);
+    let expected_hmin: f64 = oracle_line(&oracle_full.stdout, "HMIN:")
+        .strip_prefix("HMIN:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_hmax: f64 = oracle_line(&oracle_full.stdout, "HMAX:")
+        .strip_prefix("HMAX:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(hist_full.hmin, expected_hmin);
+    assert_eq!(hist_full.hmax, expected_hmax);
+    assert_eq!(
+        &hist_full.counts[..],
+        oracle_histogram(&oracle_full.stdout).as_slice()
+    );
+
+    // Rectangular ROI
+    let oracle_roi = bridge
+        .eval_macro(
+            "newImage('test', '16-bit ramp', 16, 16, 1); \
+             makeRectangle(2, 3, 8, 6); \
+             getHistogram(values, counts, 256); \
+             n = values.length; inc = (values[n-1]-values[0])/(n-1); \
+             print('HMIN:' + values[0]); print('HMAX:' + (values[0] + inc*n)); \
+             print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let mut doc_roi = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
+    doc_roi.set_rect_roi(2, 3, 8, 6).unwrap();
+    let hist_roi = display_histogram(&doc_roi);
+    let expected_hmin_roi: f64 = oracle_line(&oracle_roi.stdout, "HMIN:")
+        .strip_prefix("HMIN:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_hmax_roi: f64 = oracle_line(&oracle_roi.stdout, "HMAX:")
+        .strip_prefix("HMAX:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(hist_roi.hmin, expected_hmin_roi);
+    assert_eq!(hist_roi.hmax, expected_hmax_roi);
+    assert_eq!(
+        &hist_roi.counts[..],
+        oracle_histogram(&oracle_roi.stdout).as_slice()
+    );
+}
+
+#[test]
+fn parity_display_histogram_32bit_ramp_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Full image
+    let oracle_full = bridge
+        .eval_macro(
+            "newImage('test', '32-bit ramp', 16, 16, 1); \
+             getHistogram(values, counts, 256); \
+             n = values.length; inc = (values[n-1]-values[0])/(n-1); \
+             print('HMIN:' + values[0]); print('HMAX:' + (values[0] + inc*n)); \
+             print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let doc_full = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
+    let hist_full = display_histogram(&doc_full);
+    let expected_hmin: f64 = oracle_line(&oracle_full.stdout, "HMIN:")
+        .strip_prefix("HMIN:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_hmax: f64 = oracle_line(&oracle_full.stdout, "HMAX:")
+        .strip_prefix("HMAX:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(hist_full.hmin, expected_hmin);
+    assert!((hist_full.hmax - expected_hmax).abs() < 1e-6);
+    assert_eq!(
+        &hist_full.counts[..],
+        oracle_histogram(&oracle_full.stdout).as_slice()
+    );
+
+    // Rectangular ROI
+    let oracle_roi = bridge
+        .eval_macro(
+            "newImage('test', '32-bit ramp', 16, 16, 1); \
+             makeRectangle(2, 3, 8, 6); \
+             getHistogram(values, counts, 256); \
+             n = values.length; inc = (values[n-1]-values[0])/(n-1); \
+             print('HMIN:' + values[0]); print('HMAX:' + (values[0] + inc*n)); \
+             print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let mut doc_roi = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
+    doc_roi.set_rect_roi(2, 3, 8, 6).unwrap();
+    let hist_roi = display_histogram(&doc_roi);
+    let expected_hmin_roi: f64 = oracle_line(&oracle_roi.stdout, "HMIN:")
+        .strip_prefix("HMIN:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let expected_hmax_roi: f64 = oracle_line(&oracle_roi.stdout, "HMAX:")
+        .strip_prefix("HMAX:")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(hist_roi.hmin, expected_hmin_roi);
+    assert!((hist_roi.hmax - expected_hmax_roi).abs() < 1e-6);
+    assert_eq!(
+        &hist_roi.counts[..],
+        oracle_histogram(&oracle_roi.stdout).as_slice()
+    );
+}
+
+#[test]
+fn parity_display_histogram_8bit_oval_roi_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 16, 16, 1); \
+             makeOval(2, 2, 12, 12); \
+             getHistogram(values, counts, 256); \
+             print('HMIN:0'); print('HMAX:255'); print('HIST'); Array.print(counts);",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    doc.set_oval_roi(2, 2, 12, 12).unwrap();
+    let hist = display_histogram(&doc);
+    assert_eq!(hist.hmin, 0.0);
+    assert_eq!(hist.hmax, 255.0);
+    assert_eq!(
+        &hist.counts[..],
+        oracle_histogram(&oracle.stdout).as_slice()
+    );
+}
+
+
