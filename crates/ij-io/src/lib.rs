@@ -3777,7 +3777,7 @@ mod tests {
             }
         }
 
-        for (index, palette) in palettes.iter().enumerate() {
+        for index in 0..palettes.len() {
             let next_ifd = if index == 0 { second_ifd } else { 0 };
             out.extend_from_slice(&(entry_counts[index] as u16).to_le_bytes());
             push_ifd_entry(&mut out, TAG_IMAGE_WIDTH, 4, 1, 2);
