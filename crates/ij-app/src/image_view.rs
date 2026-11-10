@@ -1,4 +1,4 @@
-use ij_core::ImageDocument;
+use ij_core::{ImageDocument, PixelPlane};
 
 pub const ZOOM_LEVELS: &[f64] = &[
     0.25, 0.333, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0,
@@ -66,7 +66,7 @@ impl ImageView {
         (px * z + self.pan.0, py * z + self.pan.1)
     }
 
-    /// Creates subtitle string matching original ImageWindow.java lines 310-385.
+    /// Creates subtitle string matching original ImageWindow.java lines 309-379.
     pub fn create_subtitle(doc: &ImageDocument) -> String {
         let mut s = String::new();
         let stack_size = doc.stack_size();
@@ -74,32 +74,168 @@ impl ImageView {
             s.push_str(&format!("{}/{}; ", doc.current_slice, stack_size));
         }
 
-        s.push_str(&format!("{}x{} pixels; ", doc.width, doc.height));
+        let cal = &doc.calibration;
+        // Calibration.scaled (original_imagej/ij/measure/Calibration.java line 92)
+        let scaled = cal.pixel_width != 1.0
+            || cal.pixel_height != 1.0
+            || cal.pixel_depth != 1.0
+            || cal.unit != "pixel";
 
-        match doc.plane().bit_depth() {
-            8 => s.push_str("8-bit; "),
-            16 => s.push_str("16-bit; "),
-            24 => s.push_str("RGB; "),
-            32 => s.push_str("32-bit; "),
-            _ => s.push_str("8-bit; "),
-        }
-
-        let bytes_per_pixel = match doc.plane().bit_depth() {
-            8 => 1,
-            16 => 2,
-            24 => 3,
-            32 => 4,
-            _ => 1,
-        };
-        let total_bytes =
-            (doc.width as u64) * (doc.height as u64) * bytes_per_pixel * (stack_size as u64);
-        let size_kb = (total_bytes as f64) / 1024.0;
-        if size_kb < 1024.0 {
-            s.push_str(&format!("{}K", size_kb.round() as u64));
+        if scaled {
+            let cwidth = doc.width as f64 * cal.pixel_width;
+            let cheight = doc.height as f64 * cal.pixel_height;
+            // Tools.getDecimalPlaces (original_imagej/ij/gui/ImageWindow.java lines 349-350)
+            let mut digits = get_decimal_places(cwidth, cheight);
+            if digits > 2 {
+                digits = 2;
+            }
+            let units = plural_unit(&cal.unit);
+            s.push_str(&format!(
+                "{}x{} {} ({}x{}); ",
+                d2s(cwidth, digits),
+                d2s(cheight, digits),
+                units,
+                doc.width,
+                doc.height
+            ));
         } else {
-            s.push_str(&format!("{:.1}MB", size_kb / 1024.0));
+            s.push_str(&format!("{}x{} pixels; ", doc.width, doc.height));
         }
+
+        // ImagePlus type formatting (original_imagej/ij/gui/ImageWindow.java lines 361-375)
+        match doc.plane() {
+            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => s.push_str("8-bit"),
+            PixelPlane::Gray16(_) => s.push_str("16-bit"),
+            PixelPlane::Gray32(_) => s.push_str("32-bit"),
+            PixelPlane::ColorRgb(_) => s.push_str("RGB"),
+        }
+
+        // Inverting LUT detection (original_imagej/ij/gui/ImageWindow.java lines 376-377)
+        if is_inverted_lut(doc) {
+            s.push_str(" (inverting LUT)");
+        }
+
+        s.push_str("; ");
+        s.push_str(&Self::image_size(doc));
 
         s
     }
+
+    /// Formats the image size string matching ImageWindow.getImageSize (lines 381-396)
+    /// and ImagePlus.getSizeInBytes (lines 1226-1235).
+    pub fn image_size(doc: &ImageDocument) -> String {
+        let bytes_per_pixel = match doc.plane() {
+            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => 1.0,
+            PixelPlane::Gray16(_) => 2.0,
+            PixelPlane::Gray32(_) | PixelPlane::ColorRgb(_) => 4.0,
+        };
+        let total_bytes =
+            (doc.width as f64) * (doc.height as f64) * (doc.stack_size() as f64) * bytes_per_pixel;
+        let size = total_bytes / 1024.0;
+        let (mut s2, s3) = if size < 1024.0 {
+            (d2s(size, 0), "K")
+        } else if size < 10000.0 {
+            (d2s(size / 1024.0, 1), "MB")
+        } else if size < 1048576.0 {
+            let rounded = (size / 1024.0).round();
+            (d2s(rounded, 0), "MB")
+        } else {
+            (d2s(size / 1048576.0, 1), "GB")
+        };
+        if s2.ends_with(".0") {
+            s2.truncate(s2.len() - 2);
+        }
+        format!("{s2}{s3}")
+    }
+}
+
+/// Formats a number matching IJ.d2s(n, decimalPlaces).
+///
+/// Java's DecimalFormat("0") rounds 0.5 up to 1 (half-away-from-zero),
+/// whereas IEEE 754 float formatting in Rust rounds 0.5 to even (0).
+fn d2s(n: f64, decimal_places: i32) -> String {
+    if decimal_places == 0 {
+        format!("{}", n.round() as i64)
+    } else {
+        crate::status_text::ij_d2s(n, decimal_places)
+    }
+}
+
+/// Plural form of spatial calibration unit matching Calibration.pluralForm (lines 159-170).
+fn plural_unit(unit: &str) -> &str {
+    match unit {
+        "pixel" => "pixels",
+        "micron" => "microns",
+        "inch" => "inches",
+        other => other,
+    }
+}
+
+/// Checks whether the active plane has an inverting LUT matching
+/// ImageProcessor.isInvertedLut (original_imagej/ij/process/ImageProcessor.java lines 299-318).
+fn is_inverted_lut(doc: &ImageDocument) -> bool {
+    match doc.plane() {
+        PixelPlane::Color256 { lut, .. } => {
+            if lut.r.len() < 256 || lut.g.len() < 256 || lut.b.len() < 256 {
+                return false;
+            }
+            let mut has_ascending_step = false;
+            for i in 1..255 {
+                let v1 = lut.r[i - 1] as i32 + lut.g[i - 1] as i32 + lut.b[i - 1] as i32;
+                let v2 = lut.r[i] as i32 + lut.g[i] as i32 + lut.b[i] as i32;
+                if v1 < v2 {
+                    has_ascending_step = true;
+                    break;
+                }
+            }
+            !has_ascending_step
+        }
+        _ => false,
+    }
+}
+
+/// Computes decimal places matching Tools.getDecimalPlaces(double) (lines 209-222).
+fn get_decimal_places_single(n: f64) -> i32 {
+    if (n as i32 as f64) == n || n.is_nan() {
+        return 0;
+    }
+    let mut s = n.to_string();
+    if s.contains('e') || s.contains('E') {
+        return -2;
+    }
+    while s.ends_with('0') {
+        s.pop();
+    }
+    let Some(index) = s.find('.') else {
+        return 0;
+    };
+    let digits = (s.len() - index - 1) as i32;
+    if digits > 4 {
+        4
+    } else {
+        digits
+    }
+}
+
+/// Computes decimal places for two dimensions matching Tools.getDecimalPlaces(double, double)
+/// (original_imagej/ij/util/Tools.java lines 226-240).
+fn get_decimal_places(n1: f64, n2: f64) -> i32 {
+    if (n1 as i32 as f64) == n1 && (n2 as i32 as f64) == n2 {
+        return 0;
+    }
+    let digits = get_decimal_places_single(n1);
+    let digits2 = get_decimal_places_single(n2);
+    if digits == 0 {
+        return digits2;
+    }
+    if digits2 == 0 {
+        return digits;
+    }
+    if digits < 0 || digits2 < 0 {
+        return digits;
+    }
+    if digits2 > digits {
+        return digits2;
+    }
+    digits
 }
