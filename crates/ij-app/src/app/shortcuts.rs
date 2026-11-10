@@ -1,5 +1,6 @@
 use super::*;
 use crate::action::AppAction;
+use crate::roi_edit::{Arrow, nudge, nudge_corner};
 
 impl ImageJApp {
     /// Handles keyboard shortcuts targeted at a specific image window.
@@ -130,28 +131,53 @@ impl ImageJApp {
             return;
         }
 
-        // Stack Navigation
-        let has_roi = self
-            .session
-            .get_image(target_id)
-            .map(|doc| doc.roi.is_some())
-            .unwrap_or(false);
-
-        let next_slice = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Period)
-                || (!has_roi && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight))
-        });
+        // Comma and period navigate stacks regardless of selection.
+        let next_slice = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Period));
         if next_slice {
             self.perform(AppAction::NextSlice(target_id), ctx);
             return;
         }
-
-        let prev_slice = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::Comma)
-                || (!has_roi && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft))
-        });
+        let prev_slice = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Comma));
         if prev_slice {
             self.perform(AppAction::PreviousSlice(target_id), ctx);
+            return;
+        }
+
+        let arrow = ctx.input_mut(|i| {
+            let modifiers = i.modifiers;
+            [
+                (egui::Key::ArrowLeft, Arrow::Left),
+                (egui::Key::ArrowRight, Arrow::Right),
+                (egui::Key::ArrowUp, Arrow::Up),
+                (egui::Key::ArrowDown, Arrow::Down),
+            ]
+            .into_iter()
+            .find_map(|(key, arrow)| i.consume_key(modifiers, key).then_some((arrow, modifiers)))
+        });
+        if let Some((arrow, modifiers)) = arrow {
+            let Some(doc) = self.session.get_image(target_id) else {
+                return;
+            };
+            let stack_key = doc.stack_size() > 1 && (doc.roi.is_none() || modifiers.shift);
+            if stack_key && matches!(arrow, Arrow::Right | Arrow::Left) {
+                let action = if arrow == Arrow::Right {
+                    AppAction::NextSlice(target_id)
+                } else {
+                    AppAction::PreviousSlice(target_id)
+                };
+                self.perform(action, ctx);
+            } else if let Some(roi) = doc.roi.clone() {
+                let updated = if modifiers.alt || modifiers.ctrl {
+                    nudge_corner(&roi, arrow, doc.width, doc.height)
+                } else {
+                    nudge(&roi, arrow, doc.width, doc.height)
+                };
+                if updated != roi {
+                    let _ = self.set_active_window(target_id);
+                    self.session.get_image_mut(target_id).unwrap().roi = Some(updated);
+                    self.session.set_dirty(target_id, true);
+                }
+            }
         }
     }
 

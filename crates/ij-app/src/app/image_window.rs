@@ -1,6 +1,18 @@
 use super::*;
+use crate::roi_edit::{RoiHit, drag_handle, hit_test, move_by};
+
+#[derive(Clone)]
+struct RoiDrag {
+    original: Roi,
+    hit: RoiHit,
+    start_pixel: (i32, i32),
+}
 
 impl ImageJApp {
+    pub fn image_canvas_rect(ctx: &egui::Context, id: ImageId) -> Option<Rect> {
+        ctx.data(|data| data.get_temp(egui::Id::new(("ij_image_canvas", id.0))))
+    }
+
     pub fn update_ui(&mut self, ctx: &egui::Context) {
         self.poll_plugin_filter();
         if self.is_plugin_filter_running() {
@@ -392,6 +404,9 @@ impl ImageJApp {
             Pos2::new(rect.min.x + view.pan.0, rect.min.y + view.pan.1),
             canvas_size,
         );
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new(("ij_image_canvas", image_id.0)), img_rect)
+        });
         painter.image(
             texture_id,
             img_rect,
@@ -408,6 +423,27 @@ impl ImageJApp {
         if let Some(hover_pos) = response.hover_pos().filter(|pos| img_rect.contains(*pos)) {
             let (ix, iy) = view.screen_to_pixel(hover_pos.x - rect.min.x, hover_pos.y - rect.min.y);
             hover_pixel = Some((ix, iy));
+            if matches!(tool, Tool::Rectangle | Tool::Oval | Tool::Line) {
+                if let Some(roi) = self
+                    .session
+                    .get_image(image_id)
+                    .and_then(|doc| doc.roi.as_ref())
+                {
+                    let screen = (
+                        (hover_pos.x - img_rect.min.x) as f64,
+                        (hover_pos.y - img_rect.min.y) as f64,
+                    );
+                    let icon = match hit_test(roi, screen, view.zoom, (0.0, 0.0)) {
+                        RoiHit::Handle(0 | 4) => egui::CursorIcon::ResizeNwSe,
+                        RoiHit::Handle(2 | 6) => egui::CursorIcon::ResizeNeSw,
+                        RoiHit::Handle(1 | 5) => egui::CursorIcon::ResizeVertical,
+                        RoiHit::Handle(3 | 7) => egui::CursorIcon::ResizeHorizontal,
+                        RoiHit::Handle(_) | RoiHit::Inside => egui::CursorIcon::Move,
+                        RoiHit::Outside => egui::CursorIcon::Crosshair,
+                    };
+                    ui.ctx().set_cursor_icon(icon);
+                }
+            }
         }
 
         // Active Tool Interactions
@@ -422,6 +458,31 @@ impl ImageJApp {
                 view.is_dragging = true;
                 view.drag_start_pixel = Some((px, py));
                 view.drag_current_pixel = Some((px, py));
+                if matches!(tool, Tool::Rectangle | Tool::Oval | Tool::Line) {
+                    if let Some(roi) = self
+                        .session
+                        .get_image(image_id)
+                        .and_then(|doc| doc.roi.as_ref())
+                    {
+                        let screen = (
+                            (pos.x - img_rect.min.x) as f64,
+                            (pos.y - img_rect.min.y) as f64,
+                        );
+                        let hit = hit_test(roi, screen, view.zoom, (0.0, 0.0));
+                        if hit != RoiHit::Outside {
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::new(("ij_roi_drag", image_id.0)),
+                                    RoiDrag {
+                                        original: roi.clone(),
+                                        hit,
+                                        start_pixel: (px, py),
+                                    },
+                                )
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -431,6 +492,28 @@ impl ImageJApp {
                 if tool != Tool::Hand {
                     let (px, py) = view.screen_to_pixel(pos.x - rect.min.x, pos.y - rect.min.y);
                     view.drag_current_pixel = Some((px, py));
+                }
+            }
+            let edit = ui
+                .ctx()
+                .data(|data| data.get_temp::<RoiDrag>(egui::Id::new(("ij_roi_drag", image_id.0))));
+            if let (Some(edit), Some(curr)) = (edit, view.drag_current_pixel) {
+                let next = match edit.hit {
+                    RoiHit::Inside => move_by(
+                        &edit.original,
+                        curr.0 - edit.start_pixel.0,
+                        curr.1 - edit.start_pixel.1,
+                    ),
+                    RoiHit::Handle(handle) => drag_handle(&edit.original, handle, curr),
+                    RoiHit::Outside => edit.original.clone(),
+                };
+                if self
+                    .session
+                    .get_image(image_id)
+                    .and_then(|doc| doc.roi.as_ref())
+                    != Some(&next)
+                {
+                    self.session.get_image_mut(image_id).unwrap().roi = Some(next);
                 }
             }
         }
@@ -444,7 +527,31 @@ impl ImageJApp {
         let mut drag_action = None;
         if response.drag_stopped() {
             view.is_dragging = false;
-            if let (Some(start), Some(curr)) = (view.drag_start_pixel, view.drag_current_pixel) {
+            let edit = ui.ctx().data_mut(|data| {
+                let key = egui::Id::new(("ij_roi_drag", image_id.0));
+                let edit = data.get_temp::<RoiDrag>(key);
+                data.remove::<RoiDrag>(key);
+                edit
+            });
+            if let Some(edit) = edit {
+                if let Some(roi) = self
+                    .session
+                    .get_image(image_id)
+                    .and_then(|doc| doc.roi.as_ref())
+                {
+                    if roi != &edit.original {
+                        drag_action = match roi {
+                            Roi::Rect(r) => Some(DragAction::Rect(r.x, r.y, r.width, r.height)),
+                            Roi::Oval(r) => Some(DragAction::Oval(r.x, r.y, r.width, r.height)),
+                            Roi::Line(l) => Some(DragAction::Line(l.x1, l.y1, l.x2, l.y2)),
+                            Roi::Polygon(_) => None,
+                        };
+                        self.session.set_dirty(image_id, true);
+                    }
+                }
+            } else if let (Some(start), Some(curr)) =
+                (view.drag_start_pixel, view.drag_current_pixel)
+            {
                 let x = start.0.min(curr.0);
                 let y = start.1.min(curr.1);
                 let w = (start.0 - curr.0).abs();
@@ -489,7 +596,11 @@ impl ImageJApp {
         let z = view.zoom as f32;
 
         // Draw in-progress dragging preview
-        if view.is_dragging {
+        let editing_existing = ui.ctx().data(|data| {
+            data.get_temp::<RoiDrag>(egui::Id::new(("ij_roi_drag", image_id.0)))
+                .is_some()
+        });
+        if view.is_dragging && !editing_existing {
             if let (Some(start), Some(curr)) = (view.drag_start_pixel, view.drag_current_pixel) {
                 match tool {
                     Tool::Rectangle => {
