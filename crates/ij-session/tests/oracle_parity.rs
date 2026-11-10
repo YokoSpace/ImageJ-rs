@@ -2,7 +2,7 @@ use ij_bridge::JavaOracleBridge;
 use ij_core::{
     display_histogram, format_ij_num, DisplayHistogram, DisplayRange, ImageDocument, LineRoi,
     Lut256, MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi,
-    ThresholdLevels,
+    ThresholdLevels, Wand, WandMode,
 };
 use ij_io::{load_tiff, save_tiff};
 use ij_session::{Command, Session};
@@ -14,6 +14,84 @@ fn repo_root() -> PathBuf {
         .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf()
+}
+
+fn oracle_wand_points(doc: &ImageDocument, prelude: &str, x: i32, y: i32) -> Vec<(i32, i32)> {
+    oracle_wand_points_with_options(doc, prelude, x, y, 0.0, "Legacy")
+}
+
+fn oracle_wand_points_with_options(
+    doc: &ImageDocument,
+    prelude: &str,
+    x: i32,
+    y: i32,
+    tolerance: f64,
+    mode: &str,
+) -> Vec<(i32, i32)> {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let macro_text = format!(
+        "{prelude} doWand({x},{y},{tolerance},\"{mode}\"); getSelectionCoordinates(xs,ys); \
+         print(\"WAND_COUNT:\"+xs.length); for(i=0;i<xs.length;i++) print(xs[i]+\",\"+ys[i]); run(\"Select None\");"
+    );
+    let output = bridge.run_macro_on_image(doc, &macro_text).unwrap();
+    let mut lines = output.stdout.lines();
+    let count = lines.next().unwrap().strip_prefix("WAND_COUNT:").unwrap().parse::<usize>().unwrap();
+    let points = lines.map(|line| {
+        let (x, y) = line.split_once(',').unwrap();
+        (x.parse::<i32>().unwrap(), y.parse::<i32>().unwrap())
+    }).collect::<Vec<_>>();
+    assert_eq!(points.len(), count);
+    points
+}
+
+#[test]
+fn parity_wand_explicit_connectivity_and_tolerance_match_java_oracle() {
+    let mut pixels = vec![0u8; 49];
+    for index in 1..=5 { pixels[index * 7 + index] = 7; }
+    let doc = ImageDocument::new("wand-modes", 7, 7, PixelPlane::Gray8(pixels)).unwrap();
+    for (mode, java_mode) in [
+        (WandMode::FourConnected, "4-connected"),
+        (WandMode::EightConnected, "8-connected"),
+    ] {
+        let oracle = oracle_wand_points_with_options(&doc, "", 3, 3, 0.0, java_mode);
+        assert_eq!(Wand::auto_outline(&doc, 3, 3, 0.0, mode), oracle);
+    }
+
+    let mut pixels = vec![0u8; 25];
+    for y in 1..=3 { for x in 1..=3 { pixels[y * 5 + x] = 7; } }
+    pixels[2 * 5 + 2] = 8;
+    let doc = ImageDocument::new("wand-tolerance", 5, 5, PixelPlane::Gray8(pixels)).unwrap();
+    let oracle = oracle_wand_points_with_options(&doc, "", 2, 2, 1.0, "Legacy");
+    assert_eq!(Wand::auto_outline(&doc, 2, 2, 1.0, WandMode::Legacy), oracle);
+}
+
+#[test]
+fn parity_legacy_wand_rect_outline_matches_java_oracle() {
+    let mut pixels = vec![0u8; 25];
+    for y in 1..=3 { for x in 1..=3 { pixels[y * 5 + x] = 7; } }
+    let doc = ImageDocument::new("wand-rect", 5, 5, PixelPlane::Gray8(pixels)).unwrap();
+    let oracle = oracle_wand_points(&doc, "", 2, 2);
+    assert_eq!(Wand::auto_outline(&doc, 2, 2, 0.0, WandMode::Legacy), oracle);
+}
+
+#[test]
+fn parity_legacy_wand_diagonal_line_matches_java_oracle() {
+    let mut pixels = vec![0u8; 49];
+    for index in 1..=5 { pixels[index * 7 + index] = 7; }
+    let doc = ImageDocument::new("wand-line", 7, 7, PixelPlane::Gray8(pixels)).unwrap();
+    let oracle = oracle_wand_points(&doc, "", 3, 3);
+    assert_eq!(Wand::auto_outline(&doc, 3, 3, 0.0, WandMode::Legacy), oracle);
+}
+
+#[test]
+fn parity_legacy_wand_respects_active_threshold_like_java_oracle() {
+    let mut pixels = vec![0u8; 25];
+    for y in 1..=3 { for x in 1..=3 { pixels[y * 5 + x] = 7; } }
+    pixels[2 * 5 + 2] = 8;
+    let mut doc = ImageDocument::new("wand-threshold", 5, 5, PixelPlane::Gray8(pixels)).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 7.0, upper: 8.0 });
+    let oracle = oracle_wand_points(&doc, "setThreshold(7,8);", 2, 2);
+    assert_eq!(Wand::auto_outline(&doc, 2, 2, 0.0, WandMode::Legacy), oracle);
 }
 
 /// Parses the first two non-empty lines of ImageJ's batch-mode Results table

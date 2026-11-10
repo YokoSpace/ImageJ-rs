@@ -2,6 +2,7 @@ pub mod contrast;
 pub mod filters;
 pub mod histogram;
 pub mod threshold_palette;
+pub mod wand;
 
 pub use contrast::{
     adjust_brightness, adjust_contrast, adjust_max, adjust_min, auto_contrast_range,
@@ -16,6 +17,7 @@ pub use threshold_palette::{
     DEFAULT_MAX_SLIDER, DEFAULT_MAX_THRESHOLD, DEFAULT_MIN_SLIDER, DEFAULT_MIN_THRESHOLD,
     FLOAT_NEG_LIMIT, FLOAT_POS_LIMIT, NO_THRESHOLD_PLOT_BIN, THRESHOLD_SLIDER_RANGE,
 };
+pub use wand::{Wand, WandMode};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
