@@ -51,4 +51,43 @@ public final class UiProbe {
     public static String imageSize() {
         return ImageWindow.getImageSize(currentImage());
     }
+
+    private static int keyNameToCode(String key) {
+        if ("left".equalsIgnoreCase(key) || "vk_left".equalsIgnoreCase(key))
+            return java.awt.event.KeyEvent.VK_LEFT;
+        if ("right".equalsIgnoreCase(key) || "vk_right".equalsIgnoreCase(key))
+            return java.awt.event.KeyEvent.VK_RIGHT;
+        if ("up".equalsIgnoreCase(key) || "vk_up".equalsIgnoreCase(key))
+            return java.awt.event.KeyEvent.VK_UP;
+        if ("down".equalsIgnoreCase(key) || "vk_down".equalsIgnoreCase(key))
+            return java.awt.event.KeyEvent.VK_DOWN;
+        throw new IllegalArgumentException("Unknown arrow key: " + key);
+    }
+
+    public static String nudge(String key) {
+        ImagePlus image = currentImage();
+        ij.gui.Roi roi = image.getRoi();
+        if (roi == null) return "";
+        roi.nudge(keyNameToCode(key));
+        if (roi instanceof ij.gui.Line) {
+            ij.gui.Line l = (ij.gui.Line) roi;
+            return l.x1 + "," + l.y1 + "," + l.x2 + "," + l.y2;
+        }
+        java.awt.Rectangle r = roi.getBounds();
+        return r.x + "," + r.y + "," + r.width + "," + r.height;
+    }
+
+    public static String nudgeCorner(String key) {
+        ImagePlus image = currentImage();
+        ij.gui.Roi roi = image.getRoi();
+        if (roi == null) return "";
+        roi.nudgeCorner(keyNameToCode(key));
+        if (roi instanceof ij.gui.Line) {
+            ij.gui.Line l = (ij.gui.Line) roi;
+            return l.x1 + "," + l.y1 + "," + l.x2 + "," + l.y2;
+        }
+        java.awt.Rectangle r = roi.getBounds();
+        return r.x + "," + r.y + "," + r.width + "," + r.height;
+    }
 }
+
