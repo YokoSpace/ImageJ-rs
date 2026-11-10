@@ -61,6 +61,7 @@ with open(f"{src_override}/ij/macro/Interpreter.java", "w", encoding="utf-8") as
 find "$REPO_ROOT/original_imagej/ij" -name "*.java" ! -name "Interpreter.java" > "$BUILD_DIR/sources.txt"
 echo "$SRC_OVERRIDE/ij/macro/Interpreter.java" >> "$BUILD_DIR/sources.txt"
 echo "$ORACLE_DIR/runner/OracleRunner.java" >> "$BUILD_DIR/sources.txt"
+echo "$ORACLE_DIR/runner/UiProbe.java" >> "$BUILD_DIR/sources.txt"
 
 # 4. Compile ImageJ classes with patched java.desktop module
 javac --patch-module java.desktop="$PATCH_JAR" \
