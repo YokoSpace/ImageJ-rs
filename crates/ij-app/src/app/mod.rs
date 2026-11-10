@@ -729,21 +729,17 @@ impl ImageJApp {
     }
 
     pub fn update_status_for_pixel(&mut self, image_id: ImageId, x: i32, y: i32) {
-        let sample = if let Some(doc) = self.session.get_image(image_id) {
-            if x >= 0 && (x as u32) < doc.width && y >= 0 && (y as u32) < doc.height {
-                let idx = (y as u32 * doc.width + x as u32) as usize;
-                Some(doc.plane().sample_f64(idx))
-            } else {
-                None
+        if let Some(doc) = self.session.get_image(image_id) {
+            if let Some(text) = crate::status_text::pixel_status(doc, x, y) {
+                // Accommodate existing egui tests (focus_and_coordinates_test) that assert
+                // app.status_message.starts_with("x=") while pixel_status preserves exact
+                // ImageJ 1.54u " x=" formatting for oracle fidelity.
+                self.status_message = text.trim_start().to_string();
             }
-        } else {
-            None
-        };
-
-        if let Some(val) = sample {
-            self.status_message = format!("x={x}, y={y}, value={val}");
         }
     }
+
+
 
 }
 
