@@ -1,4 +1,5 @@
 use ij_app::pixel_status;
+use ij_app::ImageJApp;
 use ij_bridge::JavaOracleBridge;
 use ij_core::{Calibration, ImageDocument, Lut256, PixelPlane};
 use std::path::PathBuf;
@@ -187,5 +188,34 @@ fn oracle_ui_probe_parity_checks() {
         )
         .unwrap();
     assert_eq!(rust_status, out.stdout.trim_end());
+}
+
+#[test]
+fn app_status_keeps_the_oracle_prefix() {
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("ramp", 16, 16).unwrap();
+    app.update_status_for_pixel(id, 3, 4);
+    assert_eq!(app.status_message, " x=3, y=4, value=48");
+}
+
+#[test]
+fn slice_navigation_refreshes_the_last_pixel_status() {
+    let mut app = ImageJApp::new();
+    let id = app.session.insert_doc(
+        ImageDocument::new_stack(
+            "stack",
+            2,
+            2,
+            vec![
+                PixelPlane::Gray8(vec![10; 4]),
+                PixelPlane::Gray8(vec![20; 4]),
+                PixelPlane::Gray8(vec![30; 4]),
+            ],
+        )
+        .unwrap(),
+    );
+    app.update_status_for_pixel(id, 1, 1);
+    app.set_slice_active(2).unwrap();
+    assert_eq!(app.status_message, " x=1, y=1, z=1, value=20");
 }
 

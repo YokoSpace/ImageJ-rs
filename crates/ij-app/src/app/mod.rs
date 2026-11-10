@@ -142,6 +142,7 @@ pub struct ImageJApp {
     pub session: Session,
     pub active_tool: Tool,
     pub status_message: String,
+    last_status_pixel: Option<(ImageId, i32, i32)>,
     pub progress: Option<f32>,
     pub image_views: BTreeMap<ImageId, ImageView>,
     pub show_results_window: bool,
@@ -173,6 +174,7 @@ impl ImageJApp {
             session: Session::new(),
             active_tool: Tool::Rectangle,
             status_message: "ImageJ 1.54u ready".to_string(),
+            last_status_pixel: None,
             progress: None,
             image_views: BTreeMap::new(),
             show_results_window: false,
@@ -701,6 +703,11 @@ impl ImageJApp {
         match self.session.dispatch(Command::NavigateSlice { index }) {
             Ok(_) => {
                 self.status_message = format!("Slice {index}");
+                if let Some((id, x, y)) = self.last_status_pixel {
+                    if self.active_image_id() == Some(id) {
+                        self.update_status_for_pixel(id, x, y);
+                    }
+                }
                 Ok(())
             }
             Err(e) => {
@@ -731,10 +738,8 @@ impl ImageJApp {
     pub fn update_status_for_pixel(&mut self, image_id: ImageId, x: i32, y: i32) {
         if let Some(doc) = self.session.get_image(image_id) {
             if let Some(text) = crate::status_text::pixel_status(doc, x, y) {
-                // Accommodate existing egui tests (focus_and_coordinates_test) that assert
-                // app.status_message.starts_with("x=") while pixel_status preserves exact
-                // ImageJ 1.54u " x=" formatting for oracle fidelity.
-                self.status_message = text.trim_start().to_string();
+                self.last_status_pixel = Some((image_id, x, y));
+                self.status_message = text;
             }
         }
     }

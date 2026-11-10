@@ -78,7 +78,7 @@ fn panned_pixels_beyond_original_canvas_bounds_remain_interactive() {
     render(&mut app, frame(Vec::new()));
     render(&mut app, frame(vec![Event::PointerMoved(Pos2::new(70.0, 50.0))]));
     assert!(
-        app.status_message.starts_with("x="),
+        app.status_message.starts_with(" x="),
         "a pixel shifted right by the Hand tool must remain hoverable: {}",
         app.status_message
     );
