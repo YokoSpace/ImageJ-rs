@@ -121,8 +121,10 @@ pub fn hit_test(roi: &Roi, screen: (f64, f64), mag: f64, src_origin: (f64, f64))
             let ox = off_screen_x(sx, mag, src_origin.0);
             let oy = off_screen_y(sy, mag, src_origin.1);
             if r.width > 0 && r.height > 0 {
-                let norm_x = (ox as f64 - r.x as f64) / r.width as f64 - 0.5;
-                let norm_y = (oy as f64 - r.y as f64) / r.height as f64 - 0.5;
+                // OvalRoi.contains tests pixel centers against a center
+                // shifted by half a pixel (OvalRoi.java:355-364).
+                let norm_x = (ox as f64 - r.x as f64 + 0.5) / r.width as f64 - 0.5;
+                let norm_y = (oy as f64 - r.y as f64 + 0.5) / r.height as f64 - 0.5;
                 if norm_x * norm_x + norm_y * norm_y <= 0.25 {
                     return RoiHit::Inside;
                 }
@@ -134,10 +136,12 @@ pub fn hit_test(roi: &Roi, screen: (f64, f64), mag: f64, src_origin: (f64, f64))
             let size = 5 + 5; // HANDLE_SIZE + 5 = 10
             let half_size = size / 2;
 
-            let sx1 = screen_x(l.x1 as f64, mag, src_origin.0) - half_size;
-            let sy1 = screen_y(l.y1 as f64, mag, src_origin.1) - half_size;
-            let sx2 = screen_x(l.x2 as f64, mag, src_origin.0) - half_size;
-            let sy2 = screen_y(l.y2 as f64, mag, src_origin.1) - half_size;
+            // Roi.screenXD/YD adds 0.5 for line coordinates before the
+            // ImageCanvas transform (Roi.java:2519-2530).
+            let sx1 = screen_x(l.x1 as f64 + 0.5, mag, src_origin.0) - half_size;
+            let sy1 = screen_y(l.y1 as f64 + 0.5, mag, src_origin.1) - half_size;
+            let sx2 = screen_x(l.x2 as f64 + 0.5, mag, src_origin.0) - half_size;
+            let sy2 = screen_y(l.y2 as f64 + 0.5, mag, src_origin.1) - half_size;
             let sx3 = sx1 + (sx2 - sx1) / 2 - 1;
             let sy3 = sy1 + (sy2 - sy1) / 2 - 1;
 

@@ -13,5 +13,3 @@ pub use app::{ImageJApp, PluginFilterPhase};
 pub use roi_edit::{drag_handle, hit_test, move_by, nudge, nudge_corner, Arrow, RoiHit};
 pub use status_text::pixel_status;
 pub use tool::Tool;
-
-

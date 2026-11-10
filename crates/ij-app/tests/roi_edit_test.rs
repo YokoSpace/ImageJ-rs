@@ -105,6 +105,12 @@ fn test_magnifications_and_src_origin() {
         hit_test(&rect, (80.0, 80.0), 4.0, (80.0, 80.0)),
         RoiHit::Handle(0)
     );
+
+    // mag = 0.5, origin = (80,80): bottom-right (140,140) maps to (30,30).
+    assert_eq!(
+        hit_test(&rect, (30.0, 30.0), 0.5, (80.0, 80.0)),
+        RoiHit::Handle(4)
+    );
 }
 
 #[test]
@@ -129,6 +135,21 @@ fn test_inside_and_outside_hit() {
     });
     // Far point is outside
     assert_eq!(hit_test(&line, (10.0, 90.0), 1.0, (0.0, 0.0)), RoiHit::Outside);
+}
+
+#[test]
+fn oval_hit_uses_pixel_center_like_java_contains() {
+    // OvalRoi.java:355-364 centers pixel (1,40) at (1.5,40.5).
+    let oval = Roi::Oval(RectRoi::new(0, 0, 100, 100).unwrap());
+    assert_eq!(hit_test(&oval, (1.0, 40.0), 1.0, (0.0, 0.0)), RoiHit::Inside);
+}
+
+#[test]
+fn line_handle_hit_uses_subpixel_screen_convention_when_zoomed() {
+    // Roi.java:2519-2523 adds 0.5 before screenXD for lines.
+    // Line.java:585-598 then includes sx1+size in the endpoint hit box.
+    let line = Roi::Line(LineRoi { x1: 10, y1: 10, x2: 50, y2: 50 });
+    assert_eq!(hit_test(&line, (26.0, 20.0), 2.0, (0.0, 0.0)), RoiHit::Handle(0));
 }
 
 #[test]
@@ -385,4 +406,3 @@ fn test_line_boundary_nudge_and_corner() {
         assert_eq!((l.x1, l.y1, l.x2, l.y2), (10, 10, 99, 99));
     }
 }
-
