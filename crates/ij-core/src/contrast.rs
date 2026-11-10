@@ -100,9 +100,6 @@ impl ContrastState {
     /// `ContrastAdjuster.java` lines 485-526 (`updateScrollBars` and `scaleDown`).
     pub fn slider_positions(&self) -> [i32; 4] {
         let range = self.default_max - self.default_min;
-        if range <= 0.0 {
-            return [0, 0, (SLIDER_RANGE / 2.0) as i32, (SLIDER_RANGE / 2.0) as i32];
-        }
 
         // ContrastAdjuster.java line 522-526: scaleDown
         let scale_down = |mut v: f64| -> i32 {
@@ -126,15 +123,11 @@ impl ContrastState {
         // ContrastAdjuster.java lines 487-491: contrast
         let mid = SLIDER_RANGE / 2.0;
         let span = self.max - self.min;
-        let contrast_pos = if span <= 0.0 {
-            SLIDER_RANGE as i32
-        } else {
-            let mut c = (range / span) * mid;
-            if c > mid {
-                c = SLIDER_RANGE - (span / range) * mid;
-            }
-            c as i32
-        };
+        let mut contrast = (range / span) * mid;
+        if contrast > mid {
+            contrast = SLIDER_RANGE - (span / range) * mid;
+        }
+        let contrast_pos = contrast as i32;
 
         [min_pos, max_pos, brightness_pos, contrast_pos]
     }
@@ -194,6 +187,17 @@ mod tests {
 
         let state_16bit = ContrastState::with_defaults(0.0, 4095.0);
         assert_eq!(slider_positions(&state_16bit), [0, 255, 128, 128]);
+    }
+
+    #[test]
+    fn table_test_inverted_range_slider_positions() {
+        // ContrastAdjuster.java lines 487-492: with max-min=-100, c=(255/-100)*128=-326.4.
+        let state = ContrastState::new(0.0, 255.0, 200.0, 100.0);
+        assert_eq!(state.slider_positions(), [200, 100, 105, -326]);
+
+        // The same Java expressions produce NaN when both defaults are zero;
+        // Java's `(int)Double.NaN` conversion yields zero for each slider.
+        assert_eq!(ContrastState::with_defaults(0.0, 0.0).slider_positions(), [0; 4]);
     }
 
     #[test]
