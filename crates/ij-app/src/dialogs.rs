@@ -2,6 +2,23 @@ use ij_bridge::plugin_discovery::{DiscoveredPlugin, PluginCatalog, PluginKind};
 use ij_session::ImageId;
 use std::path::PathBuf;
 
+/// Editable state of `Image > Duplicate...`.
+///
+/// `source` pins the image that was active when the dialog opened. Duplicating
+/// after the focus moved must not fall through to whichever image happens to be
+/// active when OK is pressed. `stack_size` and `range` follow Duplicator's
+/// dialog: the Range field is shown only for stacks and defaults to
+/// `1-<stackSize>` (original_imagej/ij/plugin/Duplicator.java 485-521).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DuplicateDialog {
+    pub open: bool,
+    pub source: Option<ImageId>,
+    pub title: String,
+    pub duplicate_stack: bool,
+    pub range: String,
+    pub stack_size: u32,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DialogState {
     pub show_about: bool,
@@ -23,6 +40,10 @@ pub struct DialogState {
     pub plugin_filter_classpath: Vec<PathBuf>,
     pub plugin_filter_classpath_input: String,
     pub plugin_filter_target_id: Option<ImageId>,
+    pub duplicate: DuplicateDialog,
+    /// Duplicator's `staticDuplicateStack`: the checkbox starts checked again
+    /// on the next stack duplicate (Duplicator.java 56, 528).
+    pub duplicate_stack_default: bool,
 }
 
 impl DialogState {
@@ -45,6 +66,8 @@ impl DialogState {
             plugin_filter_classpath: Vec::new(),
             plugin_filter_classpath_input: String::new(),
             plugin_filter_target_id: None,
+            duplicate: DuplicateDialog::default(),
+            duplicate_stack_default: false,
         }
     }
 }

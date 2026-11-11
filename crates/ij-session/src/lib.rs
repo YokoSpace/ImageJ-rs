@@ -217,6 +217,25 @@ pub enum Command {
     /// active threshold without touching pixels.
     ResetThreshold,
     InvertStack,
+    /// Whole-stack answers to the "Process Stack?" prompt for the grayscale
+    /// filters. Each one records ImageJ's `stack` option
+    /// (original_imagej/ij/IJ.java 1287).
+    SmoothStack,
+    SharpenStack,
+    FindEdgesStack,
+    GaussianBlurStack {
+        sigma: f64,
+    },
+    MedianStack {
+        radius: f64,
+    },
+    MinimumStack {
+        radius: f64,
+    },
+    MaximumStack {
+        radius: f64,
+    },
+    DespeckleStack,
     Undo,
     /// `Analyze > Set Measurements...` updates session measurement options.
     SetMeasurements { flags: u32, precision: u8 },
@@ -995,12 +1014,12 @@ impl Session {
                 // answer to the Process Stack? dialog, which IJ.setupDialog
                 // records as the `slice` option (IJ.java lines 1287-1291).
                 doc.rank_filter(ij_core::RankFilterKind::Median, radius)?;
-                // GenericDialog records the "Radius" field and trims trailing
-                // ".0"/".00" (GenericDialog.java lines 1230-1250,
-                // Recorder.java lines 472-482).
-                let suffix = if is_stack { " slice" } else { "" };
+                // RankFilters.setup calls IJ.setupDialog before showDialog
+                // records the Radius field (RankFilters.java 160, 116-145), so
+                // the stack answer comes first: "slice radius=2".
+                let prefix = if is_stack { "slice " } else { "" };
                 self.macro_recorder
-                    .push(format!("run(\"Median...\", \"radius={radius}{suffix}\");"));
+                    .push(format!("run(\"Median...\", \"{prefix}radius={radius}\");"));
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
@@ -1008,9 +1027,9 @@ impl Session {
                 let doc = self.active_doc_mut()?;
                 let is_stack = doc.stack_size() > 1;
                 doc.rank_filter(ij_core::RankFilterKind::Minimum, radius)?;
-                let suffix = if is_stack { " slice" } else { "" };
+                let prefix = if is_stack { "slice " } else { "" };
                 self.macro_recorder
-                    .push(format!("run(\"Minimum...\", \"radius={radius}{suffix}\");"));
+                    .push(format!("run(\"Minimum...\", \"{prefix}radius={radius}\");"));
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
@@ -1018,9 +1037,9 @@ impl Session {
                 let doc = self.active_doc_mut()?;
                 let is_stack = doc.stack_size() > 1;
                 doc.rank_filter(ij_core::RankFilterKind::Maximum, radius)?;
-                let suffix = if is_stack { " slice" } else { "" };
+                let prefix = if is_stack { "slice " } else { "" };
                 self.macro_recorder
-                    .push(format!("run(\"Maximum...\", \"radius={radius}{suffix}\");"));
+                    .push(format!("run(\"Maximum...\", \"{prefix}radius={radius}\");"));
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
@@ -1106,6 +1125,109 @@ impl Session {
                         .push("run(\"Invert\", \"stack\");".into());
                 } else {
                     self.macro_recorder.push("run(\"Invert\");".into());
+                }
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::SmoothStack => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.smooth_stack()?;
+                if is_stack {
+                    self.macro_recorder
+                        .push("run(\"Smooth\", \"stack\");".into());
+                } else {
+                    self.macro_recorder.push("run(\"Smooth\");".into());
+                }
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::SharpenStack => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.sharpen_stack()?;
+                if is_stack {
+                    self.macro_recorder
+                        .push("run(\"Sharpen\", \"stack\");".into());
+                } else {
+                    self.macro_recorder.push("run(\"Sharpen\");".into());
+                }
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::FindEdgesStack => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.find_edges_stack()?;
+                if is_stack {
+                    self.macro_recorder
+                        .push("run(\"Find Edges\", \"stack\");".into());
+                } else {
+                    self.macro_recorder.push("run(\"Find Edges\");".into());
+                }
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::GaussianBlurStack { sigma } => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.gaussian_blur_stack(sigma)?;
+                // GaussianBlur.showDialog records sigma before IJ.setupDialog
+                // records the stack answer (GaussianBlur.java 96-104).
+                let sigma = format!("{sigma}");
+                if is_stack {
+                    self.macro_recorder.push(format!(
+                        "run(\"Gaussian Blur...\", \"sigma={sigma} stack\");"
+                    ));
+                } else {
+                    self.macro_recorder
+                        .push(format!("run(\"Gaussian Blur...\", \"sigma={sigma}\");"));
+                }
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MedianStack { radius } => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.median_stack(radius)?;
+                let prefix = if is_stack { "stack " } else { "" };
+                self.macro_recorder.push(format!(
+                    "run(\"Median...\", \"{prefix}radius={radius}\");"
+                ));
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MinimumStack { radius } => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.minimum_stack(radius)?;
+                let prefix = if is_stack { "stack " } else { "" };
+                self.macro_recorder.push(format!(
+                    "run(\"Minimum...\", \"{prefix}radius={radius}\");"
+                ));
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MaximumStack { radius } => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.maximum_stack(radius)?;
+                let prefix = if is_stack { "stack " } else { "" };
+                self.macro_recorder.push(format!(
+                    "run(\"Maximum...\", \"{prefix}radius={radius}\");"
+                ));
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::DespeckleStack => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.despeckle_stack()?;
+                if is_stack {
+                    self.macro_recorder
+                        .push("run(\"Despeckle\", \"stack\");".into());
+                } else {
+                    self.macro_recorder.push("run(\"Despeckle\");".into());
                 }
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)

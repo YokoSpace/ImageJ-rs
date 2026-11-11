@@ -2,7 +2,7 @@ use egui::{Context, RawInput};
 use ij_app::app::ImageJApp;
 use ij_app::stack_process::{StackOperation, StackProcessChoice, StackProcessOutcome};
 use ij_core::{ImageDocument, PixelPlane};
-use ij_session::ImageId;
+use ij_session::{ImageId, SessionError};
 
 /// Three 4x4 slices with distinct ramps, current slice set to 2, clean state.
 fn stack_fixture() -> (ImageJApp, ImageId, Vec<PixelPlane>) {
@@ -34,6 +34,36 @@ fn gray8(plane: &PixelPlane) -> &[u8] {
 
 fn inverted(plane: &PixelPlane) -> PixelPlane {
     PixelPlane::Gray8(gray8(plane).iter().map(|&p| 255 - p).collect())
+}
+
+/// Every operation the "Process Stack?" dialog can ask about.
+fn all_stack_operations() -> Vec<StackOperation> {
+    vec![
+        StackOperation::Invert,
+        StackOperation::Smooth,
+        StackOperation::Sharpen,
+        StackOperation::FindEdges,
+        StackOperation::GaussianBlur { sigma: 1.5 },
+        StackOperation::Median { radius: 2.0 },
+        StackOperation::Minimum { radius: 2.0 },
+        StackOperation::Maximum { radius: 2.0 },
+        StackOperation::Despeckle,
+    ]
+}
+
+/// Starts the operation through the same entry point the Process menu uses.
+fn invoke(app: &mut ImageJApp, operation: &StackOperation) -> Result<(), SessionError> {
+    match operation {
+        StackOperation::Invert => app.invert_active(),
+        StackOperation::Smooth => app.smooth_active(),
+        StackOperation::Sharpen => app.sharpen_active(),
+        StackOperation::FindEdges => app.find_edges_active(),
+        StackOperation::GaussianBlur { sigma } => app.gaussian_blur_active(*sigma),
+        StackOperation::Median { radius } => app.median_active(*radius),
+        StackOperation::Minimum { radius } => app.minimum_active(*radius),
+        StackOperation::Maximum { radius } => app.maximum_active(*radius),
+        StackOperation::Despeckle => app.despeckle_active(),
+    }
 }
 
 #[test]
@@ -107,35 +137,112 @@ fn stack_cancel_leaves_pixels_and_dirty_state_untouched() {
 }
 
 #[test]
-fn unimplemented_whole_stack_filter_refuses_yes_and_requires_a_choice() {
-    let (mut app, id, original) = stack_fixture();
+fn every_stack_operation_offers_whole_stack_processing() {
+    for operation in all_stack_operations() {
+        assert!(
+            operation.supports_whole_stack(),
+            "{} must support whole-stack processing",
+            operation.display_name()
+        );
+        assert!(
+            operation.whole_stack_command().is_some(),
+            "{} must map to a whole-stack command",
+            operation.display_name()
+        );
+        assert!(
+            operation.whole_stack_limitation().is_none(),
+            "{} must not report a whole-stack limitation",
+            operation.display_name()
+        );
+    }
+}
 
-    app.smooth_active().unwrap();
-    let outcome = app.resolve_stack_process(StackProcessChoice::All).unwrap();
-    assert_eq!(outcome, StackProcessOutcome::UnsupportedWholeStack);
+#[test]
+fn every_stack_operation_applies_choice_all_to_every_slice() {
+    for operation in all_stack_operations() {
+        let (mut app, id, original) = stack_fixture();
+        invoke(&mut app, &operation).unwrap();
+        assert!(app.pending_stack_process.is_some());
 
-    // No silent fallback: pixels, macro and dirty flag stay untouched and the
-    // question remains open for an explicit Current Slice or Cancel.
-    assert!(app.pending_stack_process.is_some());
-    assert_eq!(app.session.get_image(id).unwrap().slices, original);
-    assert!(!app.is_dirty(id));
-    assert!(app.session.macro_recorder.is_empty());
-    assert!(app.status_message.contains("not implemented"));
+        let outcome = app.resolve_stack_process(StackProcessChoice::All).unwrap();
+        assert_eq!(
+            outcome,
+            StackProcessOutcome::Applied,
+            "{} must accept the Yes answer",
+            operation.display_name()
+        );
+        assert!(app.pending_stack_process.is_none());
 
-    let outcome = app
-        .resolve_stack_process(StackProcessChoice::Current)
-        .unwrap();
-    assert_eq!(outcome, StackProcessOutcome::Applied);
-    assert!(app.pending_stack_process.is_none());
+        let doc = app.session.get_image(id).unwrap();
+        assert_eq!(
+            doc.current_slice,
+            2,
+            "{} must preserve the selected slice",
+            operation.display_name()
+        );
+        for (index, (after, before)) in doc.slices.iter().zip(original.iter()).enumerate() {
+            assert_ne!(
+                after,
+                before,
+                "{} must filter slice {}",
+                operation.display_name(),
+                index + 1
+            );
+        }
 
-    let slices = &app.session.get_image(id).unwrap().slices;
-    assert_eq!(slices[0], original[0]);
-    assert_ne!(slices[1], original[1]);
-    assert_eq!(slices[2], original[2]);
-    assert_eq!(
-        app.session.macro_recorder.last().map(String::as_str),
-        Some("run(\"Smooth\", \"slice\");")
-    );
+        // One recorder run with the `stack` option, exactly like
+        // IJ.setupDialog's "Yes" answer (IJ.java 1287).
+        assert_eq!(
+            app.session.macro_recorder.len(),
+            1,
+            "{} must record exactly one command",
+            operation.display_name()
+        );
+        let recorded = &app.session.macro_recorder[0];
+        assert!(
+            recorded.contains("stack"),
+            "{} must record the stack option, got {recorded}",
+            operation.display_name()
+        );
+        assert!(app.is_dirty(id));
+
+        // PlugInFilterRunner calls Undo.reset() for a complete stack
+        // (PlugInFilterRunner.java 118-120).
+        assert_eq!(
+            app.undo_active().unwrap(),
+            ij_session::CommandOutcome::NothingToUndo,
+            "{} must not leave an undo snapshot",
+            operation.display_name()
+        );
+    }
+}
+
+#[test]
+fn every_stack_operation_current_slice_choice_only_filters_the_selected_slice() {
+    for operation in all_stack_operations() {
+        let (mut app, id, original) = stack_fixture();
+        invoke(&mut app, &operation).unwrap();
+
+        let outcome = app
+            .resolve_stack_process(StackProcessChoice::Current)
+            .unwrap();
+        assert_eq!(outcome, StackProcessOutcome::Applied);
+
+        let doc = app.session.get_image(id).unwrap();
+        assert_eq!(doc.current_slice, 2);
+        assert_eq!(doc.slices[0], original[0]);
+        assert_ne!(doc.slices[1], original[1]);
+        assert_eq!(doc.slices[2], original[2]);
+
+        assert_eq!(app.session.macro_recorder.len(), 1);
+        let recorded = &app.session.macro_recorder[0];
+        assert!(
+            recorded.contains("slice"),
+            "{} must record the slice option, got {recorded}",
+            operation.display_name()
+        );
+        assert!(!recorded.contains("stack"));
+    }
 }
 
 #[test]

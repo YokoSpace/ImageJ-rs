@@ -297,6 +297,10 @@ impl ImageJApp {
             }
         }
 
+        if self.dialogs.duplicate.open {
+            self.render_duplicate_dialog(ctx);
+        }
+
         if self.dialogs.show_brightness_contrast {
             self.render_bc_palette(ctx);
         }
@@ -905,6 +909,238 @@ impl ImageJApp {
     }
 }
 
+/// Parses Duplicator's Range field. `Tools.split(text, " -")` collapses runs of
+/// spaces/hyphens, a missing last token means `stackSize`, and the Java
+/// `(int)` casts truncate toward zero before the 1..stackSize clamp
+/// (original_imagej/ij/plugin/Duplicator.java 511-521).
+pub fn parse_duplicate_range(range: &str, stack_size: u32) -> (u32, u32) {
+    let stack_size = stack_size.max(1);
+    let tokens: Vec<&str> = range
+        .split([' ', '-'])
+        .filter(|token| !token.is_empty())
+        .collect();
+    let parse = |token: &str| token.trim().parse::<f64>().ok().unwrap_or(f64::NAN);
+    let d1 = tokens.first().map(|token| parse(token)).unwrap_or(1.0);
+    // Java only parses a second token when exactly two were produced; every
+    // other shape leaves d2 at its `stackSize` default (Duplicator.java 512-518).
+    let d2 = if tokens.len() == 2 {
+        parse(tokens[1])
+    } else {
+        f64::from(stack_size)
+    };
+    let mut first = if d1.is_nan() { 1 } else { d1 as i64 };
+    let mut last = if d2.is_nan() {
+        i64::from(stack_size)
+    } else {
+        d2 as i64
+    };
+    if first < 1 {
+        first = 1;
+    }
+    if last > i64::from(stack_size) {
+        last = i64::from(stack_size);
+    }
+    if first > last {
+        first = 1;
+        last = i64::from(stack_size);
+    }
+    (first.max(1) as u32, last.max(1) as u32)
+}
+
+const DUPLICATE_BUTTON_RECT_ID: &str = "ij_duplicate_button_rect";
+
+impl ImageJApp {
+    /// Opens `Image > Duplicate...` for the image that is active right now and
+    /// pins that `ImageId`; later focus changes must not retarget the dialog.
+    pub fn open_duplicate_dialog(&mut self) {
+        let Some(id) = self.session.active_image_id() else {
+            self.status_message = "Duplicate requires an active image".into();
+            return;
+        };
+        let (title, stack_size) = {
+            let Some(doc) = self.session.get_image(id) else {
+                self.status_message = "Duplicate requires an active image".into();
+                return;
+            };
+            let existing: Vec<String> = self
+                .session
+                .image_ids()
+                .into_iter()
+                .filter_map(|image_id| self.session.get_image(image_id))
+                .map(|image| image.title.clone())
+                .collect();
+            let existing: Vec<&str> = existing.iter().map(String::as_str).collect();
+            (
+                ij_core::default_duplicate_title(&existing, &doc.title),
+                doc.stack_size() as u32,
+            )
+        };
+        self.dialogs.duplicate = crate::dialogs::DuplicateDialog {
+            open: true,
+            source: Some(id),
+            title,
+            // Duplicator.java 56 and 485-486.
+            duplicate_stack: stack_size > 1 && self.dialogs.duplicate_stack_default,
+            range: format!("1-{stack_size}"),
+            stack_size,
+        };
+    }
+
+    /// Cancel leaves the session untouched (Duplicator.java 503-504, 527-529).
+    pub fn cancel_duplicate_dialog(&mut self) {
+        self.dialogs.duplicate.open = false;
+    }
+
+    /// Applies the dialog draft as exactly one `Command::Duplicate`. The pinned
+    /// source is activated immediately before dispatch so a focus change while
+    /// the dialog was open cannot duplicate a different image.
+    pub fn apply_duplicate_dialog(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Result<Option<ImageId>, SessionError> {
+        if !self.dialogs.duplicate.open {
+            return Ok(None);
+        }
+        let dialog = self.dialogs.duplicate.clone();
+        self.dialogs.duplicate.open = false;
+
+        let Some(source) = dialog.source else {
+            self.status_message = "Duplicate source is no longer open".into();
+            return Ok(None);
+        };
+        if self.session.get_image(source).is_none() {
+            self.status_message = "Duplicate source is no longer open".into();
+            return Ok(None);
+        }
+        if let Some(err) = self.reject_while_closing("Duplicate") {
+            return Err(err);
+        }
+
+        let previous_active = self.session.active_image_id();
+        if previous_active != Some(source) {
+            if let Err(error) = self.session.set_active_image(source) {
+                self.status_message = format!("Duplicate failed: {error}");
+                self.dialogs.last_error = Some(format!("Duplicate failed: {error}"));
+                return Err(error);
+            }
+        }
+
+        let stack_size = dialog.stack_size.max(1);
+        let is_stack = stack_size > 1;
+        let duplicate_stack = dialog.duplicate_stack && is_stack;
+        let (first, last) = parse_duplicate_range(&dialog.range, stack_size);
+        let command = Command::Duplicate {
+            title: Some(dialog.title.clone()),
+            duplicate_stack,
+            first_slice: duplicate_stack.then_some(first),
+            last_slice: duplicate_stack.then_some(last),
+        };
+
+        match self.session.dispatch(command) {
+            Ok(CommandOutcome::ImageOpened(id)) => {
+                if is_stack {
+                    self.dialogs.duplicate_stack_default = dialog.duplicate_stack;
+                }
+                if let Some(doc) = self.session.get_image(id) {
+                    let (width, height, title) = (doc.width, doc.height, doc.title.clone());
+                    self.image_views.insert(id, ImageView::new(width, height));
+                    self.status_message = format!("Duplicated \"{title}\"");
+                }
+                let _ = self.activate_image_window(id, ctx);
+                Ok(Some(id))
+            }
+            Ok(_) => {
+                if let Some(previous) = previous_active {
+                    if previous != source {
+                        let _ = self.session.set_active_image(previous);
+                    }
+                }
+                Ok(None)
+            }
+            Err(error) => {
+                if let Some(previous) = previous_active {
+                    if previous != source {
+                        let _ = self.session.set_active_image(previous);
+                    }
+                }
+                self.status_message = format!("Duplicate failed: {error}");
+                self.dialogs.last_error = Some(format!("Duplicate failed: {error}"));
+                Err(error)
+            }
+        }
+    }
+
+    pub fn duplicate_button_rect(ctx: &egui::Context, label: &str) -> Option<egui::Rect> {
+        ctx.data(|data| data.get_temp(egui::Id::new((DUPLICATE_BUTTON_RECT_ID, label))))
+    }
+
+    /// Content shared by the immediate viewport and headless egui tests.
+    pub fn render_duplicate_content(&mut self, ui: &mut egui::Ui) {
+        let mut dialog = self.dialogs.duplicate.clone();
+        ui.horizontal(|ui| {
+            ui.label("Title: ");
+            ui.add(egui::TextEdit::singleline(&mut dialog.title).desired_width(220.0));
+        });
+        if dialog.stack_size > 1 {
+            // Duplicator.java 487-489.
+            ui.checkbox(&mut dialog.duplicate_stack, "Duplicate stack");
+            ui.horizontal(|ui| {
+                ui.label("Range:");
+                ui.add(egui::TextEdit::singleline(&mut dialog.range).desired_width(80.0));
+            });
+        }
+        ui.separator();
+        let mut action = None;
+        ui.horizontal(|ui| {
+            for label in ["OK", "Cancel"] {
+                let response = ui.button(label);
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new((DUPLICATE_BUTTON_RECT_ID, label)),
+                        response.rect,
+                    )
+                });
+                if response.clicked() {
+                    action = Some(label);
+                }
+            }
+        });
+        self.dialogs.duplicate = dialog;
+        match action {
+            Some("OK") => {
+                let _ = self.apply_duplicate_dialog(ui.ctx());
+            }
+            Some(_) => self.cancel_duplicate_dialog(),
+            None => {}
+        }
+    }
+
+    fn render_duplicate_dialog(&mut self, ctx: &egui::Context) {
+        let mut cancel = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_duplicate_dialog"),
+            egui::ViewportBuilder::default()
+                .with_title("Duplicate...")
+                .with_inner_size([380.0, 200.0])
+                .with_resizable(false),
+            |ctx, class| {
+                let is_embedded = matches!(class, egui::ViewportClass::Embedded);
+                if (!is_embedded && ctx.input(|i| i.viewport().close_requested()))
+                    || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    cancel = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.render_duplicate_content(ui);
+                });
+            },
+        );
+        if cancel {
+            self.cancel_duplicate_dialog();
+        }
+    }
+}
+
 fn render_option_group(
     ui: &mut egui::Ui,
     first: usize,
@@ -1234,5 +1470,296 @@ impl ImageJApp {
         } else if let Some(state) = self.plot_profile_window.as_mut() {
             state.show_list = show_list;
         }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_dialog_tests {
+    use super::*;
+    use crate::action::AppAction;
+    use egui::{
+        CentralPanel, Context, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2,
+    };
+    use ij_core::ImageDocument;
+
+    fn stack_fixture() -> (ImageJApp, ImageId) {
+        let planes: Vec<PixelPlane> = (1..=4u8)
+            .map(|value| PixelPlane::Gray8(vec![value; 4]))
+            .collect();
+        let doc = ImageDocument::new_stack("stack.tif", 2, 2, planes).unwrap();
+        let mut app = ImageJApp::new();
+        let id = app.session.insert_doc(doc);
+        app.image_views.insert(id, ImageView::new(2, 2));
+        app.set_active_window(id).unwrap();
+        (app, id)
+    }
+
+    fn render_duplicate(ctx: &Context, app: &mut ImageJApp, events: Vec<Event>) {
+        let mut input = RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(420.0, 220.0)));
+        input.events = events;
+        let _ = ctx.run(input, |ctx| {
+            CentralPanel::default().show(ctx, |ui| app.render_duplicate_content(ui));
+        });
+    }
+
+    fn click_duplicate_button(ctx: &Context, app: &mut ImageJApp, label: &str) {
+        render_duplicate(ctx, app, vec![]);
+        let pos = ImageJApp::duplicate_button_rect(ctx, label)
+            .unwrap_or_else(|| panic!("missing duplicate dialog button rect for {label}"))
+            .center();
+        render_duplicate(ctx, app, vec![Event::PointerMoved(pos)]);
+        render_duplicate(
+            ctx,
+            app,
+            vec![Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+        render_duplicate(
+            ctx,
+            app,
+            vec![Event::PointerButton {
+                pos,
+                button: PointerButton::Primary,
+                pressed: false,
+                modifiers: Modifiers::NONE,
+            }],
+        );
+    }
+
+    #[test]
+    fn dialog_defaults_to_unique_title_and_stack_controls() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let id = app.open_ramp_8bit("blobs.tif", 4, 4).unwrap();
+
+        app.perform(AppAction::Duplicate, &ctx);
+
+        let dialog = &app.dialogs.duplicate;
+        assert!(dialog.open);
+        assert_eq!(dialog.source, Some(id));
+        // WindowManager.getUniqueName (WindowManager.java 357-385) and
+        // Duplicator.java 54-56.
+        assert_eq!(dialog.title, "blobs-1.tif");
+        assert!(!dialog.duplicate_stack);
+        assert_eq!(dialog.stack_size, 1);
+        assert_eq!(dialog.range, "1-1");
+
+        let (mut app, id) = stack_fixture();
+        app.perform(AppAction::Duplicate, &ctx);
+        let dialog = &app.dialogs.duplicate;
+        assert_eq!(dialog.source, Some(id));
+        assert_eq!(dialog.title, "stack-1.tif");
+        assert!(!dialog.duplicate_stack);
+        assert_eq!(dialog.stack_size, 4);
+        // Duplicator.java 488-489.
+        assert_eq!(dialog.range, "1-4");
+    }
+
+    #[test]
+    fn range_parsing_matches_duplicator_show_dialog() {
+        // Duplicator.java 511-521.
+        assert_eq!(parse_duplicate_range("2-3", 4), (2, 3));
+        assert_eq!(parse_duplicate_range(" 2 - 3 ", 4), (2, 3));
+        assert_eq!(parse_duplicate_range("", 4), (1, 4));
+        assert_eq!(parse_duplicate_range("3", 4), (3, 4));
+        assert_eq!(parse_duplicate_range("0-9", 4), (1, 4));
+        assert_eq!(parse_duplicate_range("3-1", 4), (1, 4));
+        assert_eq!(parse_duplicate_range("abc", 4), (1, 4));
+    }
+
+    #[test]
+    fn cancel_keeps_session_unchanged() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let id = app.open_ramp_8bit("blobs.tif", 4, 4).unwrap();
+        app.session.macro_recorder.clear();
+        app.perform(AppAction::Duplicate, &ctx);
+        app.dialogs.duplicate.title = "changed".into();
+        app.dialogs.duplicate.range = "2-3".into();
+
+        app.cancel_duplicate_dialog();
+
+        assert!(!app.dialogs.duplicate.open);
+        assert_eq!(app.session.image_ids(), vec![id]);
+        assert_eq!(app.session.active_image_id(), Some(id));
+        assert!(app.session.macro_recorder.is_empty());
+        assert_eq!(app.image_views.len(), 1);
+    }
+
+    #[test]
+    fn single_duplicate_opens_registered_view_and_records_one_command() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let source = app.open_ramp_8bit("blobs.tif", 4, 4).unwrap();
+        app.perform(AppAction::Duplicate, &ctx);
+        app.dialogs.duplicate.title = "copy".into();
+
+        let new_id = app
+            .apply_duplicate_dialog(&ctx)
+            .unwrap()
+            .expect("OK should open a duplicate");
+
+        assert_ne!(new_id, source);
+        assert_eq!(app.session.image_ids().len(), 2);
+        assert_eq!(app.session.active_image_id(), Some(new_id));
+        assert!(app.image_views.contains_key(&new_id));
+        assert_eq!(app.image_views[&new_id].width, 4);
+        assert_eq!(app.image_views[&new_id].height, 4);
+        assert_eq!(app.session.get_image(new_id).unwrap().title, "copy");
+        assert_eq!(
+            app.session.get_image(source).unwrap().title,
+            "blobs.tif",
+            "the source document must survive the duplicate"
+        );
+
+        // One and only one macro entry, produced by Command::Duplicate.
+        let records: Vec<_> = app
+            .session
+            .macro_recorder
+            .iter()
+            .filter(|record| record.starts_with("run(\"Duplicate...\""))
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0],
+            "run(\"Duplicate...\", \"title=copy\");"
+        );
+    }
+
+    #[test]
+    fn headless_dialog_ok_opens_duplicate() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        app.open_ramp_8bit("blobs.tif", 4, 4).unwrap();
+        app.session.macro_recorder.clear();
+        app.perform(AppAction::Duplicate, &ctx);
+
+        click_duplicate_button(&ctx, &mut app, "OK");
+
+        assert!(!app.dialogs.duplicate.open);
+        assert_eq!(app.session.image_ids().len(), 2);
+        assert_eq!(app.image_views.len(), 2);
+        assert_eq!(app.session.macro_recorder.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_preserves_source_roi_calibration_and_display() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let source = app.open_ramp_8bit("blobs.tif", 10, 8).unwrap();
+        {
+            let doc = app.session.get_image_mut(source).unwrap();
+            doc.set_rect_roi(2, 1, 4, 3).unwrap();
+            doc.calibration.pixel_width = 0.5;
+            doc.calibration.pixel_height = 0.25;
+            doc.calibration.unit = "mm".into();
+            doc.display_range = ij_core::DisplayRange {
+                min: 10.0,
+                max: 200.0,
+            };
+        }
+        let before = app.session.get_image(source).unwrap().clone();
+
+        app.perform(AppAction::Duplicate, &ctx);
+        app.apply_duplicate_dialog(&ctx).unwrap().unwrap();
+
+        assert_eq!(app.session.get_image(source), Some(&before));
+    }
+
+    #[test]
+    fn stack_range_two_to_three_copies_only_selected_slices() {
+        let ctx = Context::default();
+        let (mut app, source) = stack_fixture();
+        let source_before = app.session.get_image(source).unwrap().clone();
+        app.perform(AppAction::Duplicate, &ctx);
+        {
+            let dialog = &mut app.dialogs.duplicate;
+            dialog.duplicate_stack = true;
+            dialog.range = "2-3".into();
+        }
+
+        let new_id = app.apply_duplicate_dialog(&ctx).unwrap().unwrap();
+
+        let new_doc = app.session.get_image(new_id).unwrap();
+        assert_eq!(new_doc.stack_size(), 2);
+        assert_eq!(
+            new_doc.slices,
+            vec![
+                PixelPlane::Gray8(vec![2; 4]),
+                PixelPlane::Gray8(vec![3; 4]),
+            ]
+        );
+        assert_eq!(app.session.get_image(source), Some(&source_before));
+        assert_eq!(
+            app.session.macro_recorder.last().map(String::as_str),
+            Some("run(\"Duplicate...\", \"title=stack-1.tif duplicate range=2-3\");")
+        );
+    }
+
+    #[test]
+    fn stack_checkbox_state_persists_like_static_duplicate_stack() {
+        let ctx = Context::default();
+        let (mut app, _) = stack_fixture();
+        app.perform(AppAction::Duplicate, &ctx);
+        app.dialogs.duplicate.duplicate_stack = true;
+        app.apply_duplicate_dialog(&ctx).unwrap().unwrap();
+
+        app.perform(AppAction::Duplicate, &ctx);
+        assert!(app.dialogs.duplicate.duplicate_stack);
+        // Duplicator.java 488-489 resets the Range field to 1-stackSize.
+        assert_eq!(app.dialogs.duplicate.range, "1-4");
+    }
+
+    #[test]
+    fn dialog_duplicates_pinned_source_when_focus_moves() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let first = app
+            .session
+            .insert_doc(ImageDocument::new("first", 2, 1, PixelPlane::Gray8(vec![1, 2])).unwrap());
+        app.image_views.insert(first, ImageView::new(2, 1));
+        app.set_active_window(first).unwrap();
+        let second = app
+            .session
+            .insert_doc(ImageDocument::new("second", 2, 1, PixelPlane::Gray8(vec![9, 9])).unwrap());
+        app.image_views.insert(second, ImageView::new(2, 1));
+        app.set_active_window(first).unwrap();
+
+        app.perform(AppAction::Duplicate, &ctx);
+        app.set_active_window(second).unwrap();
+        let new_id = app.apply_duplicate_dialog(&ctx).unwrap().unwrap();
+
+        let duplicated = app.session.get_image(new_id).unwrap();
+        assert_eq!(duplicated.title, "first-1");
+        assert_eq!(duplicated.slices, vec![PixelPlane::Gray8(vec![1, 2])]);
+        assert_eq!(
+            app.session.get_image(second).unwrap().slices,
+            vec![PixelPlane::Gray8(vec![9, 9])],
+            "the focused image must not be duplicated"
+        );
+    }
+
+    #[test]
+    fn closed_source_closes_dialog_without_dispatch() {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let source = app.open_ramp_8bit("blobs.tif", 4, 4).unwrap();
+        app.session.macro_recorder.clear();
+        app.perform(AppAction::Duplicate, &ctx);
+
+        app.session.close_image(source);
+        app.image_views.remove(&source);
+        let result = app.apply_duplicate_dialog(&ctx);
+
+        assert!(result.unwrap().is_none());
+        assert!(!app.dialogs.duplicate.open);
+        assert!(app.session.image_ids().is_empty());
+        assert!(app.session.macro_recorder.is_empty());
+        assert!(app.status_message.contains("no longer open"));
     }
 }

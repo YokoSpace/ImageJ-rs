@@ -4,9 +4,8 @@
 //! (`IJ.setupDialog`, original_imagej/ij/IJ.java lines 1247-1303). "No" runs
 //! the filter on the current slice and records the `slice` option; "Yes"
 //! processes the whole stack and records `stack`; "Cancel" aborts without
-//! touching the image. `ij-core` currently ports the stack-wide path only for
-//! Invert, so the dialog keeps the unsupported choices explicit instead of
-//! quietly falling back to the current slice.
+//! touching the image. Every operation in this module has a verified
+//! whole-stack path in `ij-core`.
 
 use ij_session::{Command, ImageId};
 
@@ -56,7 +55,18 @@ impl StackOperation {
 
     /// True when `ij-core` has a verified whole-stack implementation.
     pub fn supports_whole_stack(&self) -> bool {
-        matches!(self, Self::Invert)
+        matches!(
+            self,
+            Self::Invert
+                | Self::Smooth
+                | Self::Sharpen
+                | Self::FindEdges
+                | Self::GaussianBlur { .. }
+                | Self::Median { .. }
+                | Self::Minimum { .. }
+                | Self::Maximum { .. }
+                | Self::Despeckle
+        )
     }
 
     /// User-facing reason why "Yes" is not offered.
@@ -91,7 +101,14 @@ impl StackOperation {
     pub fn whole_stack_command(&self) -> Option<Command> {
         match self {
             Self::Invert => Some(Command::InvertStack),
-            _ => None,
+            Self::Smooth => Some(Command::SmoothStack),
+            Self::Sharpen => Some(Command::SharpenStack),
+            Self::FindEdges => Some(Command::FindEdgesStack),
+            Self::GaussianBlur { sigma } => Some(Command::GaussianBlurStack { sigma: *sigma }),
+            Self::Median { radius } => Some(Command::MedianStack { radius: *radius }),
+            Self::Minimum { radius } => Some(Command::MinimumStack { radius: *radius }),
+            Self::Maximum { radius } => Some(Command::MaximumStack { radius: *radius }),
+            Self::Despeckle => Some(Command::DespeckleStack),
         }
     }
 
@@ -114,7 +131,7 @@ impl StackOperation {
     pub fn whole_stack_success_message(&self, stack_size: usize) -> String {
         match self {
             Self::Invert => format!("Inverted all {stack_size} slices"),
-            _ => self.success_message(),
+            _ => format!("{} to all {stack_size} slices", self.success_message()),
         }
     }
 }

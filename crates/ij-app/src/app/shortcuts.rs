@@ -54,6 +54,16 @@ impl ImageJApp {
             return;
         }
 
+        let save = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::S)
+        });
+        if save {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::Save, ctx);
+            return;
+        }
+
         // Undo: Z or Command/Ctrl+Z (without Shift)
         let undo = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)
@@ -77,6 +87,13 @@ impl ImageJApp {
         if invert {
             let _ = self.set_active_window(target_id);
             self.perform(AppAction::Invert, ctx);
+            return;
+        }
+
+        // Duplicate: ImageJ's Image menu assigns Shift+D.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::D)) {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::Duplicate, ctx);
             return;
         }
 
@@ -104,6 +121,12 @@ impl ImageJApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
             let _ = self.set_active_window(target_id);
             self.perform(AppAction::Histogram, ctx);
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::K)) {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::PlotProfile, ctx);
             return;
         }
 

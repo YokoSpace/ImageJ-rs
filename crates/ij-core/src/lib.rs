@@ -2457,6 +2457,123 @@ impl ImageDocument {
         }
     }
 
+    /// Runs one grayscale filter on every slice, matching the "Yes" answer to
+    /// ImageJ's "Process Stack?" prompt.
+    ///
+    /// `IJ.setupDialog` adds `PlugInFilter.DOES_STACKS`
+    /// (original_imagej/ij/IJ.java 1252-1290), and
+    /// `PlugInFilterRunner.processStack` applies the same processor ROI to
+    /// every slice (original_imagej/ij/plugin/filter/PlugInFilterRunner.java
+    /// 181-199), so the current selection is reused slice by slice. A
+    /// complete-stack filter calls `Undo.reset()`
+    /// (PlugInFilterRunner.java 118-120), so only a one-plane image keeps a
+    /// snapshot and stays undoable (the same rule as [`Self::invert_stack`]).
+    ///
+    /// `apply` is the already-verified single-slice filter, so each slice is
+    /// processed exactly like the "No" answer to the same prompt. The planes
+    /// are swapped in one at a time so the filter's PlugInFilterRunner
+    /// snapshot (`PlugInFilterRunner.java 107-121`) copies one plane instead
+    /// of re-cloning the whole stack for every slice.
+    fn filter_all_slices(
+        &mut self,
+        filter: &'static str,
+        mut apply: impl FnMut(&mut Self) -> Result<(), CoreError>,
+    ) -> Result<(), CoreError> {
+        // Reject unsupported pixel types before touching any slice so a
+        // heterogeneous stack cannot be left half-filtered.
+        for plane in &self.slices {
+            match plane {
+                PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {}
+                PixelPlane::Color256 { .. } => {
+                    return Err(CoreError::UnsupportedFilter {
+                        filter,
+                        pixel_type: "8-bit color (indexed)",
+                    });
+                }
+                PixelPlane::ColorRgb(_) => {
+                    return Err(CoreError::UnsupportedFilter {
+                        filter,
+                        pixel_type: "RGB",
+                    });
+                }
+            }
+        }
+
+        let selected = self.current_slice;
+        let stack_size = self.slices.len();
+        let planes = std::mem::take(&mut self.slices);
+        let mut processed = Vec::with_capacity(planes.len());
+        let mut result = Ok(());
+        for plane in planes {
+            self.slices = vec![plane];
+            self.current_slice = 1;
+            if result.is_ok() {
+                if let Err(error) = apply(self) {
+                    result = Err(error);
+                }
+            }
+            // Keep the plane even after an error so no slice is ever dropped;
+            // `apply` only rewrites pixels, so this is still the same plane.
+            processed.append(&mut self.slices);
+        }
+        self.slices = processed;
+        self.current_slice = selected;
+        if stack_size > 1 {
+            self.snapshot = None;
+            self.snapshot_dimensions = None;
+            self.snapshot_display_range = None;
+        }
+        result
+    }
+
+    /// `run("Smooth", "stack")`: the whole-stack answer to Process > Smooth.
+    pub fn smooth_stack(&mut self) -> Result<(), CoreError> {
+        self.filter_all_slices("Smooth", |doc| doc.smooth())
+    }
+
+    /// `run("Sharpen", "stack")`: the whole-stack answer to Process > Sharpen.
+    pub fn sharpen_stack(&mut self) -> Result<(), CoreError> {
+        self.filter_all_slices("Sharpen", |doc| doc.sharpen())
+    }
+
+    /// `run("Find Edges", "stack")`: the whole-stack answer to Process > Find
+    /// Edges.
+    pub fn find_edges_stack(&mut self) -> Result<(), CoreError> {
+        self.filter_all_slices("Find Edges", |doc| doc.find_edges())
+    }
+
+    /// `run("Gaussian Blur...", "sigma=N stack")`.
+    pub fn gaussian_blur_stack(&mut self, sigma: f64) -> Result<(), CoreError> {
+        self.filter_all_slices("Gaussian Blur", |doc| doc.gaussian_blur(sigma))
+    }
+
+    /// `run("Median...", "stack radius=N")`.
+    pub fn median_stack(&mut self, radius: f64) -> Result<(), CoreError> {
+        self.filter_all_slices("Median", |doc| {
+            doc.rank_filter(RankFilterKind::Median, radius)
+        })
+    }
+
+    /// `run("Minimum...", "stack radius=N")`.
+    pub fn minimum_stack(&mut self, radius: f64) -> Result<(), CoreError> {
+        self.filter_all_slices("Minimum", |doc| {
+            doc.rank_filter(RankFilterKind::Minimum, radius)
+        })
+    }
+
+    /// `run("Maximum...", "stack radius=N")`.
+    pub fn maximum_stack(&mut self, radius: f64) -> Result<(), CoreError> {
+        self.filter_all_slices("Maximum", |doc| {
+            doc.rank_filter(RankFilterKind::Maximum, radius)
+        })
+    }
+
+    /// `run("Despeckle", "stack")`: the median filter with radius 1 on every
+    /// slice (RankFilters.java 117-119).
+    pub fn despeckle_stack(&mut self) -> Result<(), CoreError> {
+        self.filter_all_slices("Despeckle", |doc| doc.despeckle())
+    }
+
     pub fn measure(&self) -> Result<MeasurementSummary, CoreError> {
         self.measure_with_config(MeasurementConfig::default())
     }

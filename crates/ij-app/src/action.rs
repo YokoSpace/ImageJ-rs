@@ -6,6 +6,10 @@ use ij_session::{Command, CommandOutcome, ImageId};
 pub enum AppAction {
     NewRamp,
     OpenTiff,
+    /// `File > Save` (`Cmd+S`). `FileSaver.save()` re-saves a document that
+    /// already has a path and otherwise opens the Save As dialog
+    /// (original_imagej/ij/plugin/Commands.java 58-69).
+    Save,
     SaveAs,
     SaveResults,
     Close,
@@ -14,6 +18,7 @@ pub enum AppAction {
     Quit,
     Undo,
     Invert,
+    Duplicate,
     Crop,
     ConvertTo8Bit,
     ConvertTo16Bit,
@@ -95,14 +100,20 @@ const SEPARATOR: MenuNode = MenuNode {
 };
 
 const FILE_NEW: &[MenuNode] = &[item("Image... (8-bit Ramp)", None, AppAction::NewRamp)];
+// IJ_Props.txt File>Save As entries (original_imagej/IJ_Props.txt 49-66). Only
+// the two formats this app can actually write are wired.
+const FILE_SAVE_AS: &[MenuNode] = &[
+    item("Tiff...", None, AppAction::SaveAs),
+    item("Results...", None, AppAction::SaveResults),
+];
 const FILE_MENU: &[MenuNode] = &[
     submenu("New", FILE_NEW),
     item("Open...", None, AppAction::OpenTiff),
-    item("Save As... Tiff", None, AppAction::SaveAs),
-    item("Save As... Results", None, AppAction::SaveResults),
     SEPARATOR,
     item("Close", Some("W"), AppAction::Close),
     item("Close All", Some("Shift+W"), AppAction::CloseAll),
+    item("Save", Some("Cmd+S"), AppAction::Save),
+    submenu("Save As", FILE_SAVE_AS),
     SEPARATOR,
     unsupported("Revert", None),
     unsupported("Page Setup...", None),
@@ -146,7 +157,7 @@ const IMAGE_MENU: &[MenuNode] = &[
     submenu("Adjust", IMAGE_ADJUST),
     submenu("Stacks", IMAGE_STACKS),
     submenu("Type", IMAGE_TYPE),
-    unsupported("Duplicate...", None),
+    item("Duplicate...", Some("Shift+D"), AppAction::Duplicate),
     item("Crop", Some("Shift+X"), AppAction::Crop),
 ];
 
@@ -290,7 +301,7 @@ impl ImageJApp {
                         PixelPlane::Color256 { .. } => Err("32-bit conversion is not supported for 8-bit color images".into()),
                         _ => Ok(()),
                     },
-                    Median if !matches!(doc.plane(), PixelPlane::Gray8(_)) => Err("Median requires an 8-bit image".into()),
+                    Median if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)) => Err("Median requires a grayscale image".into()),
                     // ProfilePlot.java 53-62: only a line or rectangular
                     // selection produces a profile, and the two rejection
                     // messages are the ones the constructor prints.
@@ -321,6 +332,20 @@ impl ImageJApp {
                     .pick_file()
                 {
                     let _ = self.open_tiff_file(path);
+                }
+            }
+            Save => {
+                let Some(id) = self.active_image_id() else {
+                    return;
+                };
+                let path = match self.session.image_path(id).map(|path| path.to_path_buf()) {
+                    Some(path) => Some(path),
+                    None => rfd::FileDialog::new()
+                        .add_filter("TIFF Image", &["tif", "tiff"])
+                        .save_file(),
+                };
+                if let Some(path) = path {
+                    let _ = self.save_active_tiff(path);
                 }
             }
             SaveAs => {
@@ -361,6 +386,9 @@ impl ImageJApp {
             }
             Invert => {
                 let _ = self.invert_active();
+            }
+            Duplicate => {
+                self.open_duplicate_dialog();
             }
             Crop => {
                 let _ = self.crop_active();

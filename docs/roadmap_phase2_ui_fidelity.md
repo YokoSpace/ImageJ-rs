@@ -366,8 +366,8 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 
 ## 5.5 ここまでの進捗（2026-11-11 時点）
 
-- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1, M2.1–M2.2, M3a–M3d, M4a–M4c, M5, M6a, S1–S2, 英語・日本語 README。
-- **残りの Phase 2 タスク**: M2.3（Duplicate ダイアログ）、M6b（ウィンドウ実装済み、K キー接続待ち）、M7（スタック一括フィルタと保存メニュー）、N0–N1（macOS ネイティブメニュー）、P1（Plugins メニュー直結）。
+- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1–M7, S1–S2, 英語・日本語 README。
+- **残りの Phase 2 タスク**: N0–N1（macOS ネイティブメニュー）、P1（Plugins メニュー直結）。
 
 以下では、残りのタスクを `deepseek-V4.1-flash` / `Gemini flash` / `Claude Sonnet` が迷わず1タスクずつ完結できるよう、サブタスク・型シグネチャ・Java 参照行・先に書くテスト・非ゴールまで具体化しています。
 
@@ -433,7 +433,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
   - **M2.3 🟡 Duplicate ダイアログとメニュー配線（`ij-app`）**:
     - `Duplicate...` メニュー（`Shift+D`）でダイアログを開き、`Title` テキスト欄（初期値は `default_duplicate_title`）と、スタック時のみ `Duplicate stack` チェックボックスおよび `Range (1-N)` 入力欄を表示する。OK で `Command::Duplicate` を発行。
     - `menu_coverage_test.rs` の `KNOWN_UNWIRED` から `"Duplicate..."` を削除する。
-- **編集してよいファイル**: `crates/ij-core/src/lib.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`, `crates/ij-app/src/action.rs`, `crates/ij-app/src/dialogs.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/tests/menu_coverage_test.rs`
+- **編集してよいファイル**: `crates/ij-core/src/lib.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`, `crates/ij-app/src/action.rs`, `crates/ij-app/src/dialogs.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/src/app/shortcuts.rs`, `crates/ij-app/tests/menu_coverage_test.rs`
 - **先に書くテスト**:
   - `oracle_parity.rs`: 単一画像の全体複製、矩形・楕円 ROI 付き複製、4枚スタックの現在スライスのみ複製、4枚スタックの `range=2-3` 複製をオラクルと比較。
 - **受け入れ条件**: `KNOWN_UNWIRED` から `"Duplicate..."` が消え、`./tools/verify.sh` が `VERIFY_ALL_OK`。
@@ -564,7 +564,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 - **先に書くテスト**: `oracle_parity.rs` で (a) 矩形 ROI のプロファイル配列、(b) 水平・垂直・斜めの線分 ROI のプロファイル配列（8/16/32-bit）をオラクルの `getProfile()` と比較し、長さおよび全要素が `1e-4` 以内で一致すること。
 
 #### M6b Plot Profile ウィンドウと配線（`ij-app`）🟢
-- **編集してよいファイル**: `crates/ij-app/src/action.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/tests/plot_profile_ui_test.rs`（新規）
+- **編集してよいファイル**: `crates/ij-app/src/action.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/shortcuts.rs`, `crates/ij-app/tests/plot_profile_ui_test.rs`（新規）
 - **仕様**:
   - `AppAction::PlotProfile`（ショートカット `K`）を追加し、`ANALYZE_MENU` の `Plot Profile` を有効化（`action_enabled` は矩形または線分 ROI のときのみ `Ok`）。
   - 折れ線グラフ（egui painter で X 軸距離・Y 軸輝度を描画）と `List` ボタン（`(X, Y)` の一覧表示）を持つ `Plot of <short_title>` ウィンドウを表示する。
@@ -584,6 +584,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
   - `crates/ij-session/tests/oracle_parity.rs`
   - `crates/ij-app/src/stack_process.rs`
   - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/app/shortcuts.rs`
   - `crates/ij-app/tests/stack_process_test.rs`
   - `crates/ij-app/tests/menu_coverage_test.rs`
 - **仕様**:

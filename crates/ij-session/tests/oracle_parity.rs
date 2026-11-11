@@ -7410,7 +7410,7 @@ fn session_rank_filters_record_macro_and_update_pixels() {
         .unwrap();
     assert_eq!(
         stack_session.macro_recorder.last().map(String::as_str),
-        Some("run(\"Median...\", \"radius=2 slice\");")
+        Some("run(\"Median...\", \"slice radius=2\");")
     );
     stack_session.dispatch(Command::Despeckle).unwrap();
     assert_eq!(
@@ -12545,4 +12545,357 @@ fn session_plot_profile_preserves_document_and_records_macro() {
     }
     assert_eq!(session.active_doc().unwrap(), &before);
     assert!(!session.is_dirty(id));
+}
+
+// ---------------------------------------------------------------------------
+// M7: whole-stack ("Process Stack?" -> Yes) grayscale filters.
+//
+// IJ.setupDialog adds PlugInFilter.DOES_STACKS for the "Yes" answer
+// (original_imagej/ij/IJ.java 1252-1290), and PlugInFilterRunner.processStack
+// then applies the same processor ROI to every slice
+// (original_imagej/ij/plugin/filter/PlugInFilterRunner.java 181-199). A
+// complete-stack filter calls Undo.reset() (PlugInFilterRunner.java 118-120),
+// so no slice keeps an undo snapshot.
+// ---------------------------------------------------------------------------
+
+fn oracle_stack_filter(
+    bridge: &JavaOracleBridge,
+    doc: &ImageDocument,
+    prelude: &str,
+    macro_command: &str,
+) -> ImageDocument {
+    let out = bridge
+        .run_macro_on_image(doc, &format!("{prelude} {macro_command}"))
+        .unwrap();
+    out.output_image.expect("oracle must return saved TIFF")
+}
+
+/// Runs the whole-stack filter in Java and Rust and requires every slice of the
+/// three-slice stack to match exactly.
+fn assert_whole_stack_filter_matches_oracle(
+    mut doc: ImageDocument,
+    prelude: &str,
+    macro_command: &str,
+    apply: impl FnOnce(&mut ImageDocument),
+) {
+    assert_eq!(doc.slices.len(), 3, "these cases use three-slice stacks");
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = oracle_stack_filter(&bridge, &doc, prelude, macro_command);
+    let before = doc.slices.clone();
+
+    apply(&mut doc);
+
+    assert_eq!(doc.slices.len(), oracle.slices.len());
+    assert_eq!(doc.slices, oracle.slices);
+    assert!(
+        doc.slices.iter().zip(before.iter()).any(|(a, b)| a != b),
+        "the whole-stack filter must change at least one slice"
+    );
+}
+
+fn stack_filter_with_rect_roi(mut doc: ImageDocument) -> ImageDocument {
+    doc.set_rect_roi(1, 1, 4, 2).unwrap();
+    doc
+}
+
+#[test]
+fn parity_8bit_smooth_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Smooth\", \"stack\");",
+        |doc| doc.smooth_stack().unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Smooth\", \"stack\");",
+        |doc| doc.smooth_stack().unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_sharpen_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Sharpen\", \"stack\");",
+        |doc| doc.sharpen_stack().unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Sharpen\", \"stack\");",
+        |doc| doc.sharpen_stack().unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_find_edges_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Find Edges\", \"stack\");",
+        |doc| doc.find_edges_stack().unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Find Edges\", \"stack\");",
+        |doc| doc.find_edges_stack().unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_gaussian_blur_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Gaussian Blur...\", \"sigma=1.5 stack\");",
+        |doc| doc.gaussian_blur_stack(1.5).unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Gaussian Blur...\", \"sigma=1.5 stack\");",
+        |doc| doc.gaussian_blur_stack(1.5).unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_median_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Median...\", \"stack radius=2\");",
+        |doc| doc.median_stack(2.0).unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Median...\", \"stack radius=2\");",
+        |doc| doc.median_stack(2.0).unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_minimum_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Minimum...\", \"stack radius=2\");",
+        |doc| doc.minimum_stack(2.0).unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Minimum...\", \"stack radius=2\");",
+        |doc| doc.minimum_stack(2.0).unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_maximum_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Maximum...\", \"stack radius=2\");",
+        |doc| doc.maximum_stack(2.0).unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Maximum...\", \"stack radius=2\");",
+        |doc| doc.maximum_stack(2.0).unwrap(),
+    );
+}
+
+#[test]
+fn parity_8bit_despeckle_stack_with_and_without_roi_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Despeckle\", \"stack\");",
+        |doc| doc.despeckle_stack().unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Despeckle\", \"stack\");",
+        |doc| doc.despeckle_stack().unwrap(),
+    );
+}
+
+#[test]
+fn parity_16bit_stack_filters_match_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_16bit(6, 4, 3),
+        "",
+        "run(\"Smooth\", \"stack\");",
+        |doc| doc.smooth_stack().unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_16bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Gaussian Blur...\", \"sigma=1.5 stack\");",
+        |doc| doc.gaussian_blur_stack(1.5).unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_16bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Median...\", \"stack radius=2\");",
+        |doc| doc.median_stack(2.0).unwrap(),
+    );
+}
+
+#[test]
+fn parity_32bit_stack_filters_match_java_oracle() {
+    let mut slices = Vec::new();
+    for s in 0..3u32 {
+        let mut pixels = Vec::new();
+        for y in 0..4u32 {
+            for x in 0..6u32 {
+                let i = (y * 6 + x) as f32;
+                pixels.push(i * 0.17 + 0.003 * x as f32 + 0.9 * s as f32 - 1.1);
+            }
+        }
+        slices.push(PixelPlane::Gray32(pixels));
+    }
+    let doc = ImageDocument::new_stack("stack32.tif", 6, 4, slices).unwrap();
+
+    assert_whole_stack_filter_matches_oracle(
+        doc.clone(),
+        "",
+        "run(\"Sharpen\", \"stack\");",
+        |doc| doc.sharpen_stack().unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(doc),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Find Edges\", \"stack\");",
+        |doc| doc.find_edges_stack().unwrap(),
+    );
+}
+
+#[test]
+fn session_whole_stack_filters_record_stack_option_and_clear_undo() {
+    let cases: Vec<(Command, &str)> = vec![
+        (Command::SmoothStack, "run(\"Smooth\", \"stack\");"),
+        (Command::SharpenStack, "run(\"Sharpen\", \"stack\");"),
+        (Command::FindEdgesStack, "run(\"Find Edges\", \"stack\");"),
+        (
+            Command::GaussianBlurStack { sigma: 1.5 },
+            "run(\"Gaussian Blur...\", \"sigma=1.5 stack\");",
+        ),
+        (
+            Command::MedianStack { radius: 2.0 },
+            "run(\"Median...\", \"stack radius=2\");",
+        ),
+        (
+            Command::MinimumStack { radius: 2.0 },
+            "run(\"Minimum...\", \"stack radius=2\");",
+        ),
+        (
+            Command::MaximumStack { radius: 2.0 },
+            "run(\"Maximum...\", \"stack radius=2\");",
+        ),
+        (Command::DespeckleStack, "run(\"Despeckle\", \"stack\");"),
+    ];
+
+    for (index, (command, expected)) in cases.into_iter().enumerate() {
+        let path = temp_tiff(&format!("m7_stack_command_{index}.tif"));
+        save_tiff(&path, &distinct_stack_8bit(6, 4, 3)).unwrap();
+        let mut session = Session::new();
+        session.dispatch(Command::OpenTiff { path }).unwrap();
+        session.dispatch(Command::SetSlice { index: 2 }).unwrap();
+        let before = session.active_doc().unwrap().slices.clone();
+        let id = session.active_image_id().unwrap();
+
+        session.dispatch(command).unwrap();
+
+        let doc = session.active_doc().unwrap();
+        assert_eq!(doc.current_slice, 2, "the selected slice must be preserved");
+        assert_eq!(doc.slices.len(), 3);
+        for (slice_index, (after, original)) in doc.slices.iter().zip(before.iter()).enumerate() {
+            assert_ne!(
+                after, original,
+                "{expected}: slice {} must be filtered",
+                slice_index + 1
+            );
+        }
+        assert_eq!(
+            session.macro_recorder.last().map(String::as_str),
+            Some(expected),
+            "one recorder run with the stack option"
+        );
+        assert!(session.is_dirty(id));
+        // PlugInFilterRunner calls Undo.reset() for a complete stack.
+        assert_eq!(
+            session.dispatch(Command::Undo).unwrap(),
+            CommandOutcome::NothingToUndo
+        );
+    }
+}
+
+#[test]
+fn single_plane_stack_filter_keeps_undo_like_java_oracle() {
+    // IJ.setupDialog only prompts (and only resets Undo) when the stack has
+    // more than one slice, so a one-plane document stays undoable.
+    let mut doc = smooth_pattern_8bit(6, 4);
+    let before = doc.slices.clone();
+    doc.smooth_stack().unwrap();
+    assert_ne!(doc.slices, before);
+    assert!(doc.undo());
+    assert_eq!(doc.slices, before);
+}
+
+#[test]
+fn whole_stack_filters_reject_rgb_and_indexed_stacks_without_touching_pixels() {
+    let rgb = ImageDocument::new_stack(
+        "rgb_stack.tif",
+        4,
+        4,
+        vec![
+            PixelPlane::ColorRgb(vec![0xff80_4020; 16]),
+            PixelPlane::ColorRgb(vec![0xff11_2233; 16]),
+        ],
+    )
+    .unwrap();
+    let before = rgb.slices.clone();
+    let error = rgb.clone().smooth_stack().unwrap_err();
+    assert!(
+        error.to_string().contains("RGB") && error.to_string().contains("Smooth"),
+        "expected an explicit unsupported-type error, got: {error}"
+    );
+    assert_eq!(rgb.slices, before);
+
+    let mut indexed = ImageDocument::new_stack(
+        "indexed_stack.tif",
+        4,
+        4,
+        vec![
+            PixelPlane::Color256 {
+                pixels: vec![3u8; 16],
+                lut: Box::new(Lut256::default()),
+            },
+            PixelPlane::Color256 {
+                pixels: vec![7u8; 16],
+                lut: Box::new(Lut256::default()),
+            },
+        ],
+    )
+    .unwrap();
+    let before = indexed.slices.clone();
+    let error = indexed.clone().median_stack(2.0).unwrap_err();
+    assert!(
+        error.to_string().contains("8-bit color") && error.to_string().contains("Median"),
+        "expected an explicit unsupported-type error, got: {error}"
+    );
+    assert_eq!(indexed.slices, before);
+    // A single unsupported plane must also stop the filter before any slice is
+    // modified.
+    indexed.slices[1] = PixelPlane::Gray8(vec![9u8; 16]);
+    let before = indexed.slices.clone();
+    assert!(indexed.minimum_stack(1.0).is_err());
+    assert_eq!(indexed.slices, before);
 }
