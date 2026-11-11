@@ -633,6 +633,64 @@ fn parity_rgb_oval_roi_statistics_match_java_oracle() {
 const AREA_FRACTION_MEASUREMENTS: &str = "area mean area_fraction";
 
 #[test]
+fn parity_perimeter_for_area_rois_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let cases = [
+        ("no ROI", "", None, 1.0, 1.0),
+        ("rect", "makeRectangle(2,3,8,6);", Some("rect"), 1.0, 1.0),
+        ("oval", "makeOval(2,3,8,6);", Some("oval"), 1.0, 1.0),
+        ("polygon", "makePolygon(2,2,10,3,8,10,3,9);", Some("polygon"), 1.0, 1.0),
+        ("traced polygon", "makePolygon(2,2,10,2,10,8,2,8);", Some("traced"), 1.0, 1.0),
+        ("calibrated rect", "makeRectangle(2,3,8,6);", Some("rect"), 0.5, 0.25),
+        ("calibrated no ROI", "", None, 0.5, 0.25),
+    ];
+    for (name, roi_macro, roi_kind, pixel_width, pixel_height) in cases {
+        let cal_macro = if pixel_width == 1.0 {
+            String::new()
+        } else {
+            format!("setVoxelSize({pixel_width},{pixel_height},1,'mm');")
+        };
+        let oracle = bridge
+            .eval_macro(&format!(
+                "newImage('perimeter', '8-bit ramp', 16, 16, 1); {cal_macro} {roi_macro} \
+                 run('Set Measurements...', 'area perimeter decimal=3'); run('Measure');"
+            ))
+            .unwrap();
+        let mut doc = ImageDocument::new_ramp_8bit("perimeter", 16, 16).unwrap();
+        doc.calibration.pixel_width = pixel_width;
+        doc.calibration.pixel_height = pixel_height;
+        match roi_kind {
+            Some("rect") => doc.set_rect_roi(2, 3, 8, 6).unwrap(),
+            Some("oval") => doc.set_oval_roi(2, 3, 8, 6).unwrap(),
+            Some("polygon") => doc.set_polygon_roi(&[(2, 2), (10, 3), (8, 10), (3, 9)]).unwrap(),
+            Some("traced") => doc.set_polygon_roi(&[(2, 2), (10, 2), (10, 8), (2, 8)]).unwrap(),
+            _ => {}
+        }
+        let actual = format_ij_num(doc.measure().unwrap().perimeter);
+        let expected = &oracle_columns(&oracle.stdout)["Perim."];
+        assert_eq!(&actual, expected, "{name}");
+    }
+}
+
+#[test]
+fn parity_perimeter_for_line_roi_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('line-perimeter','8-bit ramp',16,16,1); \
+             setVoxelSize(0.5,0.25,1,'mm'); makeLine(2,3,10,9); \
+             run('Set Measurements...', 'area mean perimeter decimal=3'); run('Measure');",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("line-perimeter", 16, 16).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    doc.set_line_roi(2, 3, 10, 9);
+    let actual = format_ij_num(doc.measure().unwrap().perimeter);
+    assert_eq!(actual, oracle_columns(&oracle.stdout)["Perim."]);
+}
+
+#[test]
 fn measurement_config_defaults_match_imagej_startup_state() {
     // Measurements.java lines 4-10 and Analyzer.java line 42: ImageJ starts
     // with Area, Mean and Min/Max enabled at three decimal places.

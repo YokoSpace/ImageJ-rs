@@ -341,6 +341,61 @@ fn polygon_bounds(xpoints: &[i32], ypoints: &[i32]) -> (i32, i32, i32, i32) {
     (min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
+fn polygon_perimeter(poly: &PolygonRoi, pixel_width: f64, pixel_height: f64) -> f64 {
+    let n = poly.xpoints.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let dx = |i: usize, j: usize| i64::from(poly.xpoints[j]) - i64::from(poly.xpoints[i]);
+    let dy = |i: usize, j: usize| i64::from(poly.ypoints[j]) - i64::from(poly.ypoints[i]);
+    let traced = (0..n).all(|i| {
+        let j = (i + 1) % n;
+        dx(i, j) == 0 || dy(i, j) == 0
+    });
+    if traced {
+        // PolygonRoi.getTracedPerimeter shortens non-adjacent corners by
+        // (w+h)-sqrt(w²+h²), even for an orthogonal user polygon.
+        if n < 4 {
+            return 0.0;
+        }
+        let mut sum_dx = 0i64;
+        let mut sum_dy = 0i64;
+        let mut corners = 0u32;
+        let mut side = dx(n - 1, 0).abs() + dy(n - 1, 0).abs();
+        let mut previous_dx = dx(n - 1, 0);
+        let mut previous_dy = dy(n - 1, 0);
+        let mut corner = false;
+        for i in 0..n {
+            let j = (i + 1) % n;
+            let next_dx = dx(i, j);
+            let next_dy = dy(i, j);
+            sum_dx += previous_dx.abs();
+            sum_dy += previous_dy.abs();
+            if side > 1 || !corner {
+                corner = true;
+                corners += 1;
+            } else {
+                corner = false;
+            }
+            previous_dx = next_dx;
+            previous_dy = next_dy;
+            side = next_dx.abs() + next_dy.abs();
+        }
+        let corner_loss = pixel_width + pixel_height
+            - (pixel_width * pixel_width + pixel_height * pixel_height).sqrt();
+        return sum_dx as f64 * pixel_width + sum_dy as f64 * pixel_height
+            - f64::from(corners) * corner_loss;
+    }
+    (0..n)
+        .map(|i| {
+            let j = (i + 1) % n;
+            let x = dx(i, j) as f64 * pixel_width;
+            let y = dy(i, j) as f64 * pixel_height;
+            (x * x + y * y).sqrt()
+        })
+        .sum()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Roi {
     Rect(RectRoi),
@@ -2268,6 +2323,7 @@ impl ImageDocument {
             roi_y: self.calibration.transform_y(ry as f64, self.height),
             roi_width: (rw as f64) * self.calibration.pixel_width,
             roi_height: (rh as f64) * self.calibration.pixel_height,
+            perimeter: self.roi_perimeter(),
             int_den: area * mean,
             raw_int_den: raw.sum,
             histogram: raw.histogram,
@@ -2278,6 +2334,32 @@ impl ImageDocument {
             area_fraction: raw.area_fraction,
             stack_position: self.stack_position(),
             line: None,
+        }
+    }
+
+    /// `Analyzer.saveResults` uses `roi.getLength()` for selections and raw
+    /// image dimensions when there is no ROI (Analyzer.java 556-562).
+    fn roi_perimeter(&self) -> f64 {
+        let pw = self.calibration.pixel_width;
+        let ph = self.calibration.pixel_height;
+        match &self.roi {
+            None => 2.0 * f64::from(self.width) + 2.0 * f64::from(self.height),
+            Some(Roi::Rect(rect)) => {
+                2.0 * f64::from(rect.width) * pw + 2.0 * f64::from(rect.height) * ph
+            }
+            Some(Roi::Oval(oval)) => {
+                // OvalRoi.getLength uses Ramanujan's approximation.
+                let a = 0.5 * f64::from(oval.width) * pw;
+                let b = 0.5 * f64::from(oval.height) * ph;
+                std::f64::consts::PI
+                    * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt())
+            }
+            Some(Roi::Polygon(poly)) => polygon_perimeter(poly, pw, ph),
+            Some(Roi::Line(line)) => {
+                let dx = f64::from(line.x2 - line.x1) * pw;
+                let dy = f64::from(line.y2 - line.y1) * ph;
+                dx.hypot(dy)
+            }
         }
     }
 
@@ -3124,6 +3206,9 @@ pub struct MeasurementSummary {
     pub roi_y: f64,
     pub roi_width: f64,
     pub roi_height: f64,
+    /// `Roi.getLength()` as written to the `Perim.` column.
+    #[serde(default)]
+    pub perimeter: f64,
     pub int_den: f64,
     pub raw_int_den: f64,
     /// ROI histogram: 256 bins for 8-bit, RGB and 32-bit planes and the full
