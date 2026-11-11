@@ -1,6 +1,6 @@
 # Phase 3 ロードマップ: 日常の画像編集・解析ワークフロー
 
-Phase 2 で UI の骨格と主要な表示・メニュー機能がそろった。Phase 3 は、ImageJ を日常的に使うときに連続して必要になる「選択する → 画素を編集する → 二値化する → 測る → 保存する」流れを完成させる。対象は `main` の現状（コミット `ab72a51`）で `unsupported` のままになっている機能と、既存の Java プラグイン互換層の入力制限である。
+Phase 2 で UI の骨格と主要な表示・メニュー機能がそろった。Phase 3 は、ImageJ を日常的に使うときに連続して必要になる「選択する → 画素を編集する → 二値化する → 測る → 保存する」流れを完成させる。対象は現在の `main` で `unsupported` のままになっている機能と、既存の Java プラグイン互換層の入力制限である。
 
 この文書は実装そのものではなく、各タスクを独立した差分として実装・検証するための計画である。`original_imagej/` は読み取り専用の仕様資料であり、編集しない。
 
@@ -28,7 +28,7 @@ Phase 2 の [共通ルール](roadmap_phase2_ui_fidelity.md#0-全タスク共通
 
 ### 0.2 現在の実装境界
 
-- `crates/ij-app/src/action.rs` の File/Edit/Process/Analyze メニューでは `Revert`、`Cut`、`Copy`、`Paste`、`Clear`、`Fill`、`Draw`、`Process > Binary`、`Process > Math`、`Analyze > Calibrate...` が `unsupported` である。`Set Scale...` と `Analyze Particles...` はまだメニューにない。
+- `crates/ij-app/src/action.rs` の File/Edit/Process/Analyze メニューでは `Cut`、`Copy`、`Paste`、`Clear`、`Fill`、`Draw`、`Process > Binary`、`Process > Math`、`Analyze > Calibrate...` が `unsupported` である。`File > Revert` は P3.1a で実装済み。`Set Scale...` と `Analyze Particles...` はまだメニューにない。
 - `crates/ij-app/src/tool.rs` の `Tool` enum には全ツールの ID があるが、`is_supported` は Rectangle/Oval/Polygon/Freehand/Line/Wand/Magnifier/Hand に限っている。Polyline、Freeline、Point、Text、Dropper、Angle は対話処理を追加する必要がある。
 - `crates/ij-core/src/lib.rs` には `Calibration`、`Roi`、`ImageDocument::save_snapshot`/`undo`、測定とプロファイルの基盤がある。既存の snapshot/undo と calibration を再利用し、別の画素キャッシュを作らない。
 - `crates/ij-session/src/lib.rs` の公開 I/O コマンドは `OpenTiff`/`SaveTiff` で、現在のファイル境界は TIFF である。`crates/ij-io/src/lib.rs` の `IoError` と `load_tiff`/`save_tiff` の制約を先に確認し、PNG/JPEG と TIFF 圧縮を一度に混ぜない。
@@ -73,17 +73,19 @@ flowchart TD
 
 ---
 
-### P3.0 ビルド生成 JAR の追跡解除と旧作業ブランチの掃除 🟢
+### P3.0 検証可能な checkout とビルド生成物の整理 🟢
 
 - **現状（実測）**:
   1. `tools/plugin-host/plugin-host.jar` と `tools/plugin-host/fixtures/fixtures.jar` が git 追跡対象になっているため、`./tools/verify.sh` 実行のたびにタイムスタンプ差分で `git status` が汚れる。
-  2. `t3/*` のローカル作業ブランチが 8 本残っている（内容はすべて `main` に統合済み）。
-- **編集してよいファイル**: `.gitignore`（および `git rm --cached`）
+  2. `original_imagej/plugins/MacAdapter.class` と `MacAdapter9.class` は manifest に含まれるが Git 未追跡のため、新規 clone/worktree は manifest 検証に失敗する。内容の SHA-256 は manifest と一致する。
+  3. 旧 `t3/*` ブランチ 8 本は機能が `main` に再実装されていても、コミットは Git 履歴上マージされていない。進行中の T3 worktree ブランチは別に存在する。
+- **編集してよいファイル**: `.gitignore`, `tools/verify.sh`, `crates/ij-app/tests/plugin_browser_test.rs`, `crates/ij-app/tests/plugin_menu_direct_run_test.rs`, `docs/roadmap_phase3_practical_workflows.md`。`git rm --cached` で生成 JAR の追跡を外す。manifest と一致する既存の class ファイル 2 個は**内容を変更せず** Git に登録する。
 - **手順**:
-  1. `.gitignore` に `/tools/plugin-host/plugin-host.jar` と `/tools/plugin-host/fixtures/fixtures.jar` を追加し、`git rm --cached tools/plugin-host/plugin-host.jar tools/plugin-host/fixtures/fixtures.jar` を実行する（ディスク上のファイルは残す）。
-  2. `git branch -D $(git branch --list 't3/*')` でローカルの旧作業ブランチ 8 本を削除する。
-  3. `./tools/verify.sh` を実行し、完了後に `git status --short` が完全に空であることを確認する。
-- **受け入れ条件**: `./tools/verify.sh` 実行直後に `git status --short` が空出力。`VERIFY_ALL_OK`。
+  1. `.gitignore` に生成 JAR とビルド用の一時ディレクトリを追加し、`git rm --cached` で JAR の追跡のみ外す。`tools/verify.sh` はテスト前に plugin host と fixtures をビルドする。JAR を直接コピーする 2 テストも、コピー前に `PluginBridge::locate_from_repo_root` で生成を保証する。
+  2. manifest の SHA-256 と照合した既存の `MacAdapter.class` 2 個を Git に登録する。`original_imagej/` 内のファイル内容は一切変更しない。
+  3. 旧ブランチは各 tip をタグか bundle に退避し、worktree に checkout されていないことと、追加機能・テストが `main` に存在することを確認してから**明示的な名前のリスト**で削除する。進行中のブランチは残す。
+  4. `./tools/verify.sh` の `VERIFY_ALL_OK` と直後のクリーンな作業ツリーを確認する。さらに新規 checkout で同じ検証を行う。
+- **受け入れ条件**: 新規 checkout と現行 checkout の両方で `VERIFY_ALL_OK`。検証直後に追跡ファイルの差分がない。
 
 ---
 
@@ -104,9 +106,9 @@ flowchart TD
   - `crates/ij-app/src/app/shortcuts.rs`
   - `crates/ij-app/tests/roi_interaction_test.rs`
 - **厳密な仕様**:
-  1. `Session` に `pub previous_roi: Option<Roi>` を持たせる。`ClearRoi`, `SelectAll`, または新しい `Make*Roi` で既存の `doc.roi`（幅または高さ `> 0`）が消える直前に `self.previous_roi = doc.roi.clone()` を保存する（`ImagePlus.saveRoi`）。
+  1. `Session` に画像をまたぐ previous ROI を持たせる。`ClearRoi`/`Select None` と `Select All` は直前の ROI を保存する。マクロ経由の `Make*Roi` は Shift/Alt が押された場合にだけ保存する（`Functions.java:866-867,878-879,4327-4328`）。
   2. `Command::SelectAll`（マクロ記録 `"run(\"Select All\");\n"`）: 現在の `doc.roi` を `previous_roi` に退避し、`Roi::Rect(RectRoi::new(0, 0, doc.width as i32, doc.height as i32))` をセットする。
-  3. `Command::RestoreSelection`（マクロ記録 `"run(\"Restore Selection\");\n"`）: `previous_roi` が `Some(prev)` のとき、`ImagePlus.restoreRoi`（`ImagePlus.java:2268-2277`）の条件に従って復元する。ROI のバウンディングボックス `r` が画像外（`r.x >= w || r.y >= h || r.x + r.width < 0 || r.y + r.height < 0`）なら `((w - r.width) / 2, (h - r.height) / 2)` に平行移動し、`r.width == w && r.height == h` なら `(0, 0)` に配置する。
+  3. `Command::RestoreSelection` は `ImagePlus.restoreRoi`（`ImagePlus.java:2268-2277`）の復元可否判定を先に再現する。復元可能な場合のみ画像外 ROI を中央へ移動し、全画像サイズの ROI を `(0, 0)` に配置する。別画像での復元テストは、batch mode の新規画像表示時に前の ROI が保存される `ImagePlus.java:499` も考慮する。
   4. `AppAction::SelectAll`（`Cmd+A`）と `AppAction::RestoreSelection`（`Shift+E`）を `EDIT_SELECTION` メニューとショートカットに追加。
 - **先に書くテスト**:
   - `oracle_parity.rs`: 矩形・楕円・多角形 ROI を作成 → `Select None` → `Restore Selection` → `Measure` の結果がオラクルと一致。別サイズの画像に対する `Restore Selection` の中央再配置がオラクルと一致。
@@ -216,7 +218,7 @@ flowchart TD
   - [ImageMath.java:14-205](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/ImageMath.java#L14-L205)
   - 各 `ImageProcessor`（`ByteProcessor`, `ShortProcessor`, `FloatProcessor`, `ColorProcessor`）の `add(double)`, `multiply(double)`, `gamma(double)`, `log()`, `exp()`, `sqr()`, `sqrt()`, `abs()` 等の実装（特に 8-bit / 16-bit での `log()` / `exp()` のスケール係数と丸め・飽和クランプ規則を必ず Java 原文で確認すること！）。
 - **編集してよいファイル**:
-  - `crates/ij-core/src/filters.rs`（または新規 `crates/ij-core/src/math.rs`）
+  - `crates/ij-core/src/math.rs`（新規。P3.5b もこのモジュールを使う）
   - `crates/ij-core/src/lib.rs`
   - `crates/ij-session/src/lib.rs`
   - `crates/ij-session/tests/oracle_parity.rs`
@@ -338,7 +340,7 @@ flowchart TD
 - **最初に読むもの**:
   - [FileOpener.java:516-615](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/io/FileOpener.java#L516-L615)（`uncompress`, `packBitsUncompress`, `lzwUncompress`, horizontal differencing predictor）
   - [crates/ij-io/src/lib.rs](file:///Users/nauti/GitHub/ImageJ-rs/crates/ij-io/src/lib.rs)
-- **編集してよいファイル**: `crates/ij-io/Cargo.toml`（既に workspace にある `flate2` 等を利用可。`ij-core` には一切依存を足さない）, `crates/ij-io/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`
+- **編集してよいファイル**: `crates/ij-io/Cargo.toml`（Deflate 用 crate が必要なら明示的に依存追加。現状 `flate2` は workspace に存在しない。`ij-core` には一切依存を足さない）, `crates/ij-io/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`
 - **先に書くテスト**: Java オラクルの `saveAs("Tiff", ...)` や LZW / PackBits / ZIP 圧縮ストリップ（8-bit / 16-bit / RGB、Predictor あり・なし）を `load_tiff` で読み込み、全画素が元画像と一致すること。
 
 #### P3.9b PNG と JPEG の読み込み・書き出し 🟡

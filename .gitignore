@@ -10,3 +10,7 @@ __pycache__/
 *.pyc
 /tools/plugin-host/classes/
 /tools/plugin-host/fixtures/classes/
+/tools/plugin-host/plugin-host.jar
+/tools/plugin-host/fixtures/fixtures.jar
+/tools/plugin-host/.build.lock/
+/tools/plugin-host/.build.*/

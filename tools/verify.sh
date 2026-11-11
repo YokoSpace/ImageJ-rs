@@ -7,6 +7,7 @@ cd "$REPO_ROOT"
 echo "[1/6] Verifying original_imagej/ integrity against deterministic manifest and oracle freshness..."
 python3 tools/oracle/check_manifest.py --check
 python3 tools/oracle/check_freshness.py --ensure
+./tools/plugin-host/build_host.sh
 
 echo "[2/6] Checking command ledger sync..."
 python3 tools/ledger/sync_ledger.py --check

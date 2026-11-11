@@ -65,6 +65,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn fixture_jar_path() -> PathBuf {
+    let _ = plugin_bridge();
     repo_root().join("tools/plugin-host/fixtures/fixtures.jar")
 }
 
