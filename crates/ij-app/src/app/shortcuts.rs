@@ -14,6 +14,7 @@ impl ImageJApp {
 
         // Respect modal close/save confirmation, stack process prompts, and error dialogs
         if self.pending_close.is_some()
+            || self.pending_revert.is_some()
             || self.pending_stack_process.is_some()
             || self.dialogs.last_error.is_some()
         {
@@ -232,6 +233,7 @@ impl ImageJApp {
     pub fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input()
             || self.pending_close.is_some()
+            || self.pending_revert.is_some()
             || self.pending_stack_process.is_some()
             || self.dialogs.last_error.is_some()
         {

@@ -118,6 +118,7 @@ impl ImageJApp {
         self.dispatch_native_menu_actions(ctx);
         let mut native_spec = self.build_native_menu_spec();
         if self.pending_close.is_some()
+            || self.pending_revert.is_some()
             || self.pending_stack_process.is_some()
             || self.dialogs.last_error.is_some()
             || self.is_plugin_filter_running()
@@ -225,7 +226,7 @@ impl ImageJApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                             self.status_message =
                                 "Cannot close window while Java PlugInFilter is running; cancel it first".into();
-                        } else if self.pending_close.is_some() {
+                        } else if self.pending_close.is_some() || self.pending_revert.is_some() {
                             // While a close/quit prompt is open, ignore other
                             // window closes so the prompt's snapshot stays valid.
                             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);

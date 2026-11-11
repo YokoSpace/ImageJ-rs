@@ -177,6 +177,7 @@ pub struct ImageJApp {
     /// `Analyze > Set Measurements...` window and its uncommitted options.
     pub set_measurements: SetMeasurementsDialog,
     pub pending_close: Option<PendingClose>,
+    pub pending_revert: Option<ImageId>,
     pub pending_stack_process: Option<PendingStackProcess>,
     pub pending_plugin_filter: Option<PendingPluginFilter>,
     /// UI model for Plugins > Installed Plugins.
@@ -207,6 +208,7 @@ impl ImageJApp {
     pub fn dispatch_native_menu_actions(&mut self, ctx: &egui::Context) {
         for action in crate::macos_bridge::native_menu::take_actions() {
             if self.pending_close.is_none()
+                && self.pending_revert.is_none()
                 && self.pending_stack_process.is_none()
                 && self.dialogs.last_error.is_none()
                 && !self.is_plugin_filter_running()
@@ -230,6 +232,7 @@ impl ImageJApp {
             dialogs: DialogState::new(),
             set_measurements: SetMeasurementsDialog::default(),
             pending_close: None,
+            pending_revert: None,
             pending_stack_process: None,
             pending_plugin_filter: None,
             plugins_browser: PluginBrowserState::default(),
@@ -349,6 +352,53 @@ impl ImageJApp {
                 self.dialogs.last_error =
                     Some(format!("Failed to save \"{}\": {e}", path.display()));
                 Err(e)
+            }
+        }
+    }
+
+    pub fn revert_active(&mut self) -> Result<CommandOutcome, SessionError> {
+        if let Some(err) = self.reject_while_closing("Revert") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::Revert) {
+            Ok(outcome) => {
+                self.status_message = "Reverted to saved TIFF".to_string();
+                Ok(outcome)
+            }
+            Err(error) => {
+                self.status_message = format!("Revert failed: {error}");
+                self.dialogs.last_error = Some(format!("Revert failed: {error}"));
+                Err(error)
+            }
+        }
+    }
+
+    pub fn request_revert_active(&mut self) {
+        if self.pending_revert.is_some() {
+            return;
+        }
+        if self.reject_while_closing("Revert").is_some() {
+            return;
+        }
+        let Some(id) = self.active_image_id() else {
+            return;
+        };
+        if self.is_dirty(id) {
+            self.pending_revert = Some(id);
+        } else {
+            let _ = self.revert_active();
+        }
+    }
+
+    pub fn resolve_revert_confirmation(&mut self, confirm: bool) {
+        let Some(id) = self.pending_revert.take() else {
+            return;
+        };
+        if confirm {
+            if self.active_image_id() == Some(id) {
+                let _ = self.revert_active();
+            } else {
+                self.status_message = "Revert cancelled: active image changed".into();
             }
         }
     }

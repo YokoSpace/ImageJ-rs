@@ -97,6 +97,12 @@ impl ImageJApp {
                 "{action} is unavailable: {reason}"
             )));
         }
+        if self.pending_revert.is_some() {
+            self.status_message = format!("{action} blocked: resolve revert confirmation first");
+            return Some(SessionError::UnknownCommand(format!(
+                "{action} is unavailable: resolve revert confirmation first"
+            )));
+        }
         if self.pending_close.is_none() && !self.quit_app {
             return None;
         }
@@ -117,6 +123,10 @@ impl ImageJApp {
     /// While any prompt is open this is a deterministic no-op: it never
     /// replaces or downgrades the active prompt.
     pub fn request_close_window(&mut self, id: ImageId) -> bool {
+        if self.pending_revert.is_some() {
+            self.status_message = "Close request ignored: resolve revert confirmation first".into();
+            return false;
+        }
         if self.is_plugin_filter_running_for(id) {
             self.status_message =
                 "Close request ignored: Java PlugInFilter is executing on this image".into();
@@ -145,6 +155,10 @@ impl ImageJApp {
     /// preserves the entire document set. Dirty windows are prompted in order.
     /// Returns true if all windows were closed immediately with no pending confirmation.
     pub fn request_close_all(&mut self) -> bool {
+        if self.pending_revert.is_some() {
+            self.status_message = "Close All ignored: resolve revert confirmation first".into();
+            return false;
+        }
         if self.is_plugin_filter_running() {
             self.status_message =
                 "Close All ignored: Java PlugInFilter is currently executing".into();
@@ -174,6 +188,10 @@ impl ImageJApp {
     /// preserves every document. Dirty windows are prompted in order.
     /// Returns true if app can quit immediately.
     pub fn request_quit(&mut self) -> bool {
+        if self.pending_revert.is_some() {
+            self.status_message = "Quit ignored: resolve revert confirmation first".into();
+            return false;
+        }
         if self.is_plugin_filter_running() {
             self.status_message =
                 "Quit request ignored: Java PlugInFilter is currently executing; cancel it first"

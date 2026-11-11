@@ -209,6 +209,51 @@ fn parity_tiff_exchange_and_invert_matches_java_oracle_pixels() {
 }
 
 #[test]
+fn parity_file_revert_restores_saved_tiff_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let original = ImageDocument::new_ramp_8bit("revert.tif", 16, 16).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &original,
+            "makeRectangle(2,3,5,6); run(\"Invert\"); run(\"Revert\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the reverted TIFF");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("revert.tif");
+    save_tiff(&path, &original).unwrap();
+    let mut session = Session::new();
+    let id = match session
+        .dispatch(Command::OpenTiff { path: path.clone() })
+        .unwrap()
+    {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("expected ImageOpened, got {other:?}"),
+    };
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 2,
+            y: 3,
+            width: 5,
+            height: 6,
+        })
+        .unwrap();
+    session.dispatch(Command::Invert).unwrap();
+    assert!(session.is_dirty(id));
+    session.dispatch(Command::Revert).unwrap();
+
+    assert_eq!(session.get_image(id).unwrap().slices, oracle.slices);
+    assert_eq!(session.get_image(id).unwrap().roi, oracle.roi);
+    assert!(!session.is_dirty(id));
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Revert\");")
+    );
+}
+
+#[test]
 fn parity_16bit_ramp_measurement_table_matches_java_oracle() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let oracle = bridge

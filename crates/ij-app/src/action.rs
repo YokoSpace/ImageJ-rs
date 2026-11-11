@@ -16,6 +16,7 @@ pub enum AppAction {
     CloseImage(ImageId),
     CloseAll,
     Quit,
+    Revert,
     Undo,
     Invert,
     Duplicate,
@@ -116,7 +117,7 @@ const FILE_MENU: &[MenuNode] = &[
     item("Save", Some("Cmd+S"), AppAction::Save),
     submenu("Save As", FILE_SAVE_AS),
     SEPARATOR,
-    unsupported("Revert", None),
+    item("Revert", None, AppAction::Revert),
     unsupported("Page Setup...", None),
     unsupported("Print...", None),
     SEPARATOR,
@@ -370,6 +371,9 @@ impl ImageJApp {
 
 impl ImageJApp {
     pub fn action_enabled(&self, action: AppAction) -> Result<(), String> {
+        if self.pending_revert.is_some() {
+            return Err("Resolve revert confirmation first".into());
+        }
         use AppAction::*;
         match action {
             RunCatalogPlugin { index, generation } => {
@@ -388,6 +392,16 @@ impl ImageJApp {
                     Err("No results to save or clear".into())
                 } else {
                     Ok(())
+                }
+            }
+            Revert => {
+                let Some(id) = self.active_image_id() else {
+                    return Err("Requires an active image".into());
+                };
+                if self.session.image_path(id).is_some() {
+                    Ok(())
+                } else {
+                    Err("Image has not been saved to a TIFF file".into())
                 }
             }
             CloseAll => {
@@ -498,6 +512,9 @@ impl ImageJApp {
                 if let Some(path) = path {
                     let _ = self.save_active_tiff(path);
                 }
+            }
+            Revert => {
+                self.request_revert_active();
             }
             SaveAs => {
                 if let Some(path) = rfd::FileDialog::new()

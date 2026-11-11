@@ -35,6 +35,8 @@ pub enum SessionError {
     File(#[from] std::io::Error),
     #[error("no active image in session")]
     NoActiveImage,
+    #[error("active image has no saved TIFF path")]
+    NoSavedTiffPath,
     #[error("unknown command label: {0}")]
     UnknownCommand(String),
     #[error("plugin bridge error: {0}")]
@@ -61,6 +63,11 @@ pub enum Command {
     OpenTiff {
         path: PathBuf,
     },
+    /// `File > Revert`: reloads the active image from its last opened/saved
+    /// TIFF path (ImagePlus.revert, original_imagej/ij/ImagePlus.java
+    /// 2293-2333). The current ROI is restored after the pixels and metadata
+    /// are reloaded, matching ImagePlus.revert's saveRoi/setRoi sequence.
+    Revert,
     SaveTiff {
         path: PathBuf,
     },
@@ -603,6 +610,28 @@ impl Session {
                 self.dirty_images.remove(&id);
                 self.saved_tiff_paths.insert(id, remembered_path);
                 Ok(CommandOutcome::ImageOpened(id))
+            }
+            Command::Revert => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let path = self
+                    .saved_tiff_paths
+                    .get(&id)
+                    .cloned()
+                    .ok_or(SessionError::NoSavedTiffPath)?;
+                let saved_roi = self
+                    .images
+                    .get(&id)
+                    .ok_or(SessionError::NoActiveImage)?
+                    .roi
+                    .clone();
+                let mut reverted = load_tiff(&path)?;
+                reverted.roi = saved_roi;
+                self.images.insert(id, reverted);
+                self.preview_display_ranges.remove(&id);
+                self.dirty_images.remove(&id);
+                self.bump_image_revision(id);
+                self.macro_recorder.push("run(\"Revert\");".into());
+                Ok(CommandOutcome::Updated)
             }
             Command::SaveTiff { path } => {
                 let id = self.active_image.ok_or(SessionError::NoActiveImage)?;

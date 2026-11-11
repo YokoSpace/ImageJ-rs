@@ -452,6 +452,45 @@ impl ImageJApp {
             }
         }
 
+        if let Some(id) = self.pending_revert {
+            let title = self
+                .session
+                .get_image(id)
+                .map(|doc| doc.title.clone())
+                .unwrap_or_else(|| format!("Image {}", id.0));
+            let mut confirm = None;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("ij_confirm_revert_dialog"),
+                egui::ViewportBuilder::default()
+                    .with_title("Revert?")
+                    .with_inner_size([360.0, 140.0])
+                    .with_resizable(false),
+                |ctx, class| {
+                    let is_embedded = matches!(class, egui::ViewportClass::Embedded);
+                    if (!is_embedded && ctx.input(|i| i.viewport().close_requested()))
+                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                    {
+                        confirm = Some(false);
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.label(format!("Revert to saved version of\n\"{title}\"?"));
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Revert").clicked() {
+                                confirm = Some(true);
+                            }
+                            if ui.button("Cancel").clicked() {
+                                confirm = Some(false);
+                            }
+                        });
+                    });
+                },
+            );
+            if let Some(confirm) = confirm {
+                self.resolve_revert_confirmation(confirm);
+            }
+        }
+
         // Error alert dialog
         if let Some(err_msg) = &self.dialogs.last_error.clone() {
             let mut dismiss = false;
