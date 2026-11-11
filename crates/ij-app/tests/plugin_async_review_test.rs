@@ -42,15 +42,21 @@ fn bridge_with_runner(script: &Path) -> PluginBridge {
         .with_runner_script(script)
 }
 
-fn wait_for_file(path: &Path, timeout: Duration) -> bool {
+fn wait_for_pid(path: &Path, timeout: Duration) -> bool {
+    let ready = || {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| contents.trim().parse::<i32>().ok())
+            .is_some()
+    };
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if path.is_file() {
+        if ready() {
             return true;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    path.is_file()
+    ready()
 }
 
 fn gray8(app: &ImageJApp, id: ImageId) -> Vec<u8> {
@@ -94,7 +100,7 @@ fn cancellation_stays_in_cancelling_state_until_the_process_exits() {
         String::new(),
     )
     .expect("start task");
-    assert!(wait_for_file(&pid_file, Duration::from_secs(5)));
+    assert!(wait_for_pid(&pid_file, Duration::from_secs(5)));
 
     assert_eq!(app.plugin_filter_phase(), Some(PluginFilterPhase::Running));
     assert!(app.cancel_plugin_filter());
@@ -211,7 +217,7 @@ sleep 120",
         String::new(),
     )
     .expect("start task");
-    assert!(wait_for_file(&holder_pid_file, Duration::from_secs(5)));
+    assert!(wait_for_pid(&holder_pid_file, Duration::from_secs(5)));
     let holder_pid = read_pid(&holder_pid_file);
     let _guard = DetachedProcess { pid: holder_pid };
     assert!(process_exists(holder_pid));
@@ -424,7 +430,7 @@ fn a_document_change_during_execution_rejects_the_stale_result() {
         String::new(),
     )
     .expect("start task");
-    assert!(wait_for_file(&pid_file, Duration::from_secs(5)));
+    assert!(wait_for_pid(&pid_file, Duration::from_secs(5)));
 
     // Mutate the same document while the child JVM is still working.
     app.session

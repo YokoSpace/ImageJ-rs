@@ -57,6 +57,11 @@ pub enum AppAction {
     MathReciprocal,
     MathAbs,
     MathSet,
+    /// `Process > Binary > Make Binary` (`ij.plugin.Thresholder`).
+    MakeBinary,
+    /// `Process > Binary > Convert to Mask` and the Threshold palette's
+    /// `Apply` button (ThresholdAdjuster.runThresholdCommand).
+    ConvertToMask,
     Measure,
     Histogram,
     PlotProfile,
@@ -213,6 +218,12 @@ const PROCESS_MATH: &[MenuNode] = &[
     item("Abs", None, AppAction::MathAbs),
     item("Set...", None, AppAction::MathSet),
 ];
+// IJ_Props.txt binary01/binary02 (Process > Binary). The morphology items
+// (Erode, Dilate, ...) are P3.4 and are added there.
+const PROCESS_BINARY: &[MenuNode] = &[
+    item("Make Binary", None, AppAction::MakeBinary),
+    item("Convert to Mask", None, AppAction::ConvertToMask),
+];
 const PROCESS_MENU: &[MenuNode] = &[
     item("Smooth", None, AppAction::Smooth),
     item("Sharpen", None, AppAction::Sharpen),
@@ -220,7 +231,7 @@ const PROCESS_MENU: &[MenuNode] = &[
     SEPARATOR,
     submenu("Filters", PROCESS_FILTERS),
     submenu("Noise", PROCESS_NOISE),
-    unsupported("Binary", None),
+    submenu("Binary", PROCESS_BINARY),
     submenu("Math", PROCESS_MATH),
     unsupported("FFT", None),
 ];
@@ -524,6 +535,16 @@ impl ImageJApp {
                         Some(_) => Err("Line or rectangular selection required.".into()),
                     },
                     AddToRoiManager if doc.roi.is_none() => Err("Selection required".into()),
+                    // Thresholder.applyThreshold rejects RGB/indexed images;
+                    // stacks are P3.3b (Thresholder.java 152-158).
+                    MakeBinary | ConvertToMask => match doc.plane() {
+                        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)
+                            if doc.stack_size() == 1 => Ok(()),
+                        _ if doc.stack_size() > 1 => {
+                            Err("Binary conversion of stacks is not supported yet".into())
+                        }
+                        _ => Err("Binary conversion requires a grayscale image".into()),
+                    },
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
                     _ => Ok(()),
                 }
@@ -733,6 +754,12 @@ impl ImageJApp {
             }
             MathSet => {
                 let _ = self.math_active(ij_core::math::MathOperation::Set(25.0));
+            }
+            MakeBinary => {
+                let _ = self.make_binary_active();
+            }
+            ConvertToMask => {
+                let _ = self.convert_to_mask_active(false);
             }
             Measure => {
                 let _ = self.measure_active();

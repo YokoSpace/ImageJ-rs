@@ -36,7 +36,7 @@ You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick t
 - Hyperstack C/Z/T navigation, slice animation, and the ImageJ-style native macOS menu bar (the in-window menu is used on other platforms).
 - A Java compatibility path for a **limited subset** of classic ImageJ plug-ins and an API for Rust image plug-ins, described below.
 
-The app is still being expanded. Current gaps include Edit drawing and clipboard commands, binary processing, Image Calculator, Analyze Particles, and the Text and Color Picker tools. See the [Phase 3 roadmap](docs/roadmap_phase3_practical_workflows.md) for the remaining workflow and the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for earlier UI work.
+The app is still being expanded. Current gaps include Edit drawing and clipboard commands, stack-wide binary conversion and binary morphology, Image Calculator, Analyze Particles, and the Text and Color Picker tools. See the [Phase 3 roadmap](docs/roadmap_phase3_practical_workflows.md) for the remaining workflow and the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for earlier UI work.
 
 ## Classic ImageJ plug-ins
 

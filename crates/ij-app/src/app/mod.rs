@@ -655,6 +655,40 @@ impl ImageJApp {
         }
     }
 
+    /// `Process > Binary > Make Binary`. ImageJ's Process > Binary > Options
+    /// black-background pref defaults to false (IJ_Props.txt), which the
+    /// app does not model yet, so `black_background` is `false`.
+    pub fn make_binary_active(&mut self) -> Result<(), SessionError> {
+        self.run_binary_command(Command::MakeBinary { black_background: false }, "Make Binary")
+    }
+
+    /// `Process > Binary > Convert to Mask` (and the Threshold palette's
+    /// `Apply` button, ThresholdAdjuster.runThresholdCommand).
+    pub fn convert_to_mask_active(&mut self, black_background: bool) -> Result<(), SessionError> {
+        self.run_binary_command(Command::ConvertToMask { black_background }, "Convert to Mask")
+    }
+
+    fn run_binary_command(
+        &mut self,
+        command: Command,
+        label: &str,
+    ) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing(label) {
+            return Err(err);
+        }
+        match self.session.dispatch(command) {
+            Ok(_) => {
+                self.status_message = format!("{label}...");
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("{label} failed: {e}");
+                self.dialogs.last_error = Some(format!("{label} failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn convert_to_8bit_active(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("8-bit") {
             return Err(err);
@@ -672,8 +706,7 @@ impl ImageJApp {
         }
     }
 
-    pub fn convert_to_16bit_active(&mut self) -> Result<(), SessionError> {
-        if let Some(err) = self.reject_while_closing("16-bit") {
+    pub fn convert_to_16bit_active(&mut self) -> Result<(), SessionError> {        if let Some(err) = self.reject_while_closing("16-bit") {
             return Err(err);
         }
         match self.session.dispatch(Command::ConvertTo16Bit) {

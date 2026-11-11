@@ -224,6 +224,23 @@ pub enum Command {
     /// `run("8-bit")` (Converter.java 38-39). Converts every slice to 8-bit
     /// grayscale with scaling enabled and records `run("8-bit");`.
     ConvertTo8Bit,
+    /// The `Process > Binary > Make Binary` command
+    /// (`ij.plugin.Thresholder`, single-image path, Thresholder.java 38-40).
+    /// Converts the active image to an 8-bit 0/255 mask and records
+    /// `run("Make Binary");`. Undo.setup runs first (Thresholder.java 39)
+    /// and deleteRoi removes the selection.
+    MakeBinary {
+        /// ImageJ's `Prefs.blackBackground`; on this single-image path it
+        /// only inverts the display LUT and never changes pixel values.
+        black_background: bool,
+    },
+    /// The `Process > Binary > Convert to Mask` command
+    /// (`Thresholder("mask")`) and the Threshold palette's `Apply` button
+    /// (ThresholdAdjuster.runThresholdCommand). Same single-image conversion
+    /// as [`Command::MakeBinary`]; records `run("Convert to Mask");`.
+    ConvertToMask {
+        black_background: bool,
+    },
     /// `run("16-bit")` (Converter.java 38-39). Converts every slice to 16-bit
     /// grayscale with scaling enabled and records `run("16-bit");`.
     ConvertTo16Bit,
@@ -1532,6 +1549,12 @@ impl Session {
                 ));
                 Ok(CommandOutcome::Thresholded(levels))
             }
+            Command::MakeBinary { black_background } => {
+                self.run_binary_conversion(black_background, "Make Binary")
+            }
+            Command::ConvertToMask { black_background } => {
+                self.run_binary_conversion(black_background, "Convert to Mask")
+            }
             Command::AutoThreshold {
                 method,
                 dark_background,
@@ -2017,6 +2040,27 @@ impl Session {
             self.active_image = self.images.keys().last().copied();
         }
         removed
+    }
+
+    /// Shared body of `Make Binary` / `Convert to Mask` /
+    /// ThresholdAdjuster-Apply: the plugin always runs
+    /// `Undo.setup(Undo.TRANSFORM, imp)` and then `imp.deleteRoi()` before
+    /// applying (Thresholder.java 38-39, 152). deleteRoi's saveRoi() keeps
+    /// the deleted selection restorable, mirroring `Command::ClearRoi`.
+    fn run_binary_conversion(
+        &mut self,
+        black_background: bool,
+        macro_command: &str,
+    ) -> Result<CommandOutcome, SessionError> {
+        // deleteRoi runs before the pixel conversion and its saveRoi() keeps
+        // the deleted selection restorable (ImagePlus.deleteRoi), exactly
+        // like `Command::ClearRoi`.
+        self.save_roi();
+        self.active_doc_mut()?.apply_threshold(black_background)?;
+        self.mark_active_dirty();
+        self.macro_recorder
+            .push(format!("run(\"{macro_command}\");"));
+        Ok(CommandOutcome::Updated)
     }
 
     pub fn close_all_images(&mut self) {

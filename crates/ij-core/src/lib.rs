@@ -1,3 +1,4 @@
+pub mod binary;
 pub mod contrast;
 pub mod filters;
 pub mod histogram;
@@ -1063,7 +1064,7 @@ fn java_round_to_i32(value: f64) -> i32 {
 }
 
 /// TypeConverter.convertShortToByte (TypeConverter.java 49-63) with scaling.
-fn short_to_byte(pixel: u16, min: i32, scale: f64) -> u8 {
+pub(crate) fn short_to_byte(pixel: u16, min: i32, scale: f64) -> u8 {
     let mut value = i32::from(pixel).wrapping_sub(min);
     if value < 0 {
         value = 0;
@@ -1111,7 +1112,7 @@ fn gray16_display_range(pixels: &[u16]) -> DisplayRange {
     }
 }
 
-fn float_processor_range(pixels: &[f32]) -> DisplayRange {
+pub(crate) fn float_processor_range(pixels: &[f32]) -> DisplayRange {
     // FloatProcessor.findMinAndMax skips leading NaNs, then compares every
     // remaining value (FloatProcessor.java 92-114).
     let first = pixels
@@ -1161,7 +1162,7 @@ fn range_after_float_conversion(
 }
 
 /// FloatProcessor.create8BitImage (FloatProcessor.java 190-208).
-fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
+pub(crate) fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
     let mut value = f64::from(pixel) - min;
     if value < 0.0 {
         value = 0.0;

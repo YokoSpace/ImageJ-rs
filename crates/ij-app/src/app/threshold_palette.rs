@@ -78,6 +78,7 @@ impl ImageJApp {
         }
         let range = doc.display_range;
         let levels = doc.threshold;
+        let has_threshold = levels.is_some();
         let counts = display_histogram(doc).counts;
         let can_auto = bit_depth != 32;
         if bit_depth != 16 {
@@ -185,17 +186,14 @@ impl ImageJApp {
         let mut action = None;
         ui.horizontal(|ui| {
             for label in ["Auto", "Reset", "Set", "Apply"] {
-                let enabled = label != "Apply" && (label != "Auto" || can_auto);
+                let enabled = label != "Auto" || can_auto;
                 let response = ui.add_enabled(enabled, egui::Button::new(label));
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(egui::Id::new((PALETTE_STATE, label)), response.rect)
                 });
-                if label == "Apply" {
-                    response.on_disabled_hover_text("Binary conversion is not implemented yet");
-                } else if label == "Auto" && !can_auto {
-                    response.on_disabled_hover_text(
-                        "Auto threshold is not supported on 32-bit images yet",
-                    );
+                if label == "Auto" && !can_auto {
+                    response
+                        .on_disabled_hover_text("Auto threshold is not supported on 32-bit images yet");
                 } else if response.clicked() {
                     action = Some(label);
                 }
@@ -227,6 +225,17 @@ impl ImageJApp {
                 if let Err(error) = self
                     .session
                     .dispatch(Command::SetThreshold { lower, upper })
+                {
+                    self.dialogs.last_error = Some(error.to_string());
+                }
+            }
+            Some("Apply") => {
+                // ThresholdAdjuster.apply rejects an image whose threshold is
+                // not set (ThresholdAdjuster.java 776-782).
+                if !has_threshold {
+                    self.dialogs.last_error = Some("Threshold is not set".into());
+                } else if let Err(error) =
+                    self.convert_to_mask_active(self.dialogs.threshold_dark_bg)
                 {
                     self.dialogs.last_error = Some(error.to_string());
                 }

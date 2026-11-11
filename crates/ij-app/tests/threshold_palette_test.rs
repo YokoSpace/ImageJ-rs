@@ -111,23 +111,56 @@ fn auto_otsu_button_matches_java_oracle() {
 }
 
 #[test]
-fn opening_palette_sets_initial_overlay_and_apply_is_disabled() {
+fn apply_button_converts_thresholded_image_to_mask() {
     let ctx = Context::default();
     let mut app = ImageJApp::new();
     let id = app.open_ramp_8bit("opening", 32, 32).unwrap();
-    let pixels_before = app.session.get_image(id).unwrap().plane().clone();
     render_palette(&ctx, &mut app, vec![]);
     assert!(app.session.get_image(id).unwrap().threshold.is_some());
-    let records = app.session.macro_recorder.len();
+    let doc = app.session.get_image(id).unwrap().clone();
+    // The palette's auto-set levels are not saved in TIFFs, so the oracle
+    // needs the matching setThreshold prelude.
+    let levels = doc.threshold.unwrap();
+    let oracle = JavaOracleBridge::locate_from_repo_root(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap(),
+    )
+    .unwrap()
+    .run_macro_on_image(
+        &doc,
+        &format!(
+            "setThreshold({}, {}); run(\"Convert to Mask\");",
+            ij_core::format_ij_num(levels.lower),
+            ij_core::format_ij_num(levels.upper)
+        ),
+    )
+    .unwrap()
+    .output_image
+    .unwrap();
     click_button(&ctx, &mut app, "Apply");
-    assert_eq!(app.session.get_image(id).unwrap().plane(), &pixels_before);
-    assert_eq!(app.session.macro_recorder.len(), records);
-    click_button(&ctx, &mut app, "Reset");
-    assert_eq!(app.session.get_image(id).unwrap().threshold, None);
+    let applied = app.session.get_image(id).unwrap();
+    assert_eq!(applied.slices, oracle.slices);
+    assert_ne!(applied.plane(), doc.plane());
+    assert!(app.session.is_dirty(id));
     assert_eq!(
         app.session.macro_recorder.last().unwrap(),
-        "resetThreshold();"
+        "run(\"Convert to Mask\");"
     );
+}
+
+#[test]
+fn apply_button_without_threshold_reports_threshold_is_not_set() {
+    let ctx = Context::default();
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("no-threshold", 32, 32).unwrap();
+    render_palette(&ctx, &mut app, vec![]);
+    click_button(&ctx, &mut app, "Reset");
+    assert!(app.session.get_image(id).unwrap().threshold.is_none());
+    let pixels = app.session.get_image(id).unwrap().plane().clone();
+    click_button(&ctx, &mut app, "Apply");
+    // ThresholdAdjuster.apply rejects an image without threshold
+    // (ThresholdAdjuster.java 776-781).
+    assert_eq!(app.dialogs.last_error.as_deref(), Some("Threshold is not set"));
+    assert_eq!(app.session.get_image(id).unwrap().plane(), &pixels);
 }
 
 #[test]

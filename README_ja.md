@@ -36,7 +36,7 @@ cargo run --release -p ij-app -- /path/to/image.tif
 - ハイパースタックの C/Z/T 操作、スライスのアニメーション再生、ImageJ に合わせた macOS のネイティブメニューバー（ほかの OS ではウィンドウ内メニュー）。
 - 後述する**限定的な範囲**での従来の Java プラグイン実行と、Rust 製画像プラグイン用 API。
 
-現在の主な残課題は、Edit の描画・クリップボード操作、二値化、Image Calculator、Analyze Particles、Text と Color Picker ツールです。残る一連の操作は [Phase 3 ロードマップ](docs/roadmap_phase3_practical_workflows.md) に、以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
+現在の主な残課題は、Edit の描画・クリップボード操作、スタック全体の二値化と二値画像の形態学演算、Image Calculator、Analyze Particles、Text と Color Picker ツールです。残る一連の操作は [Phase 3 ロードマップ](docs/roadmap_phase3_practical_workflows.md) に、以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
 
 ## 従来の ImageJ プラグイン
 

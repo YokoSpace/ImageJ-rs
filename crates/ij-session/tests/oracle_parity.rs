@@ -15052,3 +15052,196 @@ fn session_polyline_commands_measure_record_and_profile() {
         other => panic!("expected ProfileComputed, got {other:?}"),
     }
 }
+
+// ---- P3.3a: Threshold Apply / Make Binary / Convert to Mask (Thresholder.java) ----
+/// Runs one macro command on the doc in the real ImageJ 1.54u and returns the
+/// saved result as an `ImageDocument`.
+fn oracle_run(doc: &ImageDocument, macro_body: &str) -> ImageDocument {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let out = bridge.run_macro_on_image(doc, macro_body).unwrap();
+    out.output_image.expect("oracle must return saved TIFF")
+}
+
+fn bimodal_gray8() -> ImageDocument {
+    let mut pixels = vec![20u8; 32 * 32];
+    for y in 8..24 {
+        for x in 8..24 {
+            pixels[y * 32 + x] = 200;
+        }
+    }
+    pixels[0] = 130;
+    ImageDocument::new("binary-gray8", 32, 32, PixelPlane::Gray8(pixels)).unwrap()
+}
+
+fn bimodal_gray16() -> ImageDocument {
+    let mut pixels = vec![100u16; 32 * 32];
+    for y in 8..24 {
+        for x in 8..24 {
+            pixels[y * 32 + x] = 20000;
+        }
+    }
+    pixels[0] = 15000;
+    ImageDocument::new("binary-gray16", 32, 32, PixelPlane::Gray16(pixels)).unwrap()
+}
+
+fn bimodal_gray32() -> ImageDocument {
+    let mut pixels = vec![0.1f32; 32 * 32];
+    for y in 8..24 {
+        for x in 8..24 {
+            pixels[y * 32 + x] = 0.9;
+        }
+    }
+    pixels[0] = 0.5;
+    ImageDocument::new("binary-gray32", 32, 32, PixelPlane::Gray32(pixels)).unwrap()
+}
+
+/// Runs the command through the Rust `Session` and asserts the resulting
+/// single-slice 8-bit mask matches the oracle exactly, with the ROI deleted,
+/// pixels changed and the threshold state cleared.
+fn assert_binary_mask_parity(doc: &ImageDocument, command: Command, oracle_macro: &str) {
+    let expected = oracle_run(doc, oracle_macro);
+    let before = doc.slices.clone();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc.clone());
+    session.dispatch(command).unwrap();
+    let applied = session.get_image(id).unwrap().clone();
+
+    assert!(matches!(applied.plane(), PixelPlane::Gray8(_)));
+    assert_eq!(applied.slices, expected.slices, "mask pixels must match ImageJ exactly");
+    assert_ne!(applied.slices, before, "the command must change pixels");
+    // Thresholder.applyThreshold calls imp.deleteRoi() first
+    // (Thresholder.java 152).
+    assert!(applied.roi.is_none(), "Make Binary deletes the selection");
+    // Thresholder.java 278 sets an *invisible* 255-255 threshold
+    // (setThreshold(fcolor, fcolor, NO_LUT_UPDATE)) that resetBinaryThreshold
+    // only clears on the next command. ImageDocument cannot represent the
+    // NO_LUT_UPDATE mode (see the lutUpdateMode note in filters.rs), so the
+    // visible threshold state is `None`, matching what the palette shows.
+    assert_eq!(applied.threshold, None);
+}
+
+#[test]
+fn parity_make_binary_gray8_with_set_threshold_matches_java_oracle() {
+    let mut doc = bimodal_gray8();
+    doc.threshold = Some(ThresholdLevels { lower: 100.0, upper: 220.0 });
+    doc.set_rect_roi(1, 1, 4, 4).unwrap();
+    assert_binary_mask_parity(
+        &doc,
+        Command::MakeBinary { black_background: false },
+        "setThreshold(100, 220); run(\"Make Binary\");",
+    );
+}
+
+#[test]
+fn parity_convert_to_mask_gray8_ignores_black_background_flag_like_java() {
+    // Prefs.blackBackground only inverts the display LUT (Thresholder.java
+    // 249-257); the stored pixel values are 255 foreground / 0 background for
+    // both settings.
+    let mut doc = bimodal_gray8();
+    doc.threshold = Some(ThresholdLevels { lower: 10.0, upper: 130.0 });
+    assert_binary_mask_parity(
+        &doc,
+        Command::ConvertToMask { black_background: false },
+        "setThreshold(10, 130); run(\"Convert to Mask\");",
+    );
+    assert_binary_mask_parity(
+        &doc,
+        Command::ConvertToMask { black_background: true },
+        "setOption(\"BlackBackground\", true); setThreshold(10, 130); run(\"Convert to Mask\");",
+    );
+}
+
+#[test]
+fn parity_make_binary_gray8_without_threshold_uses_isodata2_like_java_oracle() {
+    let doc = bimodal_gray8();
+    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false }, "run(\"Make Binary\");");
+}
+
+#[test]
+fn parity_make_binary_gray16_with_threshold_becomes_8bit_mask_like_java_oracle() {
+    let mut doc = bimodal_gray16();
+    doc.threshold = Some(ThresholdLevels { lower: 100.0, upper: 22000.0 });
+    assert_binary_mask_parity(
+        &doc,
+        Command::MakeBinary { black_background: false },
+        "setThreshold(100, 22000); run(\"Make Binary\");",
+    );
+}
+
+#[test]
+fn parity_make_binary_gray16_without_threshold_scales_to_byte_thresholds_like_java_oracle() {
+    let doc = bimodal_gray16();
+    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false }, "run(\"Make Binary\");");
+}
+
+#[test]
+fn parity_make_binary_gray32_with_threshold_becomes_8bit_mask_like_java_oracle() {
+    let mut doc = bimodal_gray32();
+    doc.threshold = Some(ThresholdLevels { lower: 0.2, upper: 0.95 });
+    assert_binary_mask_parity(
+        &doc,
+        Command::MakeBinary { black_background: false },
+        "setThreshold(0.2, 0.95); run(\"Make Binary\");",
+    );
+}
+
+#[test]
+fn parity_make_binary_gray32_without_threshold_matches_java_oracle() {
+    let doc = bimodal_gray32();
+    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false }, "run(\"Make Binary\");");
+}
+
+#[test]
+fn session_make_binary_deletes_roi_keeps_undo_and_records_macro() {
+    let mut doc = bimodal_gray8();
+    doc.threshold = Some(ThresholdLevels { lower: 100.0, upper: 220.0 });
+    doc.set_rect_roi(2, 2, 4, 4).unwrap();
+    let before = doc.slices.clone();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session.dispatch(Command::MakeBinary { black_background: false }).unwrap();
+
+    assert!(session.is_dirty(id));
+    assert_eq!(
+        session.macro_recorder.last().unwrap(),
+        "run(\"Make Binary\");"
+    );
+    // ImagePlus.deleteRoi() calls saveRoi(), so the deleted selection stays
+    // restorable through Restore Selection.
+    assert!(session.previous_roi.is_some());
+
+    // Undo.setup(Undo.TRANSFORM, imp) before the conversion
+    // (Thresholder.java 39) makes the mask undoable.
+    session.dispatch(Command::Undo).unwrap();
+    assert_eq!(session.get_image(id).unwrap().slices, before);
+}
+
+#[test]
+fn session_binary_conversion_rejects_stacks_and_rgb() {
+    let mut session = Session::new();
+    session.insert_doc(
+        ImageDocument::new_stack(
+            "stack",
+            8,
+            8,
+            vec![
+                PixelPlane::Gray8(vec![3; 64]),
+                PixelPlane::Gray8(vec![7; 64]),
+            ],
+        )
+        .unwrap(),
+    );
+    assert!(session
+        .dispatch(Command::MakeBinary { black_background: false })
+        .is_err());
+
+    let mut session = Session::new();
+    session.insert_doc(
+        ImageDocument::new("rgb", 4, 4, PixelPlane::ColorRgb(vec![0; 16])).unwrap(),
+    );
+    assert!(session
+        .dispatch(Command::ConvertToMask { black_background: false })
+        .is_err());
+}

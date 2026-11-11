@@ -8,12 +8,12 @@ use crate::{CoreError, ImageDocument, PixelPlane, RoiMask};
 /// The rectangle an `ImageProcessor` filter processes plus its optional
 /// irregular mask, mirroring `ImageProcessor.roiX/roiY/roiWidth/roiHeight` and
 /// `ImageProcessor.mask` after `PlugInFilterRunner.prepareProcessor`.
-struct FilterRegion {
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    mask: Option<RoiMask>,
+pub(crate) struct FilterRegion {
+    pub(crate) x: u32,
+    pub(crate) y: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) mask: Option<RoiMask>,
 }
 
 /// The `RankFilters` filter types this increment ports
@@ -1625,7 +1625,7 @@ fn blur_gaussian_float(
 /// the progress bar and worker threads. Each line is independent, so running
 /// the lines sequentially produces the same pixels as ImageJ's thread pool.
 #[allow(clippy::too_many_arguments)]
-fn blur_one_direction(
+pub(crate) fn blur_one_direction(
     pixels: &mut [f32],
     width: u32,
     height: u32,
@@ -2539,7 +2539,7 @@ fn java_round(value: f64) -> f64 {
 
 /// `ShortProcessor.findMinAndMax` (ShortProcessor.java lines 70-87) scans
 /// every pixel, not just the ROI.
-fn gray16_min_max(pixels: &[u16]) -> (u16, u16) {
+pub(crate) fn gray16_min_max(pixels: &[u16]) -> (u16, u16) {
     let mut min = u16::MAX;
     let mut max = 0u16;
     for &value in pixels {
