@@ -41,12 +41,66 @@ fn freehand_build_id(image_id: ImageId) -> egui::Id {
     egui::Id::new(("ij_freehand_build", image_id.0))
 }
 
+pub fn animation_slider_axis(axes: &[StackAxis]) -> StackAxis {
+    if axes.contains(&StackAxis::Frame) {
+        StackAxis::Frame
+    } else if axes.contains(&StackAxis::Slice) {
+        StackAxis::Slice
+    } else {
+        StackAxis::FlatSlice
+    }
+}
+
+fn render_play_stop_button(ui: &mut egui::Ui, is_animating: bool) -> bool {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&resp);
+        ui.painter().rect(
+            rect,
+            visuals.corner_radius,
+            visuals.bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let color = visuals.text_color();
+        if is_animating {
+            let square_rect = rect.shrink(4.0);
+            ui.painter()
+                .rect_filled(square_rect, CornerRadius::ZERO, color);
+        } else {
+            let pad = 4.0;
+            let p1 = Pos2::new(rect.min.x + pad, rect.min.y + pad);
+            let p2 = Pos2::new(rect.min.x + pad, rect.max.y - pad);
+            let p3 = Pos2::new(rect.max.x - pad, rect.center().y);
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![p1, p2, p3],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+    let tip = if is_animating {
+        "Stop Animation"
+    } else {
+        "Start Animation"
+    };
+    resp.on_hover_text(tip).clicked()
+}
+
 impl ImageJApp {
     pub fn image_canvas_rect(ctx: &egui::Context, id: ImageId) -> Option<Rect> {
         ctx.data(|data| data.get_temp(egui::Id::new(("ij_image_canvas", id.0))))
     }
 
     pub fn update_ui(&mut self, ctx: &egui::Context) {
+        let now_secs = ctx.input(|i| i.time);
+        self.advance_animations(now_secs);
+        if self.is_any_animating() {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(
+                1.0 / DEFAULT_ANIMATION_FPS,
+            ));
+        }
+
         self.poll_plugin_filter();
         if self.is_plugin_filter_running() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
@@ -180,6 +234,7 @@ impl ImageJApp {
         }
 
         for id in close_requests {
+            self.stop_animation(id);
             self.request_close_window(id);
         }
 
@@ -374,15 +429,22 @@ impl ImageJApp {
 
         ui.separator();
 
-        // Stack sliders (ImageJ StackWindow.java lines 58-114)
+        // Stack sliders (ImageJ StackWindow.java lines 58-114, Animator.java 109-171)
         let mut new_slice = None;
         let mut new_position = None;
+        let mut toggle_anim_image = None;
+        let is_animating = self.is_animating(image_id);
+        let anim_axis = animation_slider_axis(&stack_axes);
         for axis in &stack_axes {
+            let is_anim_target = *axis == anim_axis;
             match axis {
                 StackAxis::Channel => {
                     let mut c_idx = current_pos.0 as i32;
                     let max_c = dim_sizes.0 as i32;
                     ui.horizontal(|ui| {
+                        if is_anim_target && render_play_stop_button(ui, is_animating) {
+                            toggle_anim_image = Some(image_id);
+                        }
                         ui.label(format!("c {}/{}", c_idx, max_c));
                         if ui.add(egui::Slider::new(&mut c_idx, 1..=max_c)).changed() {
                             new_position =
@@ -394,6 +456,9 @@ impl ImageJApp {
                     let mut z_idx = current_pos.1 as i32;
                     let max_z = dim_sizes.1 as i32;
                     ui.horizontal(|ui| {
+                        if is_anim_target && render_play_stop_button(ui, is_animating) {
+                            toggle_anim_image = Some(image_id);
+                        }
                         ui.label(format!("z {}/{}", z_idx, max_z));
                         if ui.add(egui::Slider::new(&mut z_idx, 1..=max_z)).changed() {
                             new_position =
@@ -405,6 +470,9 @@ impl ImageJApp {
                     let mut t_idx = current_pos.2 as i32;
                     let max_t = dim_sizes.2 as i32;
                     ui.horizontal(|ui| {
+                        if is_anim_target && render_play_stop_button(ui, is_animating) {
+                            toggle_anim_image = Some(image_id);
+                        }
                         ui.label(format!("t {}/{}", t_idx, max_t));
                         if ui.add(egui::Slider::new(&mut t_idx, 1..=max_t)).changed() {
                             new_position =
@@ -416,6 +484,9 @@ impl ImageJApp {
                     let mut slice_idx = current_pos.3 as i32;
                     let max_s = dim_sizes.3 as i32;
                     ui.horizontal(|ui| {
+                        if is_anim_target && render_play_stop_button(ui, is_animating) {
+                            toggle_anim_image = Some(image_id);
+                        }
                         ui.label(format!("Slice {}/{}", slice_idx, max_s));
                         if ui.add(egui::Slider::new(&mut slice_idx, 1..=max_s)).changed() {
                             new_slice = Some(slice_idx);
@@ -937,12 +1008,18 @@ impl ImageJApp {
         self.image_views.insert(image_id, view);
 
         // Dispatch deferred actions
+        if let Some(id) = toggle_anim_image {
+            self.toggle_animation(id);
+        }
+
         if let Some(slice_idx) = new_slice {
+            self.stop_animation(image_id);
             let _ = self.set_active_window(image_id);
             let _ = self.set_slice_active(slice_idx);
         }
 
         if let Some((c, z, t)) = new_position {
+            self.stop_animation(image_id);
             let _ = self.set_active_window(image_id);
             let _ = self.navigate_position_active(c, z, t);
         }

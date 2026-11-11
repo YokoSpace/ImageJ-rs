@@ -17,7 +17,7 @@ use ij_bridge::plugin_discovery::{
     DiscoveredPlugin, InspectionOptions, InspectionSummary, PluginCatalog, PluginDiscoveryError,
     ScanOptions,
 };
-use ij_core::{MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, Roi};
+use ij_core::{MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, Roi};
 use ij_session::{
     Command, CommandOutcome, HistogramSummary, ImageId, PluginFilterOutcome, PluginFilterTicket, Session,
     SessionError,
@@ -38,11 +38,12 @@ mod shortcuts;
 mod histogram_window;
 pub use self::histogram_window::HistogramWindowState;
 pub use self::menu::scrollable_menu;
-pub use self::image_window::draw_ellipse_stroke;
+pub use self::image_window::{animation_slider_axis, draw_ellipse_stroke};
 pub use self::adjust_dialogs::{
-    SetMeasurementsDialog, SetMeasurementsOption, SET_MEASUREMENTS_FIRST_GROUP,
-    SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS, SET_MEASUREMENTS_OPTIONS,
-    SET_MEASUREMENTS_SECOND_ROWS, clamp_set_measurements_precision, set_measurements_slot,
+    PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SetMeasurementsDialog, SetMeasurementsOption,
+    SET_MEASUREMENTS_FIRST_GROUP, SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS,
+    SET_MEASUREMENTS_OPTIONS, SET_MEASUREMENTS_SECOND_ROWS, clamp_set_measurements_precision,
+    plot_profile_runs, plot_profile_short_title, set_measurements_slot,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +146,15 @@ pub enum PendingPluginCatalogJob {
     },
 }
 
+/// Default animation speed in frames per second (ImageJ Animator.java:12 default 7.0 fps).
+pub const DEFAULT_ANIMATION_FPS: f64 = 7.0;
+
+#[derive(Debug, Clone)]
+pub struct AnimationState {
+    pub fps: f64,
+    pub last_step_time: Option<f64>,
+}
+
 pub struct ImageJApp {
     pub session: Session,
     pub active_tool: Tool,
@@ -154,6 +164,8 @@ pub struct ImageJApp {
     pub image_views: BTreeMap<ImageId, ImageView>,
     pub show_results_window: bool,
     pub histogram_window: Option<HistogramWindowState>,
+    /// `Analyze > Plot Profile` window; one snapshot per command.
+    pub plot_profile_window: Option<PlotProfileWindowState>,
     pub dialogs: DialogState,
     /// `Analyze > Set Measurements...` window and its uncommitted options.
     pub set_measurements: SetMeasurementsDialog,
@@ -167,6 +179,7 @@ pub struct ImageJApp {
     /// Invalidates late worker results after cancel, timeout or a newer scan.
     plugin_catalog_generation: u64,
     pub quit_app: bool,
+    pub animations: HashMap<ImageId, AnimationState>,
     texture_cache: HashMap<ImageId, (u64, egui::TextureHandle)>,
     pub texture_upload_count: u64,
     pub texture_cache_hit_count: u64,
@@ -189,6 +202,7 @@ impl ImageJApp {
             image_views: BTreeMap::new(),
             show_results_window: false,
             histogram_window: None,
+            plot_profile_window: None,
             dialogs: DialogState::new(),
             set_measurements: SetMeasurementsDialog::default(),
             pending_close: None,
@@ -198,6 +212,7 @@ impl ImageJApp {
             pending_plugin_catalog_job: None,
             plugin_catalog_generation: 0,
             quit_app: false,
+            animations: HashMap::new(),
             texture_cache: HashMap::new(),
             texture_upload_count: 0,
             texture_cache_hit_count: 0,
@@ -797,6 +812,10 @@ impl ImageJApp {
     pub fn set_slice_active(&mut self, index: i32) -> Result<(), SessionError> {
         // Slider/keyboard navigation must not be recorded; only the explicit
         // Image > Stack > Set Slice... command records setSlice(n).
+        // Manual navigation stops any ongoing playback (Animator.java 54-55).
+        if let Some(id) = self.active_image_id() {
+            self.stop_animation(id);
+        }
         match self.session.dispatch(Command::NavigateSlice { index }) {
             Ok(_) => {
                 self.status_message = format!("Slice {index}");
@@ -822,6 +841,10 @@ impl ImageJApp {
         frame: i32,
     ) -> Result<(), SessionError> {
         // Hyperstack slider navigation must not be recorded (StackWindow.java 294-306).
+        // Manual navigation stops any ongoing playback (Animator.java 54-55).
+        if let Some(id) = self.active_image_id() {
+            self.stop_animation(id);
+        }
         match self.session.dispatch(Command::NavigatePosition {
             channel,
             slice,
@@ -871,6 +894,128 @@ impl ImageJApp {
                 self.status_message = text;
             }
         }
+    }
+
+    pub fn is_animating(&self, id: ImageId) -> bool {
+        self.animations.contains_key(&id) && self.session.get_image(id).is_some()
+    }
+
+    pub fn is_any_animating(&self) -> bool {
+        self.animations
+            .keys()
+            .any(|id| self.session.get_image(*id).is_some())
+    }
+
+    pub fn stop_animation(&mut self, id: ImageId) {
+        self.animations.remove(&id);
+    }
+
+    pub fn stop_all_animations(&mut self) {
+        self.animations.clear();
+    }
+
+    pub fn toggle_animation(&mut self, id: ImageId) -> bool {
+        if self.is_animating(id) {
+            self.stop_animation(id);
+            false
+        } else {
+            let Some(doc) = self.session.get_image(id) else {
+                return false;
+            };
+            if doc.stack_size() <= 1 {
+                return false;
+            }
+            self.animations.insert(
+                id,
+                AnimationState {
+                    fps: DEFAULT_ANIMATION_FPS,
+                    last_step_time: None,
+                },
+            );
+            true
+        }
+    }
+
+    pub fn advance_animations(&mut self, now_secs: f64) -> usize {
+        self.animations.retain(|id, _| self.session.get_image(*id).is_some());
+
+        let mut to_advance = Vec::new();
+        for (&id, state) in &mut self.animations {
+            match state.last_step_time {
+                None => {
+                    state.last_step_time = Some(now_secs);
+                }
+                Some(last_time) => {
+                    let interval = 1.0 / state.fps.max(0.1);
+                    if now_secs - last_time >= interval {
+                        state.last_step_time = Some(now_secs);
+                        to_advance.push(id);
+                    }
+                }
+            }
+        }
+
+        let mut advanced_count = 0;
+        for id in to_advance {
+            if self.step_animation_doc(id) {
+                advanced_count += 1;
+            }
+        }
+        advanced_count
+    }
+
+    fn step_animation_doc(&mut self, id: ImageId) -> bool {
+        let Some(doc) = self.session.get_image_mut(id) else {
+            return false;
+        };
+        if doc.stack_size() <= 1 {
+            return false;
+        }
+        let is_hyper = doc.is_hyperstack()
+            || ((doc.get_n_channels() > 1) as u8
+                + (doc.get_n_slices() > 1) as u8
+                + (doc.get_n_frames() > 1) as u8
+                >= 2);
+
+        if is_hyper {
+            let (c, z, t) = doc.get_position();
+            if doc.get_n_frames() > 1 {
+                let max_t = doc.get_n_frames();
+                let next_t = if t >= max_t { 1 } else { t + 1 };
+                doc.set_position(c as i32, z as i32, next_t as i32);
+            } else if doc.get_n_slices() > 1 {
+                let max_z = doc.get_n_slices();
+                let next_z = if z >= max_z { 1 } else { z + 1 };
+                doc.set_position(c as i32, next_z as i32, t as i32);
+            } else {
+                let current = doc.current_slice;
+                let max_s = doc.stack_size() as u32;
+                let next_s = if current >= max_s { 1 } else { current + 1 };
+                let _ = doc.set_slice(next_s as i32);
+            }
+        } else {
+            let current = doc.current_slice;
+            let max_s = doc.stack_size() as u32;
+            let next_s = if current >= max_s { 1 } else { current + 1 };
+            let _ = doc.set_slice(next_s as i32);
+        }
+
+        if self.session.active_image_id() == Some(id) {
+            if let Some(doc) = self.session.get_image(id) {
+                if is_hyper {
+                    let (c, z, t) = doc.get_position();
+                    self.status_message = format!("c:{c} z:{z} t:{t}");
+                } else {
+                    self.status_message = format!("Slice {}", doc.current_slice);
+                }
+            }
+            if let Some((pixel_id, x, y)) = self.last_status_pixel {
+                if pixel_id == id {
+                    self.update_status_for_pixel(id, x, y);
+                }
+            }
+        }
+        true
     }
 
 

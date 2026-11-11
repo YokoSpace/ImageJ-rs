@@ -366,8 +366,8 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 
 ## 5.5 ここまでの進捗（2026-11-11 時点）
 
-- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1, M2.1–M2.2, M3a–M3d, M4a–M4c, M5, M6a, S1, 英語・日本語 README。
-- **残りの Phase 2 タスク**: M2.3（Duplicate ダイアログ）、M6b（Plot Profile ウィンドウ）、M7（スタック一括フィルタと保存メニュー）、S2（アニメーション）、N0–N1（macOS ネイティブメニュー）、P1（Plugins メニュー直結）。
+- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1, M2.1–M2.2, M3a–M3d, M4a–M4c, M5, M6a, S1–S2, 英語・日本語 README。
+- **残りの Phase 2 タスク**: M2.3（Duplicate ダイアログ）、M6b（ウィンドウ実装済み、K キー接続待ち）、M7（スタック一括フィルタと保存メニュー）、N0–N1（macOS ネイティブメニュー）、P1（Plugins メニュー直結）。
 
 以下では、残りのタスクを `deepseek-V4.1-flash` / `Gemini flash` / `Claude Sonnet` が迷わず1タスクずつ完結できるよう、サブタスク・型シグネチャ・Java 参照行・先に書くテスト・非ゴールまで具体化しています。
 

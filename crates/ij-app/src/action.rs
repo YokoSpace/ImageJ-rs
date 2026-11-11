@@ -33,6 +33,7 @@ pub enum AppAction {
     Despeckle,
     Measure,
     Histogram,
+    PlotProfile,
     SetMeasurements,
     ClearResults,
     InstalledPlugins,
@@ -44,6 +45,7 @@ pub enum AppAction {
     ZoomOut(ImageId),
     NextSlice(ImageId),
     PreviousSlice(ImageId),
+    ToggleAnimation(ImageId),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -172,7 +174,7 @@ const ANALYZE_MENU: &[MenuNode] = &[
     item("Histogram", Some("H"), AppAction::Histogram),
     item("Clear Results", None, AppAction::ClearResults),
     item("Set Measurements...", None, AppAction::SetMeasurements),
-    unsupported("Plot Profile", None),
+    item("Plot Profile", Some("K"), AppAction::PlotProfile),
     unsupported("Calibrate...", None),
 ];
 
@@ -240,7 +242,7 @@ impl ImageJApp {
                     Err("Image is no longer open".into())
                 }
             }
-            NextSlice(id) | PreviousSlice(id) => {
+            NextSlice(id) | PreviousSlice(id) | ToggleAnimation(id) => {
                 let Some(doc) = self.session.get_image(id) else {
                     return Err("Image is no longer open".into());
                 };
@@ -289,6 +291,14 @@ impl ImageJApp {
                         _ => Ok(()),
                     },
                     Median if !matches!(doc.plane(), PixelPlane::Gray8(_)) => Err("Median requires an 8-bit image".into()),
+                    // ProfilePlot.java 53-62: only a line or rectangular
+                    // selection produces a profile, and the two rejection
+                    // messages are the ones the constructor prints.
+                    PlotProfile => match doc.roi.as_ref() {
+                        None => Err("Selection required.".into()),
+                        Some(ij_core::Roi::Rect(_) | ij_core::Roi::Line(_)) => Ok(()),
+                        Some(_) => Err("Line or rectangular selection required.".into()),
+                    },
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
                     _ => Ok(()),
                 }
@@ -331,13 +341,16 @@ impl ImageJApp {
             }
             Close => {
                 if let Some(id) = self.active_image_id() {
+                    self.stop_animation(id);
                     self.request_close_window(id);
                 }
             }
             CloseImage(id) => {
+                self.stop_animation(id);
                 self.request_close_window(id);
             }
             CloseAll => {
+                self.stop_all_animations();
                 self.request_close_all();
             }
             Quit => {
@@ -418,6 +431,15 @@ impl ImageJApp {
             SetMeasurements => {
                 self.open_set_measurements_dialog();
             }
+            PlotProfile => {
+                let title = self.session.active_doc().map(|doc| doc.title.clone()).ok();
+                if let (Some(title), Ok(CommandOutcome::ProfileComputed(profile))) =
+                    (title, self.session.dispatch(Command::PlotProfile))
+                {
+                    self.plot_profile_window =
+                        Some(crate::app::PlotProfileWindowState::new(&title, &profile));
+                }
+            }
             ClearResults => {
                 let _ = self.session.dispatch(Command::ClearResults);
                 self.status_message = "Results cleared".to_string();
@@ -460,10 +482,14 @@ impl ImageJApp {
                         current.saturating_sub(1)
                     };
                     if size > 1 && next >= 1 && (next as usize) <= size {
+                        self.stop_animation(id);
                         let _ = self.set_active_window(id);
                         let _ = self.set_slice_active(next as i32);
                     }
                 }
+            }
+            ToggleAnimation(id) => {
+                self.toggle_animation(id);
             }
         }
     }

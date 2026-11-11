@@ -158,6 +158,14 @@ impl ImageJApp {
             return;
         }
 
+        // Backslash: toggle stack animation playback (ImageJ.java 636-641)
+        let toggle_anim =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Backslash));
+        if toggle_anim {
+            self.perform(AppAction::ToggleAnimation(target_id), ctx);
+            return;
+        }
+
         let arrow = ctx.input_mut(|i| {
             let modifiers = i.modifiers;
             [

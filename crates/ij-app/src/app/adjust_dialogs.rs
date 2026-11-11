@@ -1,4 +1,5 @@
 use super::*;
+use ij_core::format_ij_num;
 
 #[path = "bc_palette.rs"]
 mod bc_palette;
@@ -309,6 +310,8 @@ impl ImageJApp {
         }
 
         self.render_histogram_window(ctx);
+
+        self.render_plot_profile_window(ctx);
 
         // "Process Stack?" decision, matching IJ.setupDialog. Yes is offered
         // only where a verified whole-stack implementation exists; otherwise
@@ -949,5 +952,287 @@ fn render_option(
     }
     if response.changed() {
         dialog.toggle(option.flag, checked);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Analyze > Plot Profile
+// ---------------------------------------------------------------------------
+
+/// ImageJ's default y-axis label for uncalibrated images
+/// (`Calibration.DEFAULT_VALUE_UNIT`, original_imagej/ij/measure/Calibration.java
+/// 12). `ProfilePlot` passes `cal.getValueUnit()` (ProfilePlot.java 68), and
+/// `ij_core::Calibration` does not model value units yet, so every supported
+/// image shows the default.
+pub const PLOT_PROFILE_Y_LABEL: &str = "Gray Value";
+
+/// `ProfilePlot.getShortTitle` (original_imagej/ij/gui/ProfilePlot.java 143-149).
+///
+/// Java strips the extension only when the last dot is not the first character
+/// and the dot plus extension is at most five characters, so `ramp.tif` becomes
+/// `ramp` while `a.longext` is kept.
+pub fn plot_profile_short_title(title: &str) -> String {
+    let Some(index) = title.rfind('.') else {
+        return title.to_string();
+    };
+    // Java compares UTF-16 lengths; counting chars keeps multi-byte titles
+    // behaving like the reference instead of growing by the extra UTF-8 bytes.
+    let total = title.chars().count();
+    let prefix = title[..index].chars().count();
+    if index > 0 && total - prefix <= 5 {
+        title[..index].to_string()
+    } else {
+        title.to_string()
+    }
+}
+
+/// State of one `Plot of <short title>` window.
+///
+/// A snapshot: it owns the sampled values and never borrows the document, so
+/// rendering or closing it cannot mutate the image, the ROI or the recorder.
+#[derive(Debug, Clone)]
+pub struct PlotProfileWindowState {
+    pub title: String,
+    pub x_label: String,
+    pub y_label: String,
+    pub x_values: Vec<f64>,
+    pub y_values: Vec<f64>,
+    pub show_list: bool,
+}
+
+impl PlotProfileWindowState {
+    pub fn new(image_title: &str, profile: &ProfileData) -> Self {
+        Self {
+            // ProfilePlot.java 125: new Plot("Plot of "+getShortTitle(imp), ...)
+            title: format!("Plot of {}", plot_profile_short_title(image_title)),
+            // ProfilePlot.java 117: xLabel = "Distance ("+units+")".
+            x_label: format!("Distance ({})", profile.units),
+            y_label: PLOT_PROFILE_Y_LABEL.to_string(),
+            // ProfilePlot.java 120-122: xValues[i] = (float)(i*xInc). Keeping
+            // the float cast lists the same digits Java stores.
+            x_values: (0..profile.values.len())
+                .map(|i| f64::from((i as f64 * profile.x_inc) as f32))
+                .collect(),
+            y_values: profile.values.clone(),
+            show_list: false,
+        }
+    }
+
+    pub fn x_range(&self) -> (f64, f64) {
+        match (self.x_values.first(), self.x_values.last()) {
+            (Some(&first), Some(&last)) if last > first => (first, last),
+            (Some(&first), _) => (first, first + 1.0),
+            _ => (0.0, 1.0),
+        }
+    }
+
+    /// Autoscaled y range over the finite samples; `Plot` autoscale ignores
+    /// non-finite data, and a flat profile is padded so the axis has a span.
+    pub fn y_range(&self) -> (f64, f64) {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for &value in &self.y_values {
+            if value.is_finite() {
+                min = min.min(value);
+                max = max.max(value);
+            }
+        }
+        if !min.is_finite() || !max.is_finite() {
+            return (0.0, 1.0);
+        }
+        if max > min {
+            (min, max)
+        } else {
+            (min - 0.5, max + 0.5)
+        }
+    }
+
+    /// Normalized polyline runs for this window's axes.
+    pub fn runs(&self) -> Vec<Vec<(f32, f32)>> {
+        plot_profile_runs(
+            &self.x_values,
+            &self.y_values,
+            self.x_range(),
+            self.y_range(),
+        )
+    }
+
+    /// `PlotWindow.showList` (PlotWindow.java 663-668) shows
+    /// `Plot.getResultsTable` (Plot.java 3852-3900): one `X`/`Y` row per sample,
+    /// formatted like a ResultsTable column.
+    pub fn values_tsv(&self) -> String {
+        let mut out = String::from("X\tY\n");
+        for (x, y) in self.x_values.iter().zip(&self.y_values) {
+            out.push_str(&format!("{}\t{}\n", format_ij_num(*x), format_ij_num(*y)));
+        }
+        out
+    }
+}
+
+/// Normalized (`0..1`, y up) plot coordinates split into runs at NaN samples.
+///
+/// A NaN sample has no drawable coordinate, so the polyline is broken there
+/// instead of connecting through it. `ProfilePlot.getColumnAverageProfile`
+/// leaves `0/0 = NaN` for a column with no in-bounds sample
+/// (ProfilePlot.java 210-225).
+pub fn plot_profile_runs(
+    x_values: &[f64],
+    y_values: &[f64],
+    x_range: (f64, f64),
+    y_range: (f64, f64),
+) -> Vec<Vec<(f32, f32)>> {
+    let (x_min, x_max) = x_range;
+    let (y_min, y_max) = y_range;
+    let x_span = x_max - x_min;
+    let y_span = y_max - y_min;
+    let mut runs: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut current: Vec<(f32, f32)> = Vec::new();
+    for (&x, &y) in x_values.iter().zip(y_values) {
+        if !x.is_finite() || !y.is_finite() {
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+        let nx = if x_span > 0.0 {
+            ((x - x_min) / x_span) as f32
+        } else {
+            0.0
+        };
+        let ny = if y_span > 0.0 {
+            ((y - y_min) / y_span) as f32
+        } else {
+            0.0
+        };
+        current.push((nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0)));
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
+impl ImageJApp {
+    /// `Analyze > Plot Profile` window: line graph with calibrated
+    /// distance/intensity axes plus the `List` button of PlotWindow.java
+    /// 222-266.
+    pub fn render_plot_profile_window(&mut self, ctx: &egui::Context) {
+        let Some(window) = self.plot_profile_window.as_ref().cloned() else {
+            return;
+        };
+        let mut close = false;
+        let mut show_list = window.show_list;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_plot_profile_window"),
+            egui::ViewportBuilder::default()
+                .with_title(&window.title)
+                .with_inner_size([420.0, 360.0])
+                .with_min_inner_size([320.0, 280.0]),
+            |ctx, class| {
+                if !matches!(class, egui::ViewportClass::Embedded)
+                    && ctx.input(|i| i.viewport().close_requested())
+                {
+                    close = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("List").clicked() {
+                            show_list = !show_list;
+                        }
+                    });
+                    ui.separator();
+                    let (outer, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width().max(220.0), 190.0),
+                        Sense::hover(),
+                    );
+                    // Leave room for the axis labels outside the frame.
+                    let rect = Rect::from_min_max(
+                        outer.min + egui::vec2(40.0, 14.0),
+                        outer.max - egui::vec2(8.0, 24.0),
+                    );
+                    let painter = ui.painter();
+                    let (x_min, x_max) = window.x_range();
+                    let (y_min, y_max) = window.y_range();
+                    let to_screen = |(nx, ny): (f32, f32)| {
+                        egui::pos2(
+                            rect.left() + nx * rect.width(),
+                            rect.bottom() - ny * rect.height(),
+                        )
+                    };
+                    painter.rect_stroke(
+                        rect,
+                        CornerRadius::ZERO,
+                        Stroke::new(1.0_f32, Color32::BLACK),
+                        egui::StrokeKind::Inside,
+                    );
+                    let stroke = Stroke::new(1.0_f32, Color32::from_rgb(20, 20, 160));
+                    for run in window.runs() {
+                        if run.len() == 1 {
+                            painter.circle_filled(to_screen(run[0]), 1.5, Color32::BLACK);
+                        }
+                        for pair in run.windows(2) {
+                            painter.line_segment([to_screen(pair[0]), to_screen(pair[1])], stroke);
+                        }
+                    }
+                    let tick_font = egui::FontId::proportional(10.0);
+                    let label_font = egui::FontId::proportional(11.0);
+                    painter.text(
+                        egui::pos2(outer.left(), rect.top() - 2.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        &window.y_label,
+                        label_font.clone(),
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        egui::pos2(rect.left() - 4.0, rect.top()),
+                        egui::Align2::RIGHT_CENTER,
+                        format_ij_num(y_max),
+                        tick_font.clone(),
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        egui::pos2(rect.left() - 4.0, rect.bottom()),
+                        egui::Align2::RIGHT_CENTER,
+                        format_ij_num(y_min),
+                        tick_font.clone(),
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        egui::pos2(rect.center().x, rect.bottom() + 4.0),
+                        egui::Align2::CENTER_TOP,
+                        &window.x_label,
+                        label_font,
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        egui::pos2(rect.left(), rect.bottom() + 4.0),
+                        egui::Align2::LEFT_TOP,
+                        format_ij_num(x_min),
+                        tick_font.clone(),
+                        Color32::BLACK,
+                    );
+                    painter.text(
+                        egui::pos2(rect.right(), rect.bottom() + 4.0),
+                        egui::Align2::RIGHT_TOP,
+                        format_ij_num(x_max),
+                        tick_font,
+                        Color32::BLACK,
+                    );
+                    if show_list {
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                ui.monospace(window.values_tsv());
+                            });
+                    }
+                });
+            },
+        );
+        if close {
+            self.plot_profile_window = None;
+        } else if let Some(state) = self.plot_profile_window.as_mut() {
+            state.show_list = show_list;
+        }
     }
 }
