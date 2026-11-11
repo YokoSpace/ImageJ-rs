@@ -682,6 +682,16 @@ fn rgb_to_byte(pixel: u32) -> u8 {
     (r * weight + g * weight + b * weight + 0.5) as u8
 }
 
+/// TypeConverter.convertRGBToFloat (TypeConverter.java 123-139) with
+/// ColorProcessor's default equal weights (ColorProcessor.java 26).
+fn rgb_to_float(pixel: u32) -> f32 {
+    let r = f64::from((pixel >> 16) & 0xff);
+    let g = f64::from((pixel >> 8) & 0xff);
+    let b = f64::from(pixel & 0xff);
+    let weight = 1.0 / 3.0;
+    (r * weight + g * weight + b * weight) as f32
+}
+
 fn lut_rgb(lut: &Lut256, index: u8) -> u32 {
     let i = index as usize;
     (u32::from(lut.r[i]) << 16) | (u32::from(lut.g[i]) << 8) | u32::from(lut.b[i])
@@ -1651,6 +1661,100 @@ impl ImageDocument {
             };
             self.display_range = gray16_display_range(pixels);
         }
+        Ok(())
+    }
+
+    /// Converts every plane to 32-bit float grayscale, matching `Image > Type >
+    /// 32-bit` with `doScaling = true` and `Prefs.calibrateConversions = false`.
+    /// Single images go through `ImageConverter.convertToGray32`
+    /// (ImageConverter.java 171-190); stacks go through
+    /// `StackConverter.convertToGray32` (StackConverter.java 181-223).
+    ///
+    /// `COLOR_256` images throw `IllegalArgumentException` in Java
+    /// (ImageConverter.java 174-175, StackConverter.java 184-185).
+    pub fn convert_to_32bit(&mut self) -> Result<(), CoreError> {
+        // Converter.java 51-52 resets the threshold before the type checks, and
+        // the catch block (Converter.java 132-140) does not restore it.
+        self.threshold = None;
+        if self.slices.len() > 1 {
+            return self.convert_stack_to_32bit();
+        }
+        if matches!(self.slices[0], PixelPlane::Color256 { .. }) {
+            // ImageConverter.java 174-175 rejects COLOR_256.
+            return Err(CoreError::InvalidOperation("Unsupported conversion"));
+        }
+        // Undo.setup(Undo.TYPE_CONVERSION, imp) runs for single images only
+        // (Converter.java 96-103); a GRAY32 no-op also replaces the buffer.
+        self.save_snapshot();
+        let converted = match self.slices[0].clone() {
+            // ImageConverter.java 172-173 returns without touching anything.
+            PixelPlane::Gray32(_) => return Ok(()),
+            // convertByteToFloat without calibration table (TypeConverter.java 211-225).
+            PixelPlane::Gray8(pixels) => {
+                PixelPlane::Gray32(pixels.into_iter().map(f32::from).collect())
+            }
+            // convertShortToFloat without calibration table (TypeConverter.java 231-245).
+            PixelPlane::Gray16(pixels) => {
+                PixelPlane::Gray32(pixels.into_iter().map(f32::from).collect())
+            }
+            // convertRGBToFloat (TypeConverter.java 123-139).
+            PixelPlane::ColorRgb(pixels) => {
+                PixelPlane::Gray32(pixels.into_iter().map(rgb_to_float).collect())
+            }
+            PixelPlane::Color256 { .. } => unreachable!("COLOR_256 was rejected above"),
+        };
+        self.slices[0] = converted;
+        // ImageConverter.java 188 restores the original display range via
+        // IJ.setMinAndMax(imp, min, max).
+        self.snapshot_display_range = Some(self.display_range);
+        Ok(())
+    }
+
+    fn convert_stack_to_32bit(&mut self) -> Result<(), CoreError> {
+        let current = self.current_slice_index();
+        // StackConverter.java 182-185 accepts GRAY8, GRAY16, and COLOR_RGB;
+        // GRAY32 is a silent no-op on line 183.
+        match self.slices[current] {
+            PixelPlane::Gray32(_) => return Ok(()),
+            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::ColorRgb(_) => {}
+            _ => return Err(CoreError::InvalidOperation("Unsupported conversion")),
+        }
+        // ImageJ stacks share one type, so a mixed Rust stack has no Java
+        // equivalent; reject it rather than convert some planes silently.
+        if self.slices.iter().any(|plane| {
+            matches!(
+                plane,
+                PixelPlane::Color256 { .. }
+            )
+        }) {
+            return Err(CoreError::InvalidOperation("Unsupported conversion"));
+        }
+        // A whole-stack type conversion does not create an Undo buffer.
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
+
+        self.slices = self
+            .slices
+            .iter()
+            .map(|plane| match plane {
+                PixelPlane::Gray8(pixels) => {
+                    PixelPlane::Gray32(pixels.iter().map(|&px| f32::from(px)).collect())
+                }
+                PixelPlane::Gray16(pixels) => {
+                    PixelPlane::Gray32(pixels.iter().map(|&px| f32::from(px)).collect())
+                }
+                PixelPlane::Gray32(pixels) => PixelPlane::Gray32(pixels.clone()),
+                PixelPlane::ColorRgb(pixels) => {
+                    PixelPlane::Gray32(pixels.iter().map(|&px| rgb_to_float(px)).collect())
+                }
+                PixelPlane::Color256 { .. } => {
+                    unreachable!("color256 stacks were rejected above")
+                }
+            })
+            .collect();
+        // ImageConverter.java 181 restores the original display range via
+        // IJ.setMinAndMax(imp, min, max).
         Ok(())
     }
 
@@ -2935,6 +3039,70 @@ mod tests {
                 max: 1.0
             }
         );
+    }
+
+    #[test]
+    fn undo_after_32bit_conversion_restores_original_display_range() {
+        // TYPE_CONVERSION saves the original processor, including its min/max
+        // (Undo.java 149-160, Converter.java 96-103).
+        let mut doc8 = ImageDocument::new(
+            "conversion-32-undo-8",
+            3,
+            1,
+            PixelPlane::Gray8(vec![10, 50, 200]),
+        )
+        .unwrap();
+        let original8 = doc8.plane().clone();
+        doc8.display_range = DisplayRange { min: 10.0, max: 200.0 };
+        doc8.convert_to_32bit().unwrap();
+        assert_eq!(doc8.plane(), &PixelPlane::Gray32(vec![10.0, 50.0, 200.0]));
+        assert_eq!(doc8.display_range, DisplayRange { min: 10.0, max: 200.0 });
+        assert!(doc8.undo());
+        assert_eq!(doc8.plane(), &original8);
+        assert_eq!(doc8.display_range, DisplayRange { min: 10.0, max: 200.0 });
+
+        let mut doc16 = ImageDocument::new(
+            "conversion-32-undo-16",
+            3,
+            1,
+            PixelPlane::Gray16(vec![100, 250, 500]),
+        )
+        .unwrap();
+        let original16 = doc16.plane().clone();
+        doc16.display_range = DisplayRange { min: 100.0, max: 500.0 };
+        doc16.convert_to_32bit().unwrap();
+        assert_eq!(doc16.plane(), &PixelPlane::Gray32(vec![100.0, 250.0, 500.0]));
+        assert_eq!(doc16.display_range, DisplayRange { min: 100.0, max: 500.0 });
+        assert!(doc16.undo());
+        assert_eq!(doc16.plane(), &original16);
+        assert_eq!(doc16.display_range, DisplayRange { min: 100.0, max: 500.0 });
+
+        let mut doc_rgb = ImageDocument::new(
+            "conversion-32-undo-rgb",
+            2,
+            1,
+            PixelPlane::ColorRgb(vec![0x00ff_0000, 0x0000_ff00]),
+        )
+        .unwrap();
+        let original_rgb = doc_rgb.plane().clone();
+        doc_rgb.convert_to_32bit().unwrap();
+        assert_eq!(doc_rgb.display_range, DisplayRange { min: 0.0, max: 255.0 });
+        assert!(doc_rgb.undo());
+        assert_eq!(doc_rgb.plane(), &original_rgb);
+        assert_eq!(doc_rgb.display_range, DisplayRange { min: 0.0, max: 255.0 });
+
+        let mut stack = ImageDocument::new_stack(
+            "conversion-32-stack",
+            2,
+            1,
+            vec![
+                PixelPlane::Gray8(vec![10, 20]),
+                PixelPlane::Gray8(vec![30, 40]),
+            ],
+        )
+        .unwrap();
+        stack.convert_to_32bit().unwrap();
+        assert!(!stack.undo(), "stack type conversions have no undo");
     }
 
     #[test]

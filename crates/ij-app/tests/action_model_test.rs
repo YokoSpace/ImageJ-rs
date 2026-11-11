@@ -352,3 +352,115 @@ fn convert_to_16bit_action_converts_and_records() {
         Some("run(\"16-bit\");")
     );
 }
+
+#[test]
+fn menu_tree_wires_type_32bit() {
+    let image_menu = MENU_TREE
+        .iter()
+        .find(|node| node.label == "Image")
+        .expect("Image menu");
+    let ij_app::action::MenuKind::Submenu(image_nodes) = image_menu.kind else {
+        panic!("Image must be a submenu");
+    };
+    let type_menu = image_nodes
+        .iter()
+        .find(|node| node.label == "Type")
+        .expect("Type submenu");
+    let ij_app::action::MenuKind::Submenu(type_nodes) = type_menu.kind else {
+        panic!("Type must be a submenu");
+    };
+    let thirty_two_bit = type_nodes
+        .iter()
+        .find(|node| node.label == "32-bit")
+        .expect("32-bit item");
+    assert!(matches!(
+        thirty_two_bit.kind,
+        ij_app::action::MenuKind::Item(AppAction::ConvertTo32Bit)
+    ));
+}
+
+#[test]
+fn convert_to_32bit_action_requires_a_supported_image() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::ConvertTo32Bit).is_err());
+
+    let indexed = ImageDocument::new(
+        "indexed",
+        2,
+        1,
+        PixelPlane::Color256 {
+            pixels: vec![0, 1],
+            lut: Box::new(ij_core::Lut256::default()),
+        },
+    )
+    .unwrap();
+    let indexed_id = app.session.insert_doc(indexed);
+    app.set_active_window(indexed_id).unwrap();
+    assert!(
+        app.action_enabled(AppAction::ConvertTo32Bit).is_err(),
+        "ImageConverter.java 174-175 rejects COLOR_256"
+    );
+
+    let rgb = ImageDocument::new(
+        "rgb",
+        2,
+        1,
+        PixelPlane::ColorRgb(vec![0x00ff_0000, 0x0000_00ff]),
+    )
+    .unwrap();
+    let rgb_id = app.session.insert_doc(rgb);
+    app.set_active_window(rgb_id).unwrap();
+    assert!(app.action_enabled(AppAction::ConvertTo32Bit).is_ok());
+
+    let rgb_stack = ImageDocument::new_stack(
+        "rgb-stack",
+        2,
+        1,
+        vec![
+            PixelPlane::ColorRgb(vec![0x00ff_0000, 0x0000_00ff]),
+            PixelPlane::ColorRgb(vec![0x0000_ff00, 0x00ff_ffff]),
+        ],
+    )
+    .unwrap();
+    let stack_id = app.session.insert_doc(rgb_stack);
+    app.set_active_window(stack_id).unwrap();
+    assert!(
+        app.action_enabled(AppAction::ConvertTo32Bit).is_ok(),
+        "StackConverter.java 184-185 accepts RGB stacks"
+    );
+}
+
+#[test]
+fn convert_to_32bit_action_converts_and_records() {
+    let mut app = ImageJApp::new();
+    let doc = ImageDocument::new(
+        "gray8",
+        3,
+        1,
+        PixelPlane::Gray8(vec![0, 100, 250]),
+    )
+    .unwrap();
+    let id = app.session.insert_doc(doc);
+    app.session.get_image_mut(id).unwrap().display_range = ij_core::DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    assert!(app.action_enabled(AppAction::ConvertTo32Bit).is_ok());
+
+    app.perform(AppAction::ConvertTo32Bit, &Context::default());
+
+    let doc = app.session.get_image(id).unwrap();
+    assert_eq!(doc.plane(), &PixelPlane::Gray32(vec![0.0, 100.0, 250.0]));
+    assert_eq!(
+        doc.display_range,
+        ij_core::DisplayRange {
+            min: 10.0,
+            max: 200.0
+        },
+        "ImageConverter.java 188 restores the original display range via IJ.setMinAndMax"
+    );
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"32-bit\");")
+    );
+}

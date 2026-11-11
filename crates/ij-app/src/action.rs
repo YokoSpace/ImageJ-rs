@@ -17,6 +17,7 @@ pub enum AppAction {
     Crop,
     ConvertTo8Bit,
     ConvertTo16Bit,
+    ConvertTo32Bit,
     SelectNone,
     BrightnessContrast,
     Threshold,
@@ -133,7 +134,7 @@ const IMAGE_STACKS: &[MenuNode] = &[item("Invert Stack", None, AppAction::Invert
 const IMAGE_TYPE: &[MenuNode] = &[
     item("8-bit", None, AppAction::ConvertTo8Bit),
     item("16-bit", None, AppAction::ConvertTo16Bit),
-    unsupported("32-bit", None),
+    item("32-bit", None, AppAction::ConvertTo32Bit),
     unsupported("RGB Color", None),
 ];
 const IMAGE_MENU: &[MenuNode] = &[
@@ -275,6 +276,11 @@ impl ImageJApp {
                         PixelPlane::ColorRgb(_) if doc.stack_size() > 1 => Err("16-bit conversion is not supported for RGB stacks".into()),
                         _ => Ok(()),
                     },
+                    ConvertTo32Bit => match doc.plane() {
+                        // ImageConverter.java 174-175 and StackConverter.java 184-185 reject COLOR_256.
+                        PixelPlane::Color256 { .. } => Err("32-bit conversion is not supported for 8-bit color images".into()),
+                        _ => Ok(()),
+                    },
                     Median if !matches!(doc.plane(), PixelPlane::Gray8(_)) => Err("Median requires an 8-bit image".into()),
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
                     _ => Ok(()),
@@ -344,6 +350,9 @@ impl ImageJApp {
             }
             ConvertTo16Bit => {
                 let _ = self.convert_to_16bit_active();
+            }
+            ConvertTo32Bit => {
+                let _ = self.convert_to_32bit_active();
             }
             SelectNone => {
                 let _ = self.clear_roi();

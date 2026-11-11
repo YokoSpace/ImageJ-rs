@@ -9886,3 +9886,259 @@ fn session_convert_to_16bit_records_macro_and_clears_threshold() {
         vec!["run(\"16-bit\");".to_string()]
     );
 }
+
+#[test]
+fn parity_convert_to_32bit_gray8_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0u8; 32];
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        *pixel = ((i * 37 + 11) % 251) as u8;
+    }
+    let mut doc =
+        ImageDocument::new("convert_to_32.tif", 8, 4, PixelPlane::Gray8(pixels)).unwrap();
+    doc.display_range = DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"32-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_32bit().unwrap();
+    let PixelPlane::Gray32(out) = doc.plane() else {
+        panic!("expected Gray32 after conversion, got {:?}", doc.plane());
+    };
+    let oracle_pixels = match oracle_doc.plane() {
+        PixelPlane::Gray32(v) => v.clone(),
+        other => panic!("unexpected oracle plane {other:?}"),
+    };
+    assert_eq!(out, &oracle_pixels, "8-bit -> 32-bit pixels differ");
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+#[test]
+fn parity_convert_to_32bit_gray16_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0u16; 32];
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        *pixel = ((i * 37 + 11) % 65521) as u16;
+    }
+    let mut doc =
+        ImageDocument::new("convert_16_to_32.tif", 8, 4, PixelPlane::Gray16(pixels)).unwrap();
+    doc.display_range = DisplayRange {
+        min: 100.0,
+        max: 500.0,
+    };
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"32-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_32bit().unwrap();
+    let PixelPlane::Gray32(out) = doc.plane() else {
+        panic!("expected Gray32 after conversion, got {:?}", doc.plane());
+    };
+    let oracle_pixels = match oracle_doc.plane() {
+        PixelPlane::Gray32(v) => v.clone(),
+        other => panic!("unexpected oracle plane {other:?}"),
+    };
+    assert_eq!(out, &oracle_pixels, "16-bit -> 32-bit pixels differ");
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+#[test]
+fn parity_convert_to_32bit_rgb_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0u32; 32];
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        let r = (i * 37) % 256;
+        let g = (i * 53 + 7) % 256;
+        let b = (i * 97 + 11) % 256;
+        *pixel = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+    }
+    pixels[0] = 0x00ff_0000;
+    pixels[1] = 0x0000_ff00;
+    pixels[2] = 0x0000_00ff;
+    pixels[3] = 0x00ff_ffff;
+    let mut doc =
+        ImageDocument::new("convert_rgb_to_32.tif", 8, 4, PixelPlane::ColorRgb(pixels)).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"32-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_32bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+#[test]
+fn parity_convert_to_32bit_gray8_stack_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = distinct_stack_8bit(8, 6, 3);
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    doc.display_range = DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    doc.slice_labels = vec![
+        Some("first".into()),
+        Some("second".into()),
+        Some("third".into()),
+    ];
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "Property.setSliceLabel(\"first\",1); Property.setSliceLabel(\"second\",2); \
+             Property.setSliceLabel(\"third\",3); setSlice(2); run(\"32-bit\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_32bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+    assert_eq!(doc.slice_labels, oracle_doc.slice_labels);
+    assert_eq!(doc.current_slice, 2);
+}
+
+#[test]
+fn parity_convert_to_32bit_gray16_stack_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = distinct_stack_16bit(8, 6, 3);
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    doc.display_range = DisplayRange {
+        min: 500.0,
+        max: 40000.0,
+    };
+    doc.slice_labels = vec![
+        Some("first".into()),
+        Some("second".into()),
+        Some("third".into()),
+    ];
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "Property.setSliceLabel(\"first\",1); Property.setSliceLabel(\"second\",2); \
+             Property.setSliceLabel(\"third\",3); setSlice(2); run(\"32-bit\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_32bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+    assert_eq!(doc.slice_labels, oracle_doc.slice_labels);
+    assert_eq!(doc.current_slice, 2);
+}
+
+#[test]
+fn parity_convert_to_32bit_rgb_stack_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut slices = Vec::new();
+    for s in 0..3 {
+        let mut pixels = vec![0u32; 48];
+        for y in 0..6 {
+            for x in 0..8 {
+                let r = (s * 41 + x * 17 + y * 7) % 256;
+                let g = (s * 59 + x * 23 + y * 13) % 256;
+                let b = (s * 83 + x * 31 + y * 29) % 256;
+                pixels[(y * 8 + x) as usize] = (r << 16) | (g << 8) | b;
+            }
+        }
+        slices.push(PixelPlane::ColorRgb(pixels));
+    }
+    let mut doc = ImageDocument::new_stack("stack_rgb_to_32.tif", 8, 6, slices).unwrap();
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    doc.slice_labels = vec![
+        Some("slice1".into()),
+        Some("slice2".into()),
+        Some("slice3".into()),
+    ];
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "Property.setSliceLabel(\"slice1\",1); Property.setSliceLabel(\"slice2\",2); \
+             Property.setSliceLabel(\"slice3\",3); setSlice(2); run(\"32-bit\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_32bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+    assert_eq!(doc.slice_labels, oracle_doc.slice_labels);
+    assert_eq!(doc.current_slice, 2);
+}
+
+#[test]
+fn convert_to_32bit_rejects_color256_like_java() {
+    let mut doc = ImageDocument::new(
+        "indexed.tif",
+        4,
+        2,
+        PixelPlane::Color256 {
+            pixels: (0..8).collect(),
+            lut: Box::new(Lut256::default()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        doc.convert_to_32bit(),
+        Err(CoreError::InvalidOperation("Unsupported conversion"))
+    );
+    assert!(
+        matches!(doc.plane(), PixelPlane::Color256 { .. }),
+        "a rejected conversion must not modify the pixels"
+    );
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.macro_recorder.clear();
+    assert!(session.dispatch(Command::ConvertTo32Bit).is_err());
+}
+
+#[test]
+fn session_convert_to_32bit_records_macro_and_clears_threshold() {
+    let mut doc = convert_gray16_pattern(4, 2);
+    doc.display_range = DisplayRange {
+        min: 0.0,
+        max: 65535.0,
+    };
+    doc.threshold = Some(ThresholdLevels {
+        lower: 10.0,
+        upper: 20.0,
+    });
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.macro_recorder.clear();
+
+    session.dispatch(Command::ConvertTo32Bit).unwrap();
+
+    let doc = session.active_doc().unwrap();
+    assert!(matches!(doc.plane(), PixelPlane::Gray32(_)));
+    assert_eq!(doc.threshold, None);
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"32-bit\");".to_string()]
+    );
+}
