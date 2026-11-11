@@ -13256,7 +13256,7 @@ fn session_set_measurements_is_global_and_clamps_decimal_places() {
     assert_eq!(session.results.config.precision, 9);
 }
 
-// M6a: Analyze > Plot Profile. ProfilePlot.java 53-112 (constructor),
+// M6a: Analyze > Plot Profile. ProfilePlot.java 53-112 (construct..,
 // 180-235 (getStraightLineProfile/getColumnAverageProfile) and
 // ImageProcessor.java 1116-1139 (getLine).
 fn oracle_profile(doc: &ImageDocument, roi_macro: &str) -> Vec<f64> {
@@ -15141,7 +15141,7 @@ fn session_polyline_commands_measure_record_and_profile() {
     let results_tsv = session.results.to_tsv();
     assert!(results_tsv.contains("\tLength\n"), "results: {results_tsv}");
 
-    // The freehand-line tool shares FreehandRoi construction, which
+    // The freehand-line tool shares FreehandRoi construct.., which
     // finishPolygon never records (PolygonRoi.java 594-596); only the
     // Measure commands add further records here.
     session
@@ -15242,7 +15242,7 @@ fn parity_make_binary_gray8_with_set_threshold_matches_java_oracle() {
     doc.set_rect_roi(1, 1, 4, 4).unwrap();
     assert_binary_mask_parity(
         &doc,
-        Command::MakeBinary { black_background: false },
+        Command::MakeBinary { black_background: false, stack_options: None },
         "setThreshold(100, 220); run(\"Make Binary\");",
     );
 }
@@ -15256,12 +15256,12 @@ fn parity_convert_to_mask_gray8_ignores_black_background_flag_like_java() {
     doc.threshold = Some(ThresholdLevels { lower: 10.0, upper: 130.0 });
     assert_binary_mask_parity(
         &doc,
-        Command::ConvertToMask { black_background: false },
+        Command::ConvertToMask { black_background: false, stack_options: None },
         "setThreshold(10, 130); run(\"Convert to Mask\");",
     );
     assert_binary_mask_parity(
         &doc,
-        Command::ConvertToMask { black_background: true },
+        Command::ConvertToMask { black_background: true, stack_options: None },
         "setOption(\"BlackBackground\", true); setThreshold(10, 130); run(\"Convert to Mask\");",
     );
 }
@@ -15269,7 +15269,7 @@ fn parity_convert_to_mask_gray8_ignores_black_background_flag_like_java() {
 #[test]
 fn parity_make_binary_gray8_without_threshold_uses_isodata2_like_java_oracle() {
     let doc = bimodal_gray8();
-    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false }, "run(\"Make Binary\");");
+    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false, stack_options: None }, "run(\"Make Binary\");");
 }
 
 #[test]
@@ -15278,7 +15278,7 @@ fn parity_make_binary_gray16_with_threshold_becomes_8bit_mask_like_java_oracle()
     doc.threshold = Some(ThresholdLevels { lower: 100.0, upper: 22000.0 });
     assert_binary_mask_parity(
         &doc,
-        Command::MakeBinary { black_background: false },
+        Command::MakeBinary { black_background: false, stack_options: None },
         "setThreshold(100, 22000); run(\"Make Binary\");",
     );
 }
@@ -15286,7 +15286,7 @@ fn parity_make_binary_gray16_with_threshold_becomes_8bit_mask_like_java_oracle()
 #[test]
 fn parity_make_binary_gray16_without_threshold_scales_to_byte_thresholds_like_java_oracle() {
     let doc = bimodal_gray16();
-    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false }, "run(\"Make Binary\");");
+    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false, stack_options: None }, "run(\"Make Binary\");");
 }
 
 #[test]
@@ -15295,7 +15295,7 @@ fn parity_make_binary_gray32_with_threshold_becomes_8bit_mask_like_java_oracle()
     doc.threshold = Some(ThresholdLevels { lower: 0.2, upper: 0.95 });
     assert_binary_mask_parity(
         &doc,
-        Command::MakeBinary { black_background: false },
+        Command::MakeBinary { black_background: false, stack_options: None },
         "setThreshold(0.2, 0.95); run(\"Make Binary\");",
     );
 }
@@ -15303,7 +15303,7 @@ fn parity_make_binary_gray32_with_threshold_becomes_8bit_mask_like_java_oracle()
 #[test]
 fn parity_make_binary_gray32_without_threshold_matches_java_oracle() {
     let doc = bimodal_gray32();
-    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false }, "run(\"Make Binary\");");
+    assert_binary_mask_parity(&doc, Command::MakeBinary { black_background: false, stack_options: None }, "run(\"Make Binary\");");
 }
 
 #[test]
@@ -15315,7 +15315,7 @@ fn session_make_binary_deletes_roi_keeps_undo_and_records_macro() {
 
     let mut session = Session::new();
     let id = session.insert_doc(doc);
-    session.dispatch(Command::MakeBinary { black_background: false }).unwrap();
+    session.dispatch(Command::MakeBinary { black_background: false, stack_options: None }).unwrap();
 
     assert!(session.is_dirty(id));
     assert_eq!(
@@ -15332,31 +15332,448 @@ fn session_make_binary_deletes_roi_keeps_undo_and_records_macro() {
     assert_eq!(session.get_image(id).unwrap().slices, before);
 }
 
-#[test]
-fn session_binary_conversion_rejects_stacks_and_rgb() {
-    let mut session = Session::new();
-    session.insert_doc(
-        ImageDocument::new_stack(
-            "stack",
-            8,
-            8,
-            vec![
-                PixelPlane::Gray8(vec![3; 64]),
-                PixelPlane::Gray8(vec![7; 64]),
-            ],
-        )
-        .unwrap(),
-    );
-    assert!(session
-        .dispatch(Command::MakeBinary { black_background: false })
-        .is_err());
+// ---- P3.3b: stack binary conversion (Thresholder.convertStack) ----
 
+/// 8x8 3-slice Gray8 stacks with distinct, bimodal content per slice (the
+/// block covers rows/columns 2..6) so that a threshold picked on one slice
+/// does not split the other slices the same way.
+fn stack_gray8_3() -> ImageDocument {
+    let mut slices = Vec::new();
+    for (bg, fg) in [(20u8, 200u8), (40, 120), (60, 230)] {
+        let mut pixels = vec![bg; 64];
+        for y in 2..6 {
+            for x in 2..6 {
+                pixels[y * 8 + x] = fg;
+            }
+        }
+        slices.push(PixelPlane::Gray8(pixels));
+    }
+    ImageDocument::new_stack("stack-binary-gray8", 8, 8, slices).unwrap()
+}
+
+/// 8x8 3-slice Gray16 stacks with distinct per-slice dynamic ranges, so the
+/// per-slice `resetMinAndMax` + `convertToByte(true)` scaling of
+/// `convertStackToBinary` (Thresholder.java 336-353) is observable.
+fn stack_gray16_3() -> ImageDocument {
+    let mut slices = Vec::new();
+    for (bg, fg) in [(100u16, 20000u16), (2000, 40000), (500, 65000)] {
+        let mut pixels = vec![bg; 64];
+        for y in 2..6 {
+            for x in 2..6 {
+                pixels[y * 8 + x] = fg;
+            }
+        }
+        slices.push(PixelPlane::Gray16(pixels));
+    }
+    ImageDocument::new_stack("stack-binary-gray16", 8, 8, slices).unwrap()
+}
+
+/// The 8-bit buffer of a converted mask plane. The oracle's per-slice path
+/// installs an *inverted* grayscale LUT when Process > Binary > Options
+/// black-background pref is false (Thresholder.java 387), which ImageJ saves
+/// as a COLOR8 TIFF, so `load_tiff` returns `Color256` planes for
+/// `background=Dark calculate` runs without the `black` keyword. The stored
+/// pixel values are the same 0/255 mask either way and the document model has
+/// no LUT state (same documented limitation as the P3.3a single-image paths),
+/// so stack parity is asserted on the 8-bit buffers.
+fn mask_plane_bytes(plane: &PixelPlane) -> Vec<u8> {
+    match plane {
+        PixelPlane::Gray8(pixels) => pixels.clone(),
+        PixelPlane::Color256 { pixels, .. } => pixels.clone(),
+        other => panic!("expected an 8-bit mask plane, got {other:?}"),
+    }
+}
+
+fn mask_plane_bytes_all(doc: &ImageDocument) -> Vec<Vec<u8>> {
+    doc.slices.iter().map(mask_plane_bytes).collect()
+}
+
+/// Runs the stack conversion through the Rust `Session` and asserts the
+/// resulting 8-bit mask planes match the oracle slice-for-slice, with the
+/// threshold cleared, the mask in 0..255 display range and the current slice
+/// preserved (Thresholder.java never moves the stack position).
+fn assert_stack_binary_parity(doc: &ImageDocument, command: Command, oracle_macro: &str) {
+    let expected = oracle_run(doc, oracle_macro);
+    let before = doc.slices.clone();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc.clone());
+    let current_slice = doc.current_slice;
+    session.dispatch(command.clone()).unwrap();
+    let applied = session.get_image(id).unwrap().clone();
+
+    assert_eq!(
+        applied.slices.len(),
+        expected.slices.len(),
+        "the stack size must not change"
+    );
+    assert_eq!(
+        mask_plane_bytes_all(&applied),
+        mask_plane_bytes_all(&expected),
+        "mask pixels must match ImageJ exactly"
+    );
+    // applyTable must actually change pixels on every converted slice.
+    assert_ne!(applied.slices, before, "the command must change pixels");
+    // The 255/255 invisible threshold set with NO_LUT_UPDATE (Thresholder.java
+    // 263, 393) is not representable; the visible state is None.
+    assert_eq!(applied.threshold, None);
+    // Fresh ByteProcessors start with the default 0..255 range.
+    assert_eq!(applied.display_range.min, 0.0);
+    assert_eq!(applied.display_range.max, 255.0);
+    assert_eq!(applied.current_slice, current_slice, "the current slice is preserved");
+}
+
+#[test]
+fn parity_make_binary_gray8_stack_fixed_threshold_matches_java_oracle() {
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 30.0, upper: 100.0 });
+    assert_stack_binary_parity(
+        &doc,
+        Command::MakeBinary {
+            black_background: true,
+            stack_options: None,
+        },
+        "setSlice(2); setThreshold(30, 100); run(\"Make Binary\", \"black\");",
+    );
+}
+
+#[test]
+fn parity_convert_to_mask_gray8_stack_fixed_threshold_from_current_slice_matches_java_oracle() {
+    // The whole-stack path takes the LUT from the *current* slice only
+    // (Thresholder.applyThreshold reads imp.getProcessor(), Thresholder.java
+    // 120-126) and applies it to every slice (StackProcessor.applyTable,
+    // Thresholder.java 240-244); the threshold chosen on slice 2 must not
+    // split the other slices the way their own histograms would.
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 30.0, upper: 100.0 });
+    assert_stack_binary_parity(
+        &doc,
+        Command::ConvertToMask {
+            black_background: true,
+            stack_options: None,
+        },
+        "setSlice(2); setThreshold(30, 100); run(\"Convert to Mask\", \"black\");",
+    );
+}
+
+#[test]
+fn parity_convert_to_mask_gray8_stack_per_slice_otsu_dark_matches_java_oracle() {
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    assert_stack_binary_parity(
+        &doc,
+        Command::ConvertToMask {
+            black_background: false,
+            stack_options: Some(ij_core::StackBinaryOptions {
+                method: "Otsu".into(),
+                background: "Dark".into(),
+                calculate: true,
+                only_current: false,
+            }),
+        },
+        "run(\"Convert to Mask\", \"method=Otsu background=Dark calculate\");",
+    );
+}
+
+#[test]
+fn parity_make_binary_gray8_stack_per_slice_isodata_default_matches_java_oracle() {
+    // method=Default background=Default runs ISODATA2 per slice
+    // (Thresholder.java 361-363); the M flip only happens for
+    // method!=Default || background!=Default.
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    assert_stack_binary_parity(
+        &doc,
+        Command::MakeBinary {
+            black_background: true,
+            stack_options: Some(ij_core::StackBinaryOptions {
+                method: "Default".into(),
+                background: "Default".into(),
+                calculate: true,
+                only_current: false,
+            }),
+        },
+        "run(\"Make Binary\", \"calculate black\");",
+    );
+}
+
+#[test]
+fn parity_make_binary_gray16_stack_fixed_threshold_matches_java_oracle() {
+    // Gray16 stacks take the applyShortOrFloatThreshold path with the
+    // threshold of the current slice applied to every slice
+    // (Thresholder.java 263-330).
+    let mut doc = stack_gray16_3();
+    doc.set_slice(2).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 500.0, upper: 12000.0 });
+    assert_stack_binary_parity(
+        &doc,
+        Command::MakeBinary {
+            black_background: true,
+            stack_options: None,
+        },
+        "setSlice(2); setThreshold(500, 12000); run(\"Make Binary\", \"black\");",
+    );
+}
+
+#[test]
+fn parity_convert_to_mask_gray16_stack_per_slice_scales_each_slice_like_java_oracle() {
+    let mut doc = stack_gray16_3();
+    doc.set_slice(2).unwrap();
+    assert_stack_binary_parity(
+        &doc,
+        Command::ConvertToMask {
+            black_background: false,
+            stack_options: Some(ij_core::StackBinaryOptions {
+                method: "Otsu".into(),
+                background: "Dark".into(),
+                calculate: true,
+                only_current: false,
+            }),
+        },
+        "run(\"Convert to Mask\", \"method=Otsu background=Dark calculate\");",
+    );
+}
+
+#[test]
+fn parity_convert_to_mask_gray8_stack_only_current_converts_one_slice() {
+    // "Only convert current image" (oneSlice) runs applyThreshold for the
+    // current slice only (Thresholder.java 135-138) and skips the LUT flip
+    // (Thresholder.java 246: convertToMask && !oneSlice), so the result stays
+    // grayscale without the black option.
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 30.0, upper: 100.0 });
+    assert_stack_binary_parity(
+        &doc,
+        Command::ConvertToMask {
+            black_background: false,
+            stack_options: Some(ij_core::StackBinaryOptions {
+                method: "Default".into(),
+                background: "Default".into(),
+                calculate: false,
+                only_current: true,
+            }),
+        },
+        "setSlice(2); setThreshold(30, 100); run(\"Convert to Mask\", \"only\");",
+    );
+}
+
+#[test]
+fn session_convert_to_mask_gray8_stack_per_slice_ignores_roi_in_thresholds_but_keeps_it() {
+    // convertStackToBinary never calls deleteRoi (unlike applyThreshold,
+    // Thresholder.java 152) and its per-slice processors have no ROI
+    // (ImageStack.getProcessor, ImageStack.java 308-336), so the thresholds
+    // are whole-image even with a selection; the selection itself survives.
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    doc.set_rect_roi(2, 2, 4, 4).unwrap();
+    let whole_image_thresholds = mask_plane_bytes_all(&{
+        let mut clean = doc.clone();
+        clean.roi = None;
+        let mut session = Session::new();
+        let id = session.insert_doc(clean);
+        session
+            .dispatch(Command::ConvertToMask {
+                black_background: false,
+                stack_options: Some(ij_core::StackBinaryOptions {
+                    method: "Otsu".into(),
+                    background: "Dark".into(),
+                    calculate: true,
+                    only_current: false,
+                }),
+            })
+            .unwrap();
+        session.get_image(id).unwrap().clone()
+    });
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc.clone());
+    session
+        .dispatch(Command::ConvertToMask {
+            black_background: false,
+            stack_options: Some(ij_core::StackBinaryOptions {
+                method: "Otsu".into(),
+                background: "Dark".into(),
+                calculate: true,
+                only_current: false,
+            }),
+        })
+        .unwrap();
+    let doc = session.get_image(id).unwrap();
+    assert!(doc.roi.is_some(), "the per-slice path keeps the selection");
+    assert_eq!(
+        mask_plane_bytes_all(doc),
+        whole_image_thresholds,
+        "a rectangle ROI must not change the per-slice thresholds"
+    );
+}
+
+#[test]
+fn session_stack_binary_conversion_resets_undo_and_preserves_selection_semantics() {
+    let mut doc = stack_gray8_3();
+    doc.set_slice(2).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 30.0, upper: 100.0 });
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session.dispatch(Command::Invert).unwrap(); // creates an undo snapshot
+    assert!(!matches!(
+        session.dispatch(Command::Undo).unwrap(),
+        CommandOutcome::NothingToUndo
+    ));
+
+    // Whole-stack fixed path: applyThreshold deletes the ROI...
+    session.dispatch(Command::Invert).unwrap(); // fresh snapshot + ROI
+    session.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 4, height: 8 }).unwrap();
+    session
+        .dispatch(Command::MakeBinary {
+            black_background: true,
+            stack_options: None,
+        })
+        .unwrap();
+    // Undo.reset() (Thresholder.java 118): stacks do not get an undo
+    // snapshot, and any previous one is dropped.
+    assert!(matches!(
+        session.dispatch(Command::Undo).unwrap(),
+        CommandOutcome::NothingToUndo
+    ));
+    // imp.deleteRoi() inside applyThreshold still saves the selection like
+    // the single-image path does (Thresholder.java 152).
+    assert!(session.previous_roi.is_some());
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(doc.current_slice, 2, "the current slice is preserved");
+}
+
+#[test]
+fn session_convert_to_mask_gray16_stack_only_current_reports_java_error() {
+    // Thresholder.java 129-132: "8-bit stack required to process a single
+    // slice." The oracle macro aborts with exactly this message.
+    let mut doc = stack_gray16_3();
+    doc.set_slice(2).unwrap();
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    let error = session
+        .dispatch(Command::ConvertToMask {
+            black_background: false,
+            stack_options: Some(ij_core::StackBinaryOptions {
+                method: "Default".into(),
+                background: "Default".into(),
+                calculate: false,
+                only_current: true,
+            }),
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("8-bit stack required to process a single slice"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn session_stack_binary_macro_recording_matches_java_smart_recording() {
+    // GenericDialog smart recording omits Default choices
+    // (Thresholder.java 124-133) and records checked boxes by their label's
+    // first word (GenericDialog.java 1261-1271: "calculate", "only", "black").
+    let build_session = |command: Command| {
+        let mut session = Session::new();
+        let mut doc = stack_gray8_3();
+        doc.set_slice(2).unwrap();
+        doc.threshold = Some(ThresholdLevels { lower: 30.0, upper: 100.0 });
+        session.insert_doc(doc);
+        session.dispatch(command).unwrap();
+        session.macro_recorder.last().unwrap().clone()
+    };
+    let options = |method: &str, background: &str, calculate: bool, only_current: bool| {
+        Some(ij_core::StackBinaryOptions {
+            method: method.into(),
+            background: background.into(),
+            calculate,
+            only_current,
+        })
+    };
+
+    // Defaults are omitted; an unchecked black background is not recorded.
+    assert_eq!(
+        build_session(Command::ConvertToMask {
+            black_background: true,
+            stack_options: options("Default", "Default", false, false),
+        }),
+        "run(\"Convert to Mask\", \"black\");"
+    );
+    // Without any stack options the command records option-less, like the
+    // `run("Make Binary");` macro that reaches the whole-stack path.
+    assert_eq!(
+        build_session(Command::MakeBinary {
+            black_background: false,
+            stack_options: None,
+        }),
+        "run(\"Make Binary\");"
+    );
+    assert_eq!(
+        build_session(Command::ConvertToMask {
+            black_background: false,
+            stack_options: options("Otsu", "Dark", true, false),
+        }),
+        "run(\"Convert to Mask\", \"method=Otsu background=Dark calculate\");"
+    );
+    assert_eq!(
+        build_session(Command::MakeBinary {
+            black_background: true,
+            stack_options: options("Default", "Default", true, false),
+        }),
+        "run(\"Make Binary\", \"calculate black\");"
+    );
+    assert_eq!(
+        build_session(Command::ConvertToMask {
+            black_background: true,
+            stack_options: options("Otsu", "Dark", true, true),
+        }),
+        "run(\"Convert to Mask\", \"method=Otsu background=Dark calculate only black\");"
+    );
+}
+
+#[test]
+fn session_binary_conversion_rejects_rgb_images_and_stacks() {
     let mut session = Session::new();
     session.insert_doc(
         ImageDocument::new("rgb", 4, 4, PixelPlane::ColorRgb(vec![0; 16])).unwrap(),
     );
     assert!(session
-        .dispatch(Command::ConvertToMask { black_background: false })
+        .dispatch(Command::ConvertToMask { black_background: false, stack_options: None })
+        .is_err());
+
+    let mut session = Session::new();
+    session.insert_doc(
+        ImageDocument::new_stack(
+            "rgb stack",
+            4,
+            4,
+            vec![PixelPlane::ColorRgb(vec![0; 16]); 3],
+        )
+        .unwrap(),
+    );
+    assert!(session
+        .dispatch(Command::ConvertToMask { black_background: false, stack_options: None })
+        .is_err());
+
+    let mut session = Session::new();
+    session.insert_doc(
+        ImageDocument::new_stack(
+            "indexed stack",
+            4,
+            4,
+            vec![
+                PixelPlane::Color256 { pixels: vec![0; 16], lut: Box::new(Lut256::default()) },
+                PixelPlane::Color256 { pixels: vec![0; 16], lut: Box::new(Lut256::default()) },
+            ],
+        )
+        .unwrap(),
+    );
+    assert!(session
+        .dispatch(Command::ConvertToMask { black_background: false, stack_options: None })
         .is_err());
 }
 

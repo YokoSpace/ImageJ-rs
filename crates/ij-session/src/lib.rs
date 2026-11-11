@@ -7,7 +7,7 @@ pub use ij_bridge::plugin::{
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
     MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
-    AngleRoi, PointRoi, Roi, ThresholdLevels, ParticleAnalysisOptions,
+    AngleRoi, ParticleAnalysisOptions, PointRoi, Roi, StackBinaryOptions, ThresholdLevels,
 };
 use ij_io::{ImageFileFormat, IoError, detect_image_format, load_image, save_jpeg, save_png, save_tiff};
 use ij_plugin_api::{PluginContext, RustImagePlugin};
@@ -253,16 +253,28 @@ pub enum Command {
     /// `run("Make Binary");`. Undo.setup runs first (Thresholder.java 39)
     /// and deleteRoi removes the selection.
     MakeBinary {
-        /// ImageJ's `Prefs.blackBackground`; on this single-image path it
-        /// only inverts the display LUT and never changes pixel values.
+        /// ImageJ's `Prefs.blackBackground`; only inverts the display LUT
+        /// and never changes pixel values.
         black_background: bool,
+        /// Thresholder's "Convert Stack to Binary" dialog options, used only
+        /// by multi-slice images ("Convert Stack to Binary",
+        /// Thresholder.java 54-147). `None` matches an option-less
+        /// `run("Make Binary")` macro: checkbox defaults false, which forces
+        /// the whole-stack fixed path (Thresholder.java 66). Ignored for
+        /// single-slice images.
+        stack_options: Option<ij_core::StackBinaryOptions>,
     },
     /// The `Process > Binary > Convert to Mask` command
     /// (`Thresholder("mask")`) and the Threshold palette's `Apply` button
-    /// (ThresholdAdjuster.runThresholdCommand). Same single-image conversion
-    /// as [`Command::MakeBinary`]; records `run("Convert to Mask");`.
+    /// (ThresholdAdjuster.runThresholdCommand). Same conversion as
+    /// [`Command::MakeBinary`] (the stack dialog included); records
+    /// `run("Convert to Mask");`.
     ConvertToMask {
+        /// ImageJ's `Prefs.blackBackground`; only inverts the display LUT
+        /// and never changes pixel values.
         black_background: bool,
+        /// Stack-dialog options; see [`Command::MakeBinary`].
+        stack_options: Option<ij_core::StackBinaryOptions>,
     },
     /// `run("16-bit")` (Converter.java 38-39). Converts every slice to 16-bit
     /// grayscale with scaling enabled and records `run("16-bit");`.
@@ -427,6 +439,37 @@ fn macro_option_value(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+/// The options string GenericDialog's smart recording emits for
+/// Thresholder's "Convert Stack to Binary" dialog, read in dialog order
+/// (Thresholder.java 124-133): the Method and Background choices with smart
+/// suppression of their "Default" values (GenericDialog.java 1420-1437) and
+/// the checked checkboxes by their label's first word, lowercased
+/// (GenericDialog.java 1261-1271: "Calculate threshold for each image" →
+/// "calculate", "Only convert current image" → "only",
+/// "Black background (of binary masks)" → "black").
+fn stack_binary_macro_options(
+    stack: &StackBinaryOptions,
+    black_background: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if stack.method != "Default" {
+        parts.push(format!("method={}", stack.method));
+    }
+    if stack.background != "Default" {
+        parts.push(format!("background={}", stack.background));
+    }
+    if stack.calculate {
+        parts.push("calculate".to_string());
+    }
+    if stack.only_current {
+        parts.push("only".to_string());
+    }
+    if black_background {
+        parts.push("black".to_string());
+    }
+    parts.join(" ")
 }
 
 /// Numeric dialog text as Recorder records it: GenericDialog.trim removes a
@@ -1638,11 +1681,11 @@ impl Session {
                 ));
                 Ok(CommandOutcome::Thresholded(levels))
             }
-            Command::MakeBinary { black_background } => {
-                self.run_binary_conversion(black_background, "Make Binary")
+            Command::MakeBinary { black_background, stack_options } => {
+                self.run_binary_conversion(black_background, stack_options, "Make Binary")
             }
-            Command::ConvertToMask { black_background } => {
-                self.run_binary_conversion(black_background, "Convert to Mask")
+            Command::ConvertToMask { black_background, stack_options } => {
+                self.run_binary_conversion(black_background, stack_options, "Convert to Mask")
             }
             Command::AutoThreshold {
                 method,
@@ -2164,18 +2207,52 @@ impl Session {
     }
 
     /// Shared body of `Make Binary` / `Convert to Mask` /
-    /// ThresholdAdjuster-Apply: the plugin always runs
-    /// `Undo.setup(Undo.TRANSFORM, imp)` and then `imp.deleteRoi()` before
-    /// applying (Thresholder.java 38-39, 152). deleteRoi's saveRoi() keeps
-    /// the deleted selection restorable, mirroring `Command::ClearRoi`.
+    /// ThresholdAdjuster-Apply: the plugin dispatches by stack size —
+    /// one slice runs `applyThreshold` (with `Undo.setup`,
+    /// Thresholder.java 38-40) while a stack runs `convertStack` with the
+    /// "Convert Stack to Binary" dialog options (Thresholder.java 54-147).
+    ///
+    /// deleteRoi's saveRoi() keeps the deleted selection restorable
+    /// (Thresholder.java 152), mirroring `Command::ClearRoi`; only the
+    /// whole-stack/only-current paths delete it (the `calculate` per-slice
+    /// path keeps the selection). Stack conversions call `Undo.reset()`
+    /// (Thresholder.java 118), so they drop the undo snapshot instead of
+    /// taking one.
     fn run_binary_conversion(
         &mut self,
         black_background: bool,
+        stack_options: Option<StackBinaryOptions>,
         macro_command: &str,
     ) -> Result<CommandOutcome, SessionError> {
-        // deleteRoi runs before the pixel conversion and its saveRoi() keeps
-        // the deleted selection restorable (ImagePlus.deleteRoi), exactly
-        // like `Command::ClearRoi`.
+        if self.active_doc()?.stack_size() > 1 {
+            let options = stack_options.clone().unwrap_or_default();
+            let per_slice_path = options.calculate;
+            if !per_slice_path {
+                // applyThreshold deletes the ROI (Thresholder.java 152);
+                // convertStackToBinary keeps it (Thresholder.java 333-410).
+                self.save_roi();
+            }
+            self.active_doc_mut()?.convert_stack_to_binary(&options)?;
+            self.mark_active_dirty();
+            // GenericDialog smart recording: Default choices are omitted
+            // (Thresholder.java 124-133) and checked checkboxes record
+            // their label's first word (GenericDialog.java 1261-1271).
+            let recorded = match stack_options {
+                Some(options) => stack_binary_macro_options(&options, black_background),
+                None => String::new(),
+            };
+            if recorded.is_empty() {
+                self.macro_recorder
+                    .push(format!("run(\"{macro_command}\");"));
+            } else {
+                self.macro_recorder
+                    .push(format!("run(\"{macro_command}\", \"{recorded}\");"));
+            }
+            return Ok(CommandOutcome::Updated);
+        }
+        // Single-image path: the options are not representable in Java's
+        // flow (applyThreshold runs without the dialog), so they are
+        // ignored; undo snapshot + deleteRoi (Thresholder.java 39, 152).
         self.save_roi();
         self.active_doc_mut()?.apply_threshold(black_background)?;
         self.mark_active_dirty();

@@ -8,6 +8,7 @@ pub mod particles;
 pub mod threshold_palette;
 pub mod wand;
 
+pub use binary::StackBinaryOptions;
 pub use contrast::{
     adjust_brightness, adjust_contrast, adjust_max, adjust_min, auto_contrast_range,
     default_contrast_range, reset, set_min_and_max,
@@ -84,6 +85,8 @@ pub enum CoreError {
     StackIndexOutOfRange { index: i32, stack_size: usize },
     #[error("auto-threshold method \"{0}\" is not implemented (supported: IsoData, Otsu)")]
     UnsupportedThresholdMethod(String),
+    #[error("8-bit stack required to process a single slice (Thresholder.java 129-131)")]
+    Gray8StackRequiredForOnlyCurrentSlice,
     #[error("auto-threshold is not implemented for {pixel_type} images")]
     UnsupportedThreshold { pixel_type: &'static str },
     #[error("auto-threshold on a {stack_size}-slice stack is not implemented yet")]

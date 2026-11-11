@@ -6,8 +6,45 @@
 //!
 //! Everything here is pure pixel work: no I/O, no UI, no JVM.
 
-use crate::filters::{FilterRegion, blur_one_direction};
-use crate::{CoreError, ImageDocument, PixelPlane, ThresholdLevels};
+use crate::filters::{FilterRegion, auto_threshold_histogram_16bit, blur_one_direction, gray16_min_max};
+use crate::{AutoThresholdMethod, CoreError, ImageDocument, PixelPlane, ThresholdLevels};
+
+/// Thresholder's "Convert Stack to Binary" dialog options
+/// (original_imagej/ij/plugin/Thresholder.java 82-90). The GUI dialog is
+/// exchanged for this struct like the P3.11 GenericDialog swap; the value
+/// names mirror the smart-recorded macro string
+/// `method=<Method> background=<Background> calculate only black`, where the
+/// "Default" choices are suppressed by GenericDialog.setSmartRecording.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StackBinaryOptions {
+    /// "Method:" choice; `"Default"` on this port, or one of the
+    /// `AutoThresholder` methods implemented so far ("IsoData", "Otsu").
+    pub method: String,
+    /// "Background:" choice: "Default", "Dark" or "Light". Any value other
+    /// than "Light" is a dark background, like
+    /// `!background.equals("Light")` (Thresholder.java 364).
+    pub background: String,
+    /// "Calculate threshold for each image" checkbox (Thresholder's
+    /// `useLocal`). A bare option-less `run("Make Binary")` macro never
+    /// passes it, which forces the whole-stack path (Thresholder.java 66).
+    pub calculate: bool,
+    /// "Only convert current image" checkbox (Thresholder's `oneSlice`).
+    pub only_current: bool,
+}
+
+/// The dialog defaults for a fresh `Thresholder` instance: the first entries
+/// of `AutoThresholder.getMethods()` and `backgrounds` with the static
+/// checkbox defaults (Thresholder.java 28-33, staticUseLocal defaults true).
+impl Default for StackBinaryOptions {
+    fn default() -> Self {
+        Self {
+            method: "Default".to_string(),
+            background: "Default".to_string(),
+            calculate: false,
+            only_current: false,
+        }
+    }
+}
 
 impl ImageDocument {
     /// Port of the single-image `Thresholder.applyThreshold(imp, false)` path
@@ -76,6 +113,297 @@ impl ImageDocument {
         }
         Ok(())
     }
+
+    /// Port of the stack branches of `Thresholder.run` and
+    /// `Thresholder.convertStack` (original_imagej/ij/plugin/Thresholder.java
+    /// 39-147), behind `Make Binary` / `Convert to Mask` on multi-slice
+    /// images ("Convert Stack to Binary").
+    ///
+    /// Only macro semantics are modelled: `run("Convert to Mask", "options")`
+    /// styled strings, mirroring what GenericDialog's smart recorder emits.
+    /// `options.method`/`background` of "Default" mirror the suppressed
+    /// default choices; a `None`-options command (or `calculate == false`)
+    /// runs the whole-stack fixed path, like an option-less macro whose
+    /// checkbox defaults are all false (Thresholder.java 66).
+    ///
+    /// Undo behaviour differs from the single-image path: convertStack calls
+    /// `Undo.reset()` instead of `Undo.setup` (Thresholder.java 118), so no
+    /// snapshot is taken and an existing one is dropped. The per-slice path
+    /// (`calculate`) keeps the ROI and computes whole-image histograms,
+    /// because the processors fetched via `ImageStack.getProcessor` never
+    /// carry the selection (ImageStack.java 308-336); the whole-stack and
+    /// only-current paths delete it first (`Thresholder.applyThreshold`,
+    /// Thresholder.java 152).
+    ///
+    /// Known limits, mirroring the engine's dialog: the remaining
+    /// AutoThresholder methods, "List thresholds" and "Create new stack"
+    /// (Thresholder.java 257-370) are unsupported, and the only-current
+    /// option is rejected for stacks that are not 8-bit
+    /// (Thresholder.java 129-131).
+    pub fn convert_stack_to_binary(
+        &mut self,
+        options: &StackBinaryOptions,
+    ) -> Result<(), CoreError> {
+        // AutoThreshover method validation happens inside setAutoThreshold
+        // in Java; validating first avoids dropping the undo state for an
+        // option error.
+        let method = if options.method == "Default" {
+            None
+        } else {
+            Some(AutoThresholdMethod::parse(&options.method)?)
+        };
+        let dark_background = options.background != "Light";
+        let one_slice = options.only_current;
+        let mut use_local = options.calculate;
+        if one_slice {
+            // "Only convert current image" forces the single-slice fixed path
+            // and requires an 8-bit stack (Thresholder.java 127-131).
+            use_local = false;
+            let current = self.current_slice_index_for_binary();
+            if !matches!(self.slices[current], PixelPlane::Gray8(_)) {
+                return Err(CoreError::Gray8StackRequiredForOnlyCurrentSlice);
+            }
+        }
+        // Undo.reset() (Thresholder.java 118).
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
+
+        if use_local {
+            self.convert_stack_to_binary_slice_local(method, dark_background)
+        } else {
+            self.apply_threshold_stack_fixed(one_slice)
+        }
+    }
+
+    /// Mirror of `ImageDocument::current_slice_index` in lib.rs, which is
+    /// private to the core module.
+    fn current_slice_index_for_binary(&self) -> usize {
+        let size = self.slices.len() as u32;
+        (self.current_slice.clamp(1, size) - 1) as usize
+    }
+
+    /// Port of `Thresholder.applyThreshold(imp, oneSlice)` reached from
+    /// `convertStack` (Thresholder.java 151-276): the ROI is deleted, the LUT
+    /// (or 16-bit threshold bounds) comes from the current slice's fixed
+    /// threshold or its ISODATA2 auto threshold, and one LUT table is applied
+    /// to all slices (or only the current slice).
+    fn apply_threshold_stack_fixed(&mut self, one_slice: bool) -> Result<(), CoreError> {
+        // imp.deleteRoi() (Thresholder.java 152).
+        self.roi = None;
+        let size = self.slices.len();
+        let current = self.current_slice_index_for_binary();
+        let indices: Vec<usize> = if one_slice {
+            vec![current]
+        } else {
+            (0..size).collect()
+        };
+        let converted = !matches!(self.slices[current], PixelPlane::Gray8(_));
+        let display_range = self.display_range;
+        // int type = imp.getType() (Thresholder.java 155).
+        match &self.slices[current] {
+            PixelPlane::Gray16(pixels) => {
+                let (t1, t2) = match self.threshold {
+                    Some(levels) => (levels.lower as f32, levels.upper as f32),
+                    None => {
+                        let (t1, t2) = short_float_thresholds(pixels, None, display_range);
+                        (t1, t2)
+                    }
+                };
+                let converted_planes = {
+                    let converted: Vec<PixelPlane> = indices
+                        .iter()
+                        .filter_map(|&index| match &self.slices[index] {
+                            PixelPlane::Gray16(pixels) => {
+                                Some(gray16_mask_with(pixels, t1, t2))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    converted
+                };
+                for (position, plane) in converted_planes.into_iter().enumerate() {
+                    self.slices[indices[position]] = plane;
+                }
+            }
+            PixelPlane::Gray32(pixels) => {
+                let (t1, t2) = match self.threshold {
+                    Some(levels) => (levels.lower as f32, levels.upper as f32),
+                    None => {
+                        let (t1, t2) = float_thresholds(pixels, None, display_range);
+                        (t1, t2)
+                    }
+                };
+                let converted: Vec<PixelPlane> = indices
+                    .iter()
+                    .filter_map(|&index| match &self.slices[index] {
+                        PixelPlane::Gray32(pixels) => {
+                            Some(gray32_mask_with(pixels, t1, t2))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                for (position, plane) in converted.into_iter().enumerate() {
+                    self.slices[indices[position]] = plane;
+                }
+            }
+            PixelPlane::Gray8(_) => {
+                // The threshold bounds (Thresholder.java 274-278): the saved
+                // level pair, or the ISODATA2 auto threshold of the current
+                // slice's histogram.
+                let (lower, upper) = match self.threshold {
+                    Some(levels) => (levels.lower, levels.upper),
+                    None => {
+                        let histogram =
+                            byte_histogram_256(self.gray8_pixels_at(current).iter().copied());
+                        isodata2_threshold(&histogram)
+                    }
+                };
+                let converted: Vec<Vec<u8>> = indices
+                    .iter()
+                    .map(|&index| match &self.slices[index] {
+                        PixelPlane::Gray8(pixels) => pixels
+                            .iter()
+                            .map(|&p| in_threshold_f64(f64::from(p), lower, upper))
+                            .collect(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
+                for (position, mask) in converted.into_iter().enumerate() {
+                    self.slices[indices[position]] = PixelPlane::Gray8(mask);
+                }
+            }
+            PixelPlane::Color256 { .. } => {
+                return Err(CoreError::UnsupportedThreshold {
+                    pixel_type: "8-bit color (indexed)",
+                });
+            }
+            PixelPlane::ColorRgb(_) => {
+                return Err(CoreError::UnsupportedThreshold { pixel_type: "RGB" });
+            }
+        }
+        // ip.resetThreshold() plus the invisible 255-255 NO_LUT_UPDATE
+        // threshold (Thresholder.java 263, 266 and 393), which this model
+        // stores as None.
+        self.threshold = None;
+        if converted && !one_slice {
+            self.display_range = crate::DisplayRange { min: 0.0, max: 255.0 };
+        }
+        Ok(())
+    }
+
+    fn gray8_pixels_at(&self, index: usize) -> Vec<u8> {
+        match &self.slices[index] {
+            PixelPlane::Gray8(pixels) => pixels.clone(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Port of `Thresholder.convertStackToBinary` (Thresholder.java 333-410):
+    /// per-slice auto thresholding. Non-8-bit slices are first converted to
+    /// byte with a per-slice `resetMinAndMax()` + `convertToByte(true)`.
+    fn convert_stack_to_binary_slice_local(
+        &mut self,
+        method: Option<AutoThresholdMethod>,
+        dark_background: bool,
+    ) -> Result<(), CoreError> {
+        let mut converted_any = false;
+        for index in 0..self.slices.len() {
+            let bytes = match &self.slices[index] {
+                PixelPlane::Gray8(_) => continue,
+                PixelPlane::Gray16(pixels) => {
+                    // ip.resetMinAndMax(); ip.convertToByte(true)
+                    // (Thresholder.java 346-350). ShortProcessor.findMinAndMax
+                    // scans the whole plane (ShortProcessor.java 70-87).
+                    let (min, max) = gray16_min_max(pixels);
+                    let scale =
+                        256.0 / ((max as i64 - min as i64) + 1) as f64;
+                    pixels
+                        .iter()
+                        .map(|&p| crate::short_to_byte(p, min as i32, scale))
+                        .collect::<Vec<u8>>()
+                }
+                PixelPlane::Gray32(_) => {
+                    return Err(CoreError::UnsupportedThreshold {
+                        pixel_type: "32-bit float",
+                    });
+                }
+                PixelPlane::Color256 { .. } => {
+                    return Err(CoreError::UnsupportedThreshold {
+                        pixel_type: "8-bit color (indexed)",
+                    });
+                }
+                PixelPlane::ColorRgb(_) => {
+                    return Err(CoreError::UnsupportedThreshold { pixel_type: "RGB" });
+                }
+            };
+            self.slices[index] = PixelPlane::Gray8(bytes);
+            converted_any = true;
+        }
+        for index in 0..self.slices.len() {
+            let (lower, upper) = {
+                let histogram = match &self.slices[index] {
+                    PixelPlane::Gray8(pixels) => {
+                        byte_histogram_256(pixels.iter().copied())
+                    }
+                    _ => unreachable!("converted above"),
+                };
+                match method {
+                    None => isodata2_threshold(&histogram),
+                    Some(method) => {
+                        // setAutoThreshold(Method, !background.equals("Light"),
+                        // NO_LUT_UPDATE) on a fresh ByteProcessor
+                        // (Thresholder.java 364, ImageProcessor.java 629-676):
+                        // addOne is the untouched instance field default
+                        // (false), so dark backgrounds keep the threshold
+                        // itself as the lower level.
+                        let t =
+                            auto_threshold_histogram_16bit(method, &histogram, false)? as f64;
+                        if dark_background {
+                            (t, 255.0)
+                        } else {
+                            (0.0, t)
+                        }
+                    }
+                }
+            };
+            let mask: Vec<u8> = match &self.slices[index] {
+                PixelPlane::Gray8(pixels) => pixels
+                    .iter()
+                    .map(|&p| in_threshold_f64(f64::from(p), lower, upper))
+                    .collect(),
+                _ => unreachable!("converted above"),
+            };
+            self.slices[index] = PixelPlane::Gray8(mask);
+        }
+        // stack.setColorModel + setThreshold(255, 255, NO_LUT_UPDATE)
+        // (Thresholder.java 387-393): display-only.
+        self.threshold = None;
+        if converted_any {
+            self.display_range = crate::DisplayRange { min: 0.0, max: 255.0 };
+        }
+        Ok(())
+    }
+}
+
+/// `(value>=t1 && value<=t2) ? 255 : 0` for Gray16 sources with float bounds
+/// (Thresholder.java 302-307).
+fn gray16_mask_with(pixels: &[u16], t1: f32, t2: f32) -> PixelPlane {
+    PixelPlane::Gray8(
+        pixels
+            .iter()
+            .map(|&p| in_threshold_f32(f32::from(p), t1, t2))
+            .collect(),
+    )
+}
+
+fn gray32_mask_with(pixels: &[f32], t1: f32, t2: f32) -> PixelPlane {
+    PixelPlane::Gray8(
+        pixels
+            .iter()
+            .map(|&p| in_threshold_f32(p, t1, t2))
+            .collect(),
+    )
 }
 
 /// The threshold bounds in original pixel units for each source type.

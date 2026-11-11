@@ -106,6 +106,10 @@ pub struct DialogState {
     /// Duplicator's `staticDuplicateStack`: the checkbox starts checked again
     /// on the next stack duplicate (Duplicator.java 56, 528).
     pub duplicate_stack_default: bool,
+    /// Pending egui stand-in for Thresholder's "Convert Stack to Binary"
+    /// dialog (Thresholder.java 82-90); state and rendering live in
+    /// `app/adjust_dialogs.rs`.
+    pub pending_stack_binary: Option<crate::app::PendingStackBinaryDialog>,
 }
 
 impl DialogState {
@@ -132,6 +136,7 @@ impl DialogState {
             math: None,
             math_defaults: MathDefaults::default(),
             duplicate_stack_default: false,
+            pending_stack_binary: None,
         }
     }
 }

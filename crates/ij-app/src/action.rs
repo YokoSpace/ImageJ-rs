@@ -550,13 +550,10 @@ impl ImageJApp {
                     },
                     AddToRoiManager if doc.roi.is_none() => Err("Selection required".into()),
                     // Thresholder.applyThreshold rejects RGB/indexed images;
-                    // stacks are P3.3b (Thresholder.java 152-158).
+                    // stacks run the "Convert Stack to Binary" dialog
+                    // (Thresholder.java 54-147).
                     MakeBinary | ConvertToMask => match doc.plane() {
-                        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)
-                            if doc.stack_size() == 1 => Ok(()),
-                        _ if doc.stack_size() > 1 => {
-                            Err("Binary conversion of stacks is not supported yet".into())
-                        }
+                        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => Ok(()),
                         _ => Err("Binary conversion requires a grayscale image".into()),
                     },
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),

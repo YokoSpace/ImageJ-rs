@@ -31,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod adjust_dialogs;
+pub use adjust_dialogs::PendingStackBinaryDialog;
 mod close_guard;
 mod histogram_window;
 mod image_window;
@@ -741,13 +742,32 @@ impl ImageJApp {
     /// black-background pref defaults to false (IJ_Props.txt), which the
     /// app does not model yet, so `black_background` is `false`.
     pub fn make_binary_active(&mut self) -> Result<(), SessionError> {
-        self.run_binary_command(Command::MakeBinary { black_background: false }, "Make Binary")
+        if self.session_stack_size() > 1 {
+            self.open_stack_binary_dialog("Make Binary", "Default", "Default");
+            return Ok(());
+        }
+        self.run_binary_command(Command::MakeBinary { black_background: false, stack_options: None }, "Make Binary")
     }
 
     /// `Process > Binary > Convert to Mask` (and the Threshold palette's
     /// `Apply` button, ThresholdAdjuster.runThresholdCommand).
     pub fn convert_to_mask_active(&mut self, black_background: bool) -> Result<(), SessionError> {
-        self.run_binary_command(Command::ConvertToMask { black_background }, "Convert to Mask")
+        if self.session_stack_size() > 1 {
+            // ThresholdAdjuster.runThresholdCommand sets Thresholder's
+            // statics from the adjuster (ThresholdAdjuster.java 859-868), so
+            // the dialog pre-fills the palette's method/dark background.
+            let method = self.dialogs.threshold_method.clone();
+            let background = if self.dialogs.threshold_dark_bg { "Dark" } else { "Light" };
+            self.open_stack_binary_dialog("Convert to Mask", &method, &background);
+            return Ok(());
+        }
+        self.run_binary_command(Command::ConvertToMask { black_background, stack_options: None }, "Convert to Mask")
+    }
+
+    /// Stack size of the active image, for Thresholder.run's stack-size
+    /// dispatch (Thresholder.java 41-46).
+    fn session_stack_size(&self) -> usize {
+        self.session.active_doc().map(|doc| doc.stack_size()).unwrap_or(1)
     }
 
     fn run_binary_command(

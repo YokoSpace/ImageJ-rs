@@ -215,6 +215,25 @@ impl SetMeasurementsDialog {
 const OPTION_RECT_ID: &str = "ij_set_measurements_option_rect";
 const BUTTON_RECT_ID: &str = "ij_set_measurements_button_rect";
 
+use ij_core::StackBinaryOptions;
+
+/// Pending egui stand-in for Thresholder's "Convert Stack to Binary"
+/// GenericDialog (original_imagej/ij/plugin/Thresholder.java 82-90).
+#[derive(Debug, Clone)]
+pub struct PendingStackBinaryDialog {
+    /// Image the dialog was opened for.
+    pub image: ImageId,
+    /// Menu command whose recorder name is written on OK
+    /// ("Make Binary" / "Convert to Mask").
+    pub macro_command: &'static str,
+    /// Thresholder dialog options; the GenericDialog defaults
+    /// (method/background "Default", checkboxes unchecked).
+    pub options: StackBinaryOptions,
+    /// "Black background (of binary masks)" checkbox (ImageJ's
+    /// `Prefs.blackBackground`; LUT-only display state in this model).
+    pub black_background: bool,
+}
+
 impl ImageJApp {
     pub fn render_dialogs(&mut self, ctx: &egui::Context) {
         if let Some(dialog) = self.dialogs.math.as_ref() {
@@ -403,6 +422,9 @@ impl ImageJApp {
                 let _ = self.resolve_stack_process(choice);
             }
         }
+
+        // "Convert Stack to Binary" dialog, Thresholder.java 82-90.
+        self.render_stack_binary_dialog(ctx);
 
         // Modal "Save changes?" guard dialog for pending close routes
         if let Some(pending) = &self.pending_close {
@@ -2433,6 +2455,135 @@ impl ImageJApp {
             if let Err(error) = self.apply_particle_dialog() {
                 self.dialogs.last_error = Some(error.to_string());
             }
+        }
+    }
+
+    /// Opens the egui stand-in for Thresholder's "Convert Stack to Binary"
+    /// GenericDialog (Thresholder.java 82-90). `method`/`background` follow
+    /// ThresholdAdjuster.runThresholdCommand's `Thresholder.setMethod` /
+    /// `setBackground` statics; the black-background checkbox starts from
+    /// the app's Process > Binary > Options pref shadow (`false`, the
+    /// IJ_Props.txt default, because this model has no LUT state).
+    pub fn open_stack_binary_dialog(
+        &mut self,
+        macro_command: &'static str,
+        method: &str,
+        background: &str,
+    ) {
+        let Some(image) = self.active_image_id() else { return };
+        let options = StackBinaryOptions {
+            method: method.to_string(),
+            background: background.to_string(),
+            calculate: true,
+            only_current: false,
+        };
+        self.dialogs.pending_stack_binary = Some(PendingStackBinaryDialog {
+            image,
+            macro_command,
+            options,
+            black_background: false,
+        });
+        self.status_message = "Convert Stack to Binary...".to_string();
+    }
+
+    /// OK/Cancel answer of the pending "Convert Stack to Binary" dialog;
+    /// OK dispatches the recorded command for the dialog's image.
+    pub fn resolve_stack_binary_dialog(&mut self, apply: bool) {
+        let Some(pending) = self.dialogs.pending_stack_binary.take() else {
+            return;
+        };
+        if !apply || self.active_image_id() != Some(pending.image) {
+            self.status_message = "Convert Stack to Binary canceled".to_string();
+            return;
+        }
+        let command = if pending.macro_command == "Make Binary" {
+            Command::MakeBinary {
+                black_background: pending.black_background,
+                stack_options: Some(pending.options),
+            }
+        } else {
+            Command::ConvertToMask {
+                black_background: pending.black_background,
+                stack_options: Some(pending.options),
+            }
+        };
+        if let Err(e) = self.run_binary_command(command, pending.macro_command) {
+            self.dialogs.last_error = Some(e.to_string());
+        }
+    }
+
+    /// Renders the pending "Convert Stack to Binary" dialog and resolves it.
+    fn render_stack_binary_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut pending) = self.dialogs.pending_stack_binary.clone() else {
+            return;
+        };
+        let mut apply = false;
+        let mut cancel = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_stack_binary_dialog"),
+            egui::ViewportBuilder::default()
+                .with_title("Convert Stack to Binary")
+                .with_inner_size([380.0, 220.0])
+                .with_resizable(false),
+            |ctx, class| {
+                let is_embedded = matches!(class, egui::ViewportClass::Embedded);
+                if !is_embedded && ctx.input(|i| i.viewport().close_requested()) {
+                    cancel = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ComboBox::from_label("Method:")
+                        .width(140.0)
+                        .selected_text(pending.options.method.clone())
+                        .show_ui(ui, |ui| {
+                            for method in ["Default", "IsoData", "Otsu"] {
+                                ui.selectable_value(
+                                    &mut pending.options.method,
+                                    method.to_string(),
+                                    method,
+                                );
+                            }
+                        });
+                    egui::ComboBox::from_label("Background:")
+                        .width(140.0)
+                        .selected_text(pending.options.background.clone())
+                        .show_ui(ui, |ui| {
+                            for background in ["Default", "Dark", "Light"] {
+                                ui.selectable_value(
+                                    &mut pending.options.background,
+                                    background.to_string(),
+                                    background,
+                                );
+                            }
+                        });
+                    ui.checkbox(
+                        &mut pending.options.calculate,
+                        "Calculate threshold for each image",
+                    );
+                    ui.checkbox(
+                        &mut pending.options.only_current,
+                        "Only convert current image",
+                    );
+                    ui.checkbox(&mut pending.black_background, "Black background");
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("OK").clicked() {
+                            apply = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+            },
+        );
+        if apply {
+            self.dialogs.pending_stack_binary = Some(pending);
+            self.resolve_stack_binary_dialog(true);
+        } else if cancel {
+            self.dialogs.pending_stack_binary = None;
+            self.status_message = "Convert Stack to Binary canceled".to_string();
+        } else {
+            self.dialogs.pending_stack_binary = Some(pending);
         }
     }
 }
