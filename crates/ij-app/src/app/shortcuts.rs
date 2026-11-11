@@ -106,6 +106,20 @@ impl ImageJApp {
             return;
         }
 
+        // Fill: ImageJ's Edit menu assigns unmodified F (Menus.java 150).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::Fill, ctx);
+            return;
+        }
+
+        // Draw: ImageJ's Edit menu assigns unmodified D (Menus.java 151).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D)) {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::Draw, ctx);
+            return;
+        }
+
         // Measure: M or Command/Ctrl+M (without Shift)
         let measure = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::M)

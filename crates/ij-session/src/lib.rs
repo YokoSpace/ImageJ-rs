@@ -170,6 +170,26 @@ pub enum Command {
     RoiManagerSelect { index: usize },
     RoiManagerDelete { indices: Vec<usize> },
     RoiManagerMeasure { indices: Vec<usize> },
+    /// `setForegroundColor(r, g, b)` (Functions.java 4014-4027): sets the
+    /// toolbar foreground color used by Edit > Fill / Draw. Recorded as the
+    /// macro statement; pixels are unchanged.
+    SetForegroundColor {
+        color: [u8; 3],
+    },
+    /// `setBackgroundColor(r, g, b)`: sets the toolbar background color used
+    /// by Edit > Clear.
+    SetBackgroundColor {
+        color: [u8; 3],
+    },
+    /// `run("Fill")` — Filler("fill") fills the current slice's selection
+    /// interior with the foreground color (Filler.java 97-113).
+    Fill,
+    /// `run("Clear")` — Filler("clear") fills the selection interior with the
+    /// background color (Filler.java 79-95).
+    Clear,
+    /// `run("Draw")` — Filler("draw") draws the selection outline with the
+    /// foreground color (Filler.java 116-121).
+    Draw,
     SetDimensions {
         channels: u32,
         slices: u32,
@@ -567,6 +587,11 @@ pub struct Session {
     pub previous_roi: Option<Roi>,
     pub roi_manager: Vec<NamedRoi>,
     pub roi_manager_selected: Vec<usize>,
+    /// Toolbar foreground color (default black), used by Edit > Fill / Draw
+    /// (Editor.setColor / Toolbar.setForegroundColor).
+    pub foreground_color: [u8; 3],
+    /// Toolbar background color (default black), used by Edit > Clear.
+    pub background_color: [u8; 3],
 }
 
 impl Session {
@@ -1214,6 +1239,39 @@ impl Session {
                 if !entries.is_empty() {
                     self.macro_recorder.push("roiManager(\"Measure\");".into());
                 }
+                Ok(CommandOutcome::Updated)
+            }
+            Command::SetForegroundColor { color } => {
+                self.foreground_color = color;
+                self.macro_recorder
+                    .push(format!("setForegroundColor({}, {}, {});", color[0], color[1], color[2]));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::SetBackgroundColor { color } => {
+                self.background_color = color;
+                self.macro_recorder
+                    .push(format!("setBackgroundColor({}, {}, {});", color[0], color[1], color[2]));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Fill => {
+                let color = self.foreground_color;
+                self.active_doc_mut()?.fill_roi_or_plane(color)?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Fill\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Clear => {
+                let color = self.background_color;
+                self.active_doc_mut()?.clear_roi_or_plane(color)?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Clear\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Draw => {
+                let color = self.foreground_color;
+                self.active_doc_mut()?.draw_roi(color)?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Draw\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::SetDimensions {

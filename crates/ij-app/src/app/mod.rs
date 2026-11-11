@@ -638,6 +638,57 @@ impl ImageJApp {
         self.begin_stack_aware(StackOperation::Invert)
     }
 
+    pub fn filler_clear_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Clear") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::Clear) {
+            Ok(_) => {
+                self.status_message = "Clear".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Clear failed: {e}");
+                self.dialogs.last_error = Some(format!("Clear failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    pub fn fill_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Fill") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::Fill) {
+            Ok(_) => {
+                self.status_message = "Fill".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Fill failed: {e}");
+                self.dialogs.last_error = Some(format!("Fill failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    pub fn draw_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Draw") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::Draw) {
+            Ok(_) => {
+                self.status_message = "Draw".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Draw failed: {e}");
+                self.dialogs.last_error = Some(format!("Draw failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn crop_active(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("Crop") {
             return Err(err);

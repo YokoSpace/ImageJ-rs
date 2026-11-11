@@ -31,12 +31,13 @@ cargo run --release -p ij-app -- /path/to/image.tif
 - 8-bit グレースケール・インデックスカラー、16-bit グレースケール、32-bit float、RGB の画像データ。データモデルと TIFF の読み書きでは複数スライスと C/Z/T 次元にも対応。
 - 矩形、楕円、直線、多角形、フリーハンド、Wand、ポイント、角度、折れ線、フリーハンド線の選択領域。ROI Manager では選択領域の登録、選択、削除、計測ができます。
 - 表示範囲、Brightness & Contrast、ヒストグラムを伴うしきい値のライブ表示、実装済みのフィルタと計測、TIFF の読み書き、対応コマンドのマクロ記録。
+- Edit → Clear、Fill、Draw。前景色・背景色、ROI マスク、Undo に対応します。
 - Crop、Duplicate、8-bit/16-bit/32-bit/RGB の画像型変換、Set Measurements、Set Scale、Histogram、Plot Profile、14 種類の Process → Math 演算。対応するフィルタと演算はスタックにも適用できます。
 - TIFF、PNG、JPEG の読み書きと Results 表の保存。対応する可逆形式の PNG と TIFF では画素を保持し、JPEG は非可逆圧縮で保存します。
 - ハイパースタックの C/Z/T 操作、スライスのアニメーション再生、ImageJ に合わせた macOS のネイティブメニューバー（ほかの OS ではウィンドウ内メニュー）。
 - 後述する**限定的な範囲**での従来の Java プラグイン実行と、Rust 製画像プラグイン用 API。
 
-現在の主な残課題は、Edit の描画・クリップボード操作、スタック全体の二値化と二値画像の形態学演算、Image Calculator、Analyze Particles、Text と Color Picker ツールです。残る一連の操作は [Phase 3 ロードマップ](docs/roadmap_phase3_practical_workflows.md) に、以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
+現在の主な残課題は、Edit のクリップボード操作、スタック全体の二値化と二値画像の形態学演算、Image Calculator、Analyze Particles、Text と Color Picker ツールです。残る一連の操作は [Phase 3 ロードマップ](docs/roadmap_phase3_practical_workflows.md) に、以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
 
 ## 従来の ImageJ プラグイン
 

@@ -1,5 +1,6 @@
 pub mod binary;
 pub mod contrast;
+pub mod edit;
 pub mod filters;
 pub mod histogram;
 pub mod math;

@@ -15245,3 +15245,561 @@ fn session_binary_conversion_rejects_stacks_and_rgb() {
         .dispatch(Command::ConvertToMask { black_background: false })
         .is_err());
 }
+
+// ---------------------------------------------------------------------------
+// P3.2a: Edit > Clear / Fill / Draw and the foreground/background colors.
+// ---------------------------------------------------------------------------
+
+fn ramp8(u32_width: u32, height: u32) -> Vec<u8> {
+    (0..u32_width * height).map(|i| (i % 251) as u8).collect()
+}
+
+#[test]
+fn parity_8bit_ramp_clear_fill_draw_rect_roi_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new("edit8", 16, 16, PixelPlane::Gray8(ramp8(16, 16))).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(2, 3, 8, 6); setForegroundColor(5, 200, 100); run(\"Fill\"); \
+             setBackgroundColor(250, 10, 60); run(\"Clear\"); \
+             setForegroundColor(64, 128, 200); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 2,
+            y: 3,
+            width: 8,
+            height: 6,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [5, 200, 100],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [250, 10, 60],
+        })
+        .unwrap();
+    session.dispatch(Command::Clear).unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [64, 128, 200],
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+
+    // Undo.setup(Undo.FILTER, imp): the last edit (Draw) reverts to the
+    // pre-Draw snapshot.
+    let after_draw = session.active_doc().unwrap().slices.clone();
+    session.dispatch(Command::Undo).unwrap();
+    assert_ne!(session.active_doc().unwrap().slices, after_draw);
+}
+
+
+#[test]
+fn parity_8bit_clear_fill_draw_line_roi_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new("edit8ln", 16, 16, PixelPlane::Gray8(ramp8(16, 16))).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeLine(1, 2, 12, 13); setForegroundColor(11, 22, 33); run(\"Fill\"); \
+             setForegroundColor(10, 200, 200); run(\"Draw\"); \
+             setBackgroundColor(200, 100, 50); run(\"Clear\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeLineRoi {
+            x1: 1,
+            y1: 2,
+            x2: 12,
+            y2: 13,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [11, 22, 33],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [10, 200, 200],
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [200, 100, 50],
+        })
+        .unwrap();
+    session.dispatch(Command::Clear).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_16bit_clear_fill_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new(
+        "edit16",
+        16,
+        16,
+        PixelPlane::Gray16((0..256u32).map(|i| (i * 257) as u16).collect()),
+    )
+    .unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(2, 3, 8, 6); setForegroundColor(5, 200, 100); run(\"Fill\"); \
+             setMinAndMax(100, 200); setBackgroundColor(250, 10, 60); \
+             setForegroundColor(0, 0, 0); run(\"Fill\"); run(\"Clear\"); \
+             setMinAndMax(0, 65535); setForegroundColor(20, 30, 40); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 2,
+            y: 3,
+            width: 8,
+            height: 6,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [5, 200, 100],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetDisplayRange {
+            min: 100.0,
+            max: 200.0,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [250, 10, 60],
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor { color: [0, 0, 0] })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session.dispatch(Command::Clear).unwrap();
+    session
+        .dispatch(Command::SetDisplayRange {
+            min: 0.0,
+            max: 65535.0,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [20, 30, 40],
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_32bit_clear_fill_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new(
+        "edit32",
+        16,
+        16,
+        PixelPlane::Gray32((0..256u32).map(|i| (i % 251) as f32).collect()),
+    )
+    .unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(2, 3, 8, 6); setForegroundColor(5, 200, 100); run(\"Fill\"); \
+             setMinAndMax(100, 200); setBackgroundColor(250, 10, 60); \
+             run(\"Clear\"); setMinAndMax(0, 255); \
+             setForegroundColor(90, 90, 90); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 2,
+            y: 3,
+            width: 8,
+            height: 6,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [5, 200, 100],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetDisplayRange {
+            min: 100.0,
+            max: 200.0,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [250, 10, 60],
+        })
+        .unwrap();
+    session.dispatch(Command::Clear).unwrap();
+    session
+        .dispatch(Command::SetDisplayRange {
+            min: 0.0,
+            max: 255.0,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [90, 90, 90],
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_rgb_clear_fill_draw_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new(
+        "editrgb",
+        16,
+        16,
+        PixelPlane::ColorRgb(
+            (0..256u32)
+                .map(|i| 0xff00_0000 | (i << 16) | ((255 - i) << 8) | (i / 2))
+                .collect(),
+        ),
+    )
+    .unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(1, 1, 10, 10); setForegroundColor(200, 30, 60); run(\"Fill\"); \
+             setBackgroundColor(10, 250, 120); run(\"Clear\"); \
+             setForegroundColor(70, 70, 200); makeOval(10, 10, 5, 5); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 1,
+            y: 1,
+            width: 10,
+            height: 10,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [200, 30, 60],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [10, 250, 120],
+        })
+        .unwrap();
+    session.dispatch(Command::Clear).unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [70, 70, 200],
+        })
+        .unwrap();
+    session
+        .dispatch(Command::MakeOvalRoi {
+            x: 10,
+            y: 10,
+            width: 5,
+            height: 5,
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(
+        session.active_doc().unwrap().slices,
+        oracle.slices,
+        "rust and java diverge on rgb clear/fill/draw"
+    );
+}
+
+#[test]
+fn parity_8bit_color256_fill_draw_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let lut = Lut256 {
+        r: (0..=255u16).map(|i| (i * 7 & 0xff) as u8).collect(),
+        g: (0..=255u16).map(|i| 200u8.wrapping_sub(i as u8)).collect(),
+        b: (0..=255u16)
+            .map(|i| if i % 2 == 0 { 10 } else { 200 })
+            .collect(),
+    };
+    let doc = ImageDocument::new(
+        "edit256",
+        12,
+        9,
+        PixelPlane::Color256 {
+            pixels: (0..108u32).map(|i| (i % 251) as u8).collect(),
+            lut: Box::new(lut),
+        },
+    )
+    .unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(1, 2, 6, 5); setForegroundColor(90, 30, 250); run(\"Fill\"); \
+             setBackgroundColor(200, 200, 40); setForegroundColor(10, 10, 10); \
+             run(\"Clear\"); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 1,
+            y: 2,
+            width: 6,
+            height: 5,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [90, 30, 250],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [200, 200, 40],
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor { color: [10, 10, 10] })
+        .unwrap();
+    session.dispatch(Command::Clear).unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_8bit_polygon_fill_draw_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new("edit8pg", 24, 18, PixelPlane::Gray8(ramp8(24, 18))).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makePolygon(14, 3, 22, 5, 18, 15, 15, 8); setForegroundColor(90, 200, 30); \
+             run(\"Fill\"); setBackgroundColor(0, 200, 200); \
+             setForegroundColor(120, 10, 220); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakePolygonRoi {
+            points: vec![(14, 3), (22, 5), (18, 15), (15, 8)],
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [90, 200, 30],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [0, 200, 200],
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [120, 10, 220],
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_8bit_oval_fill_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new("edit8ov", 24, 18, PixelPlane::Gray8(ramp8(24, 18))).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeOval(2, 2, 9, 7); setForegroundColor(200, 40, 40); run(\"Fill\"); \
+             setBackgroundColor(0, 200, 200); run(\"Clear\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeOvalRoi {
+            x: 2,
+            y: 2,
+            width: 9,
+            height: 7,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [200, 40, 40],
+        })
+        .unwrap();
+    session.dispatch(Command::Fill).unwrap();
+    session
+        .dispatch(Command::SetBackgroundColor {
+            color: [0, 200, 200],
+        })
+        .unwrap();
+    session.dispatch(Command::Clear).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_8bit_oval_draw_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new("edit8od", 24, 18, PixelPlane::Gray8(ramp8(24, 18))).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeOval(2, 2, 9, 7); setForegroundColor(30, 60, 90); run(\"Draw\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the edited TIFF");
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeOvalRoi {
+            x: 2,
+            y: 2,
+            width: 9,
+            height: 7,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetForegroundColor {
+            color: [30, 60, 90],
+        })
+        .unwrap();
+    session.dispatch(Command::Draw).unwrap();
+
+    assert_eq!(session.active_doc().unwrap().slices, oracle.slices);
+}
+
+#[test]
+fn parity_edit_point_angle_and_polyline_outlines_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new("edit-new-rois", 12, 10, PixelPlane::Gray8(vec![0; 120]))
+        .unwrap();
+    let cases = [
+        (
+            Command::MakePointRoi {
+                points: vec![(2, 3), (8, 6)],
+            },
+            "makeSelection('point', newArray(2,8), newArray(3,6));",
+            Command::Draw,
+            "Draw",
+        ),
+        (
+            Command::MakeAngleRoi {
+                points: [(2, 2), (5, 2), (5, 6)],
+            },
+            "makeSelection('angle', newArray(2,5,5), newArray(2,2,6));",
+            Command::Clear,
+            "Clear",
+        ),
+        (
+            Command::MakePolylineRoi {
+                points: vec![(1, 1), (5, 1), (5, 5)],
+            },
+            "makeLine(1,1,5,1,5,5);",
+            Command::Fill,
+            "Fill",
+        ),
+    ];
+    for (roi_command, roi_macro, edit_command, edit_name) in cases {
+        let macro_body = format!(
+            "{roi_macro} setForegroundColor(255,255,255); setBackgroundColor(255,255,255); run('{edit_name}'); run('Select None');"
+        );
+        let expected = bridge
+            .run_macro_on_image(&source, &macro_body)
+            .unwrap()
+            .output_image
+            .unwrap();
+        let mut session = Session::new();
+        session.insert_doc(source.clone());
+        session.dispatch(roi_command).unwrap();
+        session
+            .dispatch(Command::SetForegroundColor {
+                color: [255, 255, 255],
+            })
+            .unwrap();
+        session
+            .dispatch(Command::SetBackgroundColor {
+                color: [255, 255, 255],
+            })
+            .unwrap();
+        session.dispatch(edit_command).unwrap();
+        assert_eq!(session.active_doc().unwrap().slices, expected.slices, "{edit_name}");
+    }
+}

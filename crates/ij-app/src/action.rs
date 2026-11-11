@@ -79,6 +79,15 @@ pub enum AppAction {
     NextSlice(ImageId),
     PreviousSlice(ImageId),
     ToggleAnimation(ImageId),
+    /// Edit > Clear: fills the selection with the background color
+    /// (Filler.java "clear").
+    Clear,
+    /// Edit > Fill (`F`): fills the selection with the foreground color
+    /// (Filler.java "fill").
+    Fill,
+    /// Edit > Draw (`D`): draws the selection outline with the foreground
+    /// color (Filler.java "draw").
+    Draw,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,9 +172,9 @@ const EDIT_MENU: &[MenuNode] = &[
     unsupported("Cut", Some("X")),
     unsupported("Copy", Some("C")),
     unsupported("Paste", Some("V")),
-    unsupported("Clear", None),
-    unsupported("Fill", Some("F")),
-    unsupported("Draw", Some("D")),
+    item("Clear", None, AppAction::Clear),
+    item("Fill", Some("F"), AppAction::Fill),
+    item("Draw", Some("D"), AppAction::Draw),
     SEPARATOR,
     item("Invert", Some("Shift+I"), AppAction::Invert),
     SEPARATOR,
@@ -637,6 +646,15 @@ impl ImageJApp {
             }
             Undo => {
                 let _ = self.undo_active();
+            }
+            Clear => {
+                let _ = self.filler_clear_active();
+            }
+            Fill => {
+                let _ = self.fill_active();
+            }
+            Draw => {
+                let _ = self.draw_active();
             }
             Invert => {
                 let _ = self.invert_active();

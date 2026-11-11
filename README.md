@@ -31,12 +31,13 @@ You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick t
 - 8-bit grayscale and indexed color, 16-bit grayscale, 32-bit float, and RGB image data; multi-slice stacks and C/Z/T dimensions in the data model and TIFF round trips.
 - Rectangle, oval, line, polygon, freehand, Wand, point, angle, segmented line, and freehand line selections. The ROI Manager can store, select, delete, and measure selections.
 - Display range, Brightness & Contrast, threshold controls with live histogram previews, selected filters, measurements, TIFF I/O, and macro recording for supported commands.
+- Edit → Clear, Fill, and Draw with foreground and background colors, ROI masks, and Undo.
 - Crop, Duplicate, 8-bit/16-bit/32-bit/RGB type conversion, Set Measurements, Set Scale, Histogram, Plot Profile, and 14 Process → Math operations. Supported filters and math operations can process stacks.
 - TIFF, PNG, and JPEG opening and saving, plus Results table export. PNG and TIFF preserve pixels on supported lossless round trips; JPEG uses lossy compression.
 - Hyperstack C/Z/T navigation, slice animation, and the ImageJ-style native macOS menu bar (the in-window menu is used on other platforms).
 - A Java compatibility path for a **limited subset** of classic ImageJ plug-ins and an API for Rust image plug-ins, described below.
 
-The app is still being expanded. Current gaps include Edit drawing and clipboard commands, stack-wide binary conversion and binary morphology, Image Calculator, Analyze Particles, and the Text and Color Picker tools. See the [Phase 3 roadmap](docs/roadmap_phase3_practical_workflows.md) for the remaining workflow and the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for earlier UI work.
+The app is still being expanded. Current gaps include Edit clipboard commands, stack-wide binary conversion and binary morphology, Image Calculator, Analyze Particles, and the Text and Color Picker tools. See the [Phase 3 roadmap](docs/roadmap_phase3_practical_workflows.md) for the remaining workflow and the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for earlier UI work.
 
 ## Classic ImageJ plug-ins
 
