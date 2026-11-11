@@ -192,6 +192,18 @@ impl Default for ImageJApp {
 }
 
 impl ImageJApp {
+    pub fn dispatch_native_menu_actions(&mut self, ctx: &egui::Context) {
+        for action in crate::macos_bridge::native_menu::take_actions() {
+            if self.pending_close.is_none()
+                && self.pending_stack_process.is_none()
+                && self.dialogs.last_error.is_none()
+                && !self.is_plugin_filter_running()
+            {
+                self.perform(action, ctx);
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             session: Session::new(),

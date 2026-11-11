@@ -366,8 +366,8 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 
 ## 5.5 ここまでの進捗（2026-11-11 時点）
 
-- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1–M7, S1–S2, 英語・日本語 README。
-- **残りの Phase 2 タスク**: N0–N1（macOS ネイティブメニュー）、P1（Plugins メニュー直結）。
+- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1–M7, S1–S2, N0–N1, 英語・日本語 README。
+- **残りの Phase 2 タスク**: P1（Plugins メニュー直結）。
 
 以下では、残りのタスクを `deepseek-V4.1-flash` / `Gemini flash` / `Claude Sonnet` が迷わず1タスクずつ完結できるよう、サブタスク・型シグネチャ・Java 参照行・先に書くテスト・非ゴールまで具体化しています。
 
@@ -664,6 +664,8 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
      - (d) `Cmd+Q` の未保存終了確認（`macos_termination_test.rs`）が引き続き 100% 通るか。
 - **No-Go の場合の代替実装（N1-alt）**:
   - もし `winit` のイベントループとの競合で `NSMenu` が不安定な場合は、無理に `NSMenu` を使わず、メインウィンドウの高さをメニュー展開時に動的拡張する（または子ビューポートでメニューを表示する）方式に切り替える。
+
+N0 実機スパイク（2026-11-11）: **Go**。`native_menu_spec_test::native_appkit_menu_and_unsaved_quit_smoke` は独立した eframe アプリをメインスレッドで起動し、既存 App メニューと 8 メニューの共存、Objective-C ターゲットからの操作キュー、画像追加後の有効状態・Window 項目、未保存 Quit の Cancel、100 回更新後の非重複を確認する。既存の macOS 終了テストも維持する。アクセシビリティによる見た目の比較は未実施。
 
 ### N1 ネイティブメニュー本実装（または N1-alt）🟡
 

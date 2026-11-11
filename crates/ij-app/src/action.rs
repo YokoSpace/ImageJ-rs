@@ -224,6 +224,122 @@ pub static MENU_TREE: &[MenuNode] = &[
     submenu("Help", HELP_MENU),
 ];
 
+/// OS-independent description of a native menu, derived from [`MENU_TREE`].
+/// `Command` is implicit in every shortcut because only `Cmd+` chords are
+/// promoted to OS key equivalents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeShortcut {
+    pub key: String,
+    pub shift: bool,
+}
+
+/// One entry of a native menu bar, independent of AppKit or any other OS API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeMenuSpec {
+    pub label: String,
+    pub shortcut: Option<NativeShortcut>,
+    pub action: Option<AppAction>,
+    pub enabled: bool,
+    pub checked: bool,
+    pub is_separator: bool,
+    pub children: Vec<NativeMenuSpec>,
+}
+
+/// Only explicit `Cmd+` chords in the menu table become OS key equivalents.
+/// Bare keys such as `Z`, `W`, `M` and `Shift+X` stay with `shortcuts.rs`, so
+/// typing in a text field can never fire a native menu command (N1 spec).
+fn native_shortcut(shortcut: Option<&str>) -> Option<NativeShortcut> {
+    let chord = shortcut?.strip_prefix("Cmd+")?;
+    let (key, shift) = match chord.strip_prefix("Shift+") {
+        Some(key) => (key, true),
+        None => (chord, false),
+    };
+    if key.len() == 1 && key.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(NativeShortcut {
+            key: key.to_ascii_uppercase(),
+            shift,
+        })
+    } else {
+        None
+    }
+}
+
+impl ImageJApp {
+    /// Converts the shared menu table into an OS-independent native menu tree.
+    /// `WindowList` expands in place to one selectable entry per open image.
+    pub fn build_native_menu_spec(&self) -> Vec<NativeMenuSpec> {
+        self.build_native_menu_nodes(MENU_TREE)
+    }
+
+    fn build_native_menu_nodes(&self, nodes: &[MenuNode]) -> Vec<NativeMenuSpec> {
+        let mut spec = Vec::new();
+        for node in nodes {
+            self.push_native_menu_node(&mut spec, node);
+        }
+        spec
+    }
+
+    fn push_native_menu_node(&self, out: &mut Vec<NativeMenuSpec>, node: &MenuNode) {
+        match node.kind {
+            MenuKind::Item(action) => out.push(NativeMenuSpec {
+                label: node.label.to_string(),
+                shortcut: native_shortcut(node.shortcut),
+                action: Some(action),
+                enabled: self.action_enabled(action).is_ok(),
+                checked: false,
+                is_separator: false,
+                children: Vec::new(),
+            }),
+            MenuKind::Submenu(children) => out.push(NativeMenuSpec {
+                label: node.label.to_string(),
+                shortcut: None,
+                action: None,
+                enabled: true,
+                checked: false,
+                is_separator: false,
+                children: self.build_native_menu_nodes(children),
+            }),
+            MenuKind::Separator => out.push(NativeMenuSpec {
+                label: String::new(),
+                shortcut: None,
+                action: None,
+                enabled: false,
+                checked: false,
+                is_separator: true,
+                children: Vec::new(),
+            }),
+            MenuKind::Unsupported => out.push(NativeMenuSpec {
+                label: node.label.to_string(),
+                shortcut: None,
+                action: None,
+                enabled: false,
+                checked: false,
+                is_separator: false,
+                children: Vec::new(),
+            }),
+            MenuKind::WindowList => {
+                for id in self.session.image_ids() {
+                    let title = self
+                        .session
+                        .get_image(id)
+                        .map(|doc| doc.title.clone())
+                        .unwrap_or_else(|| format!("Image {}", id.0));
+                    let action = AppAction::ActivateImage(id);
+                    out.push(NativeMenuSpec {
+                        label: title,
+                        shortcut: None,
+                        action: Some(action),
+                        enabled: self.action_enabled(action).is_ok(),
+                        checked: self.active_image_id() == Some(id),
+                        is_separator: false,
+                        children: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+}
+
 impl ImageJApp {
     pub fn action_enabled(&self, action: AppAction) -> Result<(), String> {
         use AppAction::*;

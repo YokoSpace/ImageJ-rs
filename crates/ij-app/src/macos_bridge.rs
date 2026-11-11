@@ -1,6 +1,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "macos_menu.rs"]
+pub mod native_menu;
+
 static QUIT_AUTHORIZED: AtomicBool = AtomicBool::new(false);
 static NATIVE_QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static ANY_DIRTY: AtomicBool = AtomicBool::new(false);

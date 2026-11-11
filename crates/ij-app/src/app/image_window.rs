@@ -115,6 +115,19 @@ impl ImageJApp {
 
         crate::macos_bridge::install_macos_termination_bridge(Some(ctx));
         crate::macos_bridge::set_dirty_state(self.any_dirty());
+        self.dispatch_native_menu_actions(ctx);
+        let mut native_spec = self.build_native_menu_spec();
+        if self.pending_close.is_some()
+            || self.pending_stack_process.is_some()
+            || self.dialogs.last_error.is_some()
+            || self.is_plugin_filter_running()
+        {
+            for menu in &mut native_spec {
+                menu.enabled = false;
+            }
+        }
+        let native_menu_active =
+            crate::macos_bridge::native_menu::sync_menus(&native_spec, ctx);
 
         // Native OS termination requested (macOS Cmd-Q / App Menu Quit / Dock Quit)
         if crate::macos_bridge::poll_native_quit_requested() {
@@ -147,9 +160,11 @@ impl ImageJApp {
         self.handle_keyboard_shortcuts(ctx);
 
         // Main Toolbar Window
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            self.render_menu_bar(ui);
-        });
+        if !native_menu_active {
+            egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+                self.render_menu_bar(ui);
+            });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_toolbar_tools(ui);
