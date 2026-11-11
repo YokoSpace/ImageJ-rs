@@ -17,6 +17,415 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+const PRACTICAL_WORKFLOW_PROBES: &str = r#"
+function dumpWorkflowPlane(label) {
+    values="";
+    for (yy=0; yy<getHeight(); yy++)
+        for (xx=0; xx<getWidth(); xx++) values+=d2s(getPixel(xx,yy),0)+",";
+    print(label+"PIXELS="+values);
+    print(label+"SIZE="+getWidth()+","+getHeight()+","+bitDepth()+","+nSlices);
+    getVoxelSize(pw,ph,pd,unit);
+    print(label+"CAL="+pw+","+ph+","+pd+","+unit);
+}
+function dumpWorkflowRoi(label) {
+    getSelectionBounds(rx,ry,rw,rh);
+    print(label+"BOUNDS="+rx+","+ry+","+rw+","+rh);
+    members="";
+    for (yy=0; yy<getHeight(); yy++)
+        for (xx=0; xx<getWidth(); xx++) members+=d2s(selectionContains(xx,yy),0);
+    print(label+"MEMBERS="+members);
+}
+"#;
+
+fn practical_workflow_field<'a>(stdout: &'a str, prefix: &str) -> &'a str {
+    oracle_line(stdout, prefix).strip_prefix(prefix).unwrap()
+}
+
+fn assert_practical_workflow_image(doc: &ImageDocument, stdout: &str, label: &str) {
+    let size: Vec<u32> = practical_workflow_field(stdout, &format!("{label}SIZE="))
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(
+        size,
+        [doc.width, doc.height, 8, doc.slices.len() as u32],
+        "{label}"
+    );
+    let pixels: Vec<u8> = practical_workflow_field(stdout, &format!("{label}PIXELS="))
+        .trim_end_matches(',')
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    assert_eq!(
+        doc.plane(),
+        &PixelPlane::Gray8(pixels),
+        "{label} full plane"
+    );
+    let calibration: Vec<&str> = practical_workflow_field(stdout, &format!("{label}CAL="))
+        .splitn(4, ',')
+        .collect();
+    assert_eq!(calibration.len(), 4, "{label} calibration");
+    assert_eq!(
+        doc.calibration.pixel_width,
+        calibration[0].parse::<f64>().unwrap(),
+        "{label} pixel width"
+    );
+    assert_eq!(
+        doc.calibration.pixel_height,
+        calibration[1].parse::<f64>().unwrap(),
+        "{label} pixel height"
+    );
+    assert_eq!(
+        doc.calibration.pixel_depth,
+        calibration[2].parse::<f64>().unwrap(),
+        "{label} pixel depth"
+    );
+    // getVoxelSize uses Calibration.getUnits, whose pixel unit is plural.
+    let unit = if calibration[3] == "pixels" {
+        "pixel"
+    } else {
+        calibration[3]
+    };
+    assert_eq!(doc.calibration.unit, unit, "{label} unit");
+}
+
+fn assert_practical_workflow_roi(roi: &Roi, stdout: &str, label: &str) -> Vec<u8> {
+    let bounds: Vec<i32> = practical_workflow_field(stdout, &format!("{label}BOUNDS="))
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    let (x, y, width, height) = roi.bounds();
+    assert_eq!([x, y, width, height], bounds.as_slice(), "{label} bounds");
+    let mask = roi.raster_mask(40, 28).unwrap().unwrap();
+    let members: Vec<u8> = (0..28)
+        .flat_map(|y| {
+            let mask = &mask;
+            (0..40).map(move |x| u8::from(mask.contains(x, y)))
+        })
+        .collect();
+    let java: Vec<u8> = practical_workflow_field(stdout, &format!("{label}MEMBERS="))
+        .bytes()
+        .map(|value| value - b'0')
+        .collect();
+    assert_eq!(members, java, "{label} full ROI membership");
+    members
+}
+
+fn assert_practical_workflow_tsv(rust: &std::path::Path, java: &std::path::Path) {
+    let read = |path| std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
+    assert_eq!(read(rust), read(java), "Results TSV {}", rust.display());
+}
+
+#[test]
+fn parity_practical_workflow_compressed_tiff_to_particles_source_measurements_and_saved_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("source_packbits.tif");
+    let rust_png = dir.path().join("rust_mask.png");
+    let rust_tiff = dir.path().join("rust_mask.tif");
+    let java_png = dir.path().join("java_mask.png");
+    let java_tiff = dir.path().join("java_mask.tif");
+    let rust_particles = dir.path().join("rust_particles.tsv");
+    let java_particles = dir.path().join("java_particles.tsv");
+    let mut source_pixels = vec![0u8; 40 * 28];
+    for (left, top, width, height, value) in [(4, 4, 11, 11, 180), (24, 5, 11, 13, 220)] {
+        for y in top..top + height {
+            for x in left..left + width {
+                source_pixels[y * 40 + x] = value;
+            }
+        }
+    }
+    // ImageReader.java 1040-1058: -(run-1) repeats the following byte.
+    // Assemble the compressed input without using either image writer.
+    let mut packed = Vec::new();
+    for row in source_pixels.chunks(40) {
+        let mut x = 0;
+        while x < row.len() {
+            let count = row[x..]
+                .iter()
+                .take_while(|&&value| value == row[x])
+                .count();
+            packed.push((1i16 - count as i16) as i8 as u8);
+            packed.push(row[x]);
+            x += count;
+        }
+    }
+    let fixture = compressed_tiff_fixture(&CompressedTiffFixture {
+        width: 40,
+        height: 28,
+        bits: 8,
+        samples: 1,
+        compression: 32773,
+        predictor: 1,
+        rows: 28,
+        le: true,
+        strips: vec![packed],
+        description: None,
+    });
+    std::fs::write(&input, fixture).unwrap();
+
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.eval_macro(&format!(r#"
+        {PRACTICAL_WORKFLOW_PROBES}
+        open("{input}"); dumpWorkflowPlane("OPEN_");
+        run("Set Scale...", "distance=2 known=1 pixel=1 unit=um");
+        dumpWorkflowPlane("SCALED_"); source=getImageID();
+        run("Duplicate...", "title=mask");
+        run("Median...", "radius=1"); dumpWorkflowPlane("FILTER_");
+        setOption("BlackBackground",true); setThreshold(100,255);
+        run("Convert to Mask");
+        run("Options...", "iterations=1 count=1 black do=Nothing");
+        run("Erode"); run("Open"); dumpWorkflowPlane("MASK_");
+        run("Set Measurements...", "area mean redirect=None decimal=3");
+        run("Analyze Particles...", "size=0-Infinity circularity=0.00-1.00 show=Nothing display clear add");
+        print("PARTICLE_COUNT="+nResults); print("ROI_COUNT="+roiManager("count"));
+        for(i=0;i<nResults;i++) print("PARTICLE_"+i+"="+getResult("Area",i)+","+getResult("Mean",i));
+        for(i=0;i<roiManager("count");i++) {{ roiManager("Select",i); dumpWorkflowRoi("ROI_"+i+"_"); }}
+        saveAs("Results", "{java_particles}");
+        // Export pixels without the ROI Manager edit overlay or window-name property.
+        Overlay.remove; run("Select None");
+        Property.set("UniqueName", "");
+        saveAs("PNG", "{java_png}"); saveAs("Tiff", "{java_tiff}");
+        selectImage(source);
+        for(i=0;i<roiManager("count");i++) {{
+            roiManager("Select",i); dumpWorkflowRoi("RESTORED_"+i+"_");
+            run("Clear Results"); run("Measure");
+            print("SOURCE_"+i+"="+getResult("Area",nResults-1)+","+getResult("Mean",nResults-1));
+            saveAs("Results", "{directory}/java_source_"+i+".tsv");
+        }}
+        run("Select None"); dumpWorkflowPlane("SOURCE_AFTER_");
+    "#,
+        input=input.display(), java_particles=java_particles.display(),
+        java_png=java_png.display(), java_tiff=java_tiff.display(), directory=dir.path().display(),
+    )).unwrap();
+
+    let mut session = Session::new();
+    session
+        .dispatch(Command::OpenImage { path: input })
+        .unwrap();
+    let source_id = session.active_image_id().unwrap();
+    assert_eq!(
+        session.active_doc().unwrap().plane(),
+        &PixelPlane::Gray8(source_pixels.clone())
+    );
+    assert_practical_workflow_image(session.active_doc().unwrap(), &java.stdout, "OPEN_");
+    session
+        .dispatch(Command::SetScale {
+            distance: 2.0,
+            known: 1.0,
+            aspect: 1.0,
+            unit: "um".into(),
+        })
+        .unwrap();
+    assert_practical_workflow_image(session.active_doc().unwrap(), &java.stdout, "SCALED_");
+    session
+        .dispatch(Command::Duplicate {
+            title: Some("mask".into()),
+            duplicate_stack: false,
+            first_slice: None,
+            last_slice: None,
+        })
+        .unwrap();
+    let mask_id = session.active_image_id().unwrap();
+    assert_ne!(mask_id, source_id);
+    session.dispatch(Command::Median { radius: 1.0 }).unwrap();
+    assert_practical_workflow_image(session.active_doc().unwrap(), &java.stdout, "FILTER_");
+    session
+        .dispatch(Command::SetThreshold {
+            lower: 100.0,
+            upper: 255.0,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::ConvertToMask {
+            black_background: true,
+            stack_options: None,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::BinaryErode {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack: false,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::BinaryOpen {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack: false,
+        })
+        .unwrap();
+    assert_practical_workflow_image(session.active_doc().unwrap(), &java.stdout, "MASK_");
+    let PixelPlane::Gray8(mask_pixels) = session.active_doc().unwrap().plane() else {
+        unreachable!()
+    };
+    assert!(mask_pixels.iter().all(|&value| value == 0 || value == 255));
+    assert_eq!(
+        mask_pixels.iter().filter(|&&value| value == 255).count(),
+        172
+    );
+    let expected_mask = session.active_doc().unwrap().slices.clone();
+
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: MeasurementFlags::AREA | MeasurementFlags::MEAN,
+            precision: 3,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::AnalyzeParticles {
+            options: ParticleAnalysisOptions {
+                black_background: true,
+                ..Default::default()
+            },
+            clear_results: true,
+            add_to_manager: true,
+            summarize: false,
+        })
+        .unwrap();
+    assert_eq!(
+        practical_workflow_field(&java.stdout, "PARTICLE_COUNT="),
+        "2"
+    );
+    assert_eq!(practical_workflow_field(&java.stdout, "ROI_COUNT="), "2");
+    assert_eq!(session.results.rows.len(), 2);
+    assert_eq!(session.roi_manager.len(), 2);
+    let mut union = vec![0u8; 40 * 28];
+    for (index, ((entry, row), expected_bounds)) in session
+        .roi_manager
+        .iter()
+        .zip(&session.results.rows)
+        .zip([(5, 5, 9, 9), (25, 6, 9, 11)])
+        .enumerate()
+    {
+        assert_eq!(entry.source_image, mask_id);
+        assert_eq!(entry.roi.bounds(), expected_bounds);
+        let members =
+            assert_practical_workflow_roi(&entry.roi, &java.stdout, &format!("ROI_{index}_"));
+        assert_eq!(
+            members
+                .iter()
+                .map(|&value| usize::from(value))
+                .sum::<usize>(),
+            [77, 95][index]
+        );
+        for (union, member) in union.iter_mut().zip(members) {
+            *union += member;
+        }
+        let measured: Vec<f64> =
+            practical_workflow_field(&java.stdout, &format!("PARTICLE_{index}="))
+                .split(',')
+                .map(|value| value.parse().unwrap())
+                .collect();
+        assert_eq!([row.area, row.mean], measured.as_slice());
+        assert_eq!(row.area, [19.25, 23.75][index]);
+        assert_eq!(row.mean, 255.0);
+    }
+    let PixelPlane::Gray8(mask_pixels) = session.active_doc().unwrap().plane() else {
+        unreachable!()
+    };
+    assert_eq!(
+        union,
+        mask_pixels
+            .iter()
+            .map(|&value| u8::from(value == 255))
+            .collect::<Vec<_>>()
+    );
+    session
+        .dispatch(Command::SaveResultsTsv {
+            path: rust_particles.clone(),
+        })
+        .unwrap();
+    assert_practical_workflow_tsv(&rust_particles, &java_particles);
+    session.dispatch(Command::ClearRoi).unwrap();
+    session
+        .dispatch(Command::SavePng {
+            path: rust_png.clone(),
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SaveTiff {
+            path: rust_tiff.clone(),
+        })
+        .unwrap();
+
+    session.set_active_image(source_id).unwrap();
+    for index in 0..2 {
+        session
+            .dispatch(Command::RoiManagerSelect { index })
+            .unwrap();
+        assert_practical_workflow_roi(
+            session.active_doc().unwrap().roi.as_ref().unwrap(),
+            &java.stdout,
+            &format!("RESTORED_{index}_"),
+        );
+        // Analyzer.java 283-284 resets each headless Measure table. Save the
+        // particle table first and compare each restored source measurement.
+        session.dispatch(Command::ClearResults).unwrap();
+        session.dispatch(Command::Measure).unwrap();
+        let row = &session.results.rows[0];
+        let measured: Vec<f64> =
+            practical_workflow_field(&java.stdout, &format!("SOURCE_{index}="))
+                .split(',')
+                .map(|value| value.parse().unwrap())
+                .collect();
+        assert_eq!([row.area, row.mean], measured.as_slice());
+        assert_eq!(row.area, [19.25, 23.75][index]);
+        assert_eq!(row.mean, [180.0, 220.0][index]);
+        let rust_results = dir.path().join(format!("rust_source_{index}.tsv"));
+        session
+            .dispatch(Command::SaveResultsTsv {
+                path: rust_results.clone(),
+            })
+            .unwrap();
+        assert_practical_workflow_tsv(
+            &rust_results,
+            &dir.path().join(format!("java_source_{index}.tsv")),
+        );
+    }
+    session.dispatch(Command::ClearRoi).unwrap();
+    assert_eq!(
+        session.active_doc().unwrap().plane(),
+        &PixelPlane::Gray8(source_pixels)
+    );
+    assert_practical_workflow_image(session.active_doc().unwrap(), &java.stdout, "SOURCE_AFTER_");
+    assert_eq!(session.get_image(mask_id).unwrap().slices, expected_mask);
+
+    let saved = [rust_png, java_png, rust_tiff, java_tiff];
+    let mut reopen_macro = PRACTICAL_WORKFLOW_PROBES.to_string();
+    for (index, path) in saved.iter().enumerate() {
+        reopen_macro.push_str(&format!(
+            "open(\"{}\"); dumpWorkflowPlane(\"REOPEN_{index}_\"); close();",
+            path.display()
+        ));
+    }
+    let reopened_java = bridge.eval_macro(&reopen_macro).unwrap();
+    for (index, path) in saved.into_iter().enumerate() {
+        let mut reopened = Session::new();
+        reopened
+            .dispatch(Command::OpenImage { path: path.clone() })
+            .unwrap();
+        let doc = reopened.active_doc().unwrap();
+        assert_eq!(doc.slices, expected_mask, "saved mask {}", path.display());
+        assert_practical_workflow_image(doc, &reopened_java.stdout, &format!("REOPEN_{index}_"));
+        assert_eq!(doc.calibration.pixel_depth, 1.0);
+        assert_eq!(
+            doc.calibration.pixel_width,
+            if index < 2 { 1.0 } else { 0.5 }
+        );
+        assert_eq!(
+            doc.calibration.pixel_height,
+            if index < 2 { 1.0 } else { 0.5 }
+        );
+        assert_eq!(
+            doc.calibration.unit,
+            if index < 2 { "pixel" } else { "\u{00b5}m" }
+        );
+    }
+}
+
 #[test]
 fn parity_analyze_particles_holes_edges_and_size_match_java_oracle() {
     let mut pixels = vec![0_u8; 20 * 20];
@@ -77,6 +486,129 @@ fn parity_analyze_particles_holes_edges_and_size_match_java_oracle() {
             assert_eq!([x, y, w, h], expected.as_slice());
         }
         assert_eq!(session.active_doc().unwrap().plane(), &PixelPlane::Gray8(pixels.clone()));
+    }
+}
+
+#[test]
+fn parity_analyze_particles_clips_connected_particle_to_source_roi() {
+    let mut pixels = vec![0u8; 8 * 8];
+    for y in 1..7 {
+        for x in 1..7 {
+            pixels[y * 8 + x] = 255;
+        }
+    }
+    let source = ImageDocument::new("selected-particle", 8, 8, PixelPlane::Gray8(pixels)).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (selection, command, expected_area, expected_bounds) in [
+        (
+            "makeRectangle(2,2,3,3);",
+            Command::MakeRectRoi {
+                x: 2,
+                y: 2,
+                width: 3,
+                height: 3,
+            },
+            9.0,
+            (2, 2, 3, 3),
+        ),
+        (
+            "makeOval(2,2,4,4);",
+            Command::MakeOvalRoi {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 4,
+            },
+            12.0,
+            (2, 2, 4, 4),
+        ),
+    ] {
+        let java = bridge.run_macro_on_image(&source, &format!(r#"
+        {PRACTICAL_WORKFLOW_PROBES}
+        {selection} setThreshold(255,255);
+        run("Set Measurements...", "area mean redirect=None decimal=3");
+        run("Analyze Particles...", "size=0-Infinity circularity=0.00-1.00 show=Nothing display clear add");
+        print("SELECTED_COUNT="+nResults); print("SELECTED_ROIS="+roiManager("count"));
+        print("SELECTED_AREA="+getResult("Area",0)); print("SELECTED_MEAN="+getResult("Mean",0));
+        roiManager("Select",0); dumpWorkflowRoi("SELECTED_");
+        Overlay.remove; run("Select None");
+    "#)).unwrap();
+        let mut session = Session::new();
+        session.insert_doc(source.clone());
+        session.dispatch(command).unwrap();
+        let selected_roi = session.active_doc().unwrap().roi.clone();
+        session
+            .dispatch(Command::SetThreshold {
+                lower: 255.0,
+                upper: 255.0,
+            })
+            .unwrap();
+        session
+            .dispatch(Command::SetMeasurements {
+                flags: MeasurementFlags::AREA | MeasurementFlags::MEAN,
+                precision: 3,
+            })
+            .unwrap();
+        session
+            .dispatch(Command::AnalyzeParticles {
+                options: ParticleAnalysisOptions {
+                    black_background: true,
+                    ..Default::default()
+                },
+                clear_results: true,
+                add_to_manager: true,
+                summarize: false,
+            })
+            .unwrap();
+        assert_eq!(
+            practical_workflow_field(&java.stdout, "SELECTED_COUNT="),
+            "1"
+        );
+        assert_eq!(
+            practical_workflow_field(&java.stdout, "SELECTED_ROIS="),
+            "1"
+        );
+        assert_eq!(session.results.rows.len(), 1);
+        assert_eq!(
+            session.results.rows[0].area,
+            practical_workflow_field(&java.stdout, "SELECTED_AREA=")
+                .parse::<f64>()
+                .unwrap()
+        );
+        assert_eq!(session.results.rows[0].area, expected_area, "{selection}");
+        assert_eq!(
+            session.results.rows[0].mean,
+            practical_workflow_field(&java.stdout, "SELECTED_MEAN=")
+                .parse::<f64>()
+                .unwrap()
+        );
+        assert_eq!(session.roi_manager.len(), 1);
+        let roi = &session.roi_manager[0].roi;
+        let bounds: Vec<i32> = practical_workflow_field(&java.stdout, "SELECTED_BOUNDS=")
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        let (x, y, width, height) = roi.bounds();
+        assert_eq!([x, y, width, height], bounds.as_slice());
+        assert_eq!(roi.bounds(), expected_bounds, "{selection}");
+        let mask = roi.raster_mask(8, 8).unwrap().unwrap();
+        let members: Vec<u8> = (0..8)
+            .flat_map(|y| {
+                let mask = &mask;
+                (0..8).map(move |x| u8::from(mask.contains(x, y)))
+            })
+            .collect();
+        let java_members: Vec<u8> = practical_workflow_field(&java.stdout, "SELECTED_MEMBERS=")
+            .bytes()
+            .map(|value| value - b'0')
+            .collect();
+        assert_eq!(members, java_members);
+        assert_eq!(session.active_doc().unwrap().slices, source.slices);
+        assert_eq!(
+            session.active_doc().unwrap().roi,
+            selected_roi,
+            "{selection}"
+        );
     }
 }
 
@@ -183,7 +715,7 @@ fn parity_analyze_particles_summary_matches_java_table() {
 }
 
 #[test]
-fn parity_analyze_particles_unthresholded_binary_uses_white_background_default() {
+fn parity_analyze_particles_unthresholded_binary_uses_white_background_option() {
     let mut pixels = vec![255_u8; 20 * 20];
     pixels[2 * 20 + 2] = 0;
     pixels[10 * 20 + 10] = 0;
@@ -199,11 +731,50 @@ fn parity_analyze_particles_unthresholded_binary_uses_white_background_default()
     let mut session = Session::new();
     session.insert_doc(doc);
     session.dispatch(Command::AnalyzeParticles {
-        options: ParticleAnalysisOptions::default(), clear_results: true,
+        options: ParticleAnalysisOptions { black_background: false, ..Default::default() }, clear_results: true,
         add_to_manager: false, summarize: false,
     }).unwrap();
     assert_eq!(session.results.rows.len(), count);
     assert_eq!(session.results.rows.iter().map(|row| row.mean).collect::<Vec<_>>(), means);
+}
+
+#[test]
+fn parity_gray32_set_threshold_records_float_threshold_like_java() {
+    let doc = ImageDocument::new(
+        "float-threshold",
+        2,
+        2,
+        PixelPlane::Gray32(vec![-1.5, 0.25, 3.5, 10.0]),
+    )
+    .unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge
+        .run_macro_on_image(
+            &doc,
+            "setThreshold(0.25,3.5); getThreshold(lo,hi); print(\"FLOAT_THRESHOLD=\"+lo+\",\"+hi);",
+        )
+        .unwrap();
+    let expected: Vec<f64> = oracle_line(&java.stdout, "FLOAT_THRESHOLD=")
+        .strip_prefix("FLOAT_THRESHOLD=")
+        .unwrap()
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect();
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::SetThreshold {
+            lower: 0.25,
+            upper: 3.5,
+        })
+        .unwrap();
+    let levels = session.active_doc().unwrap().threshold.unwrap();
+    assert_eq!([levels.lower, levels.upper], expected.as_slice());
+    // ThresholdAdjuster.java 800-807 and Recorder.java 268-272 use four decimals.
+    assert_eq!(
+        session.macro_recorder.last().unwrap(),
+        "setThreshold(0.2500, 3.5000);"
+    );
 }
 
 #[test]
@@ -283,6 +854,187 @@ fn parity_roi_manager_add_select_measure_and_delete() {
     assert_eq!(row.mean, value("RM_MEAN:").parse::<f64>().unwrap());
     session.dispatch(Command::RoiManagerDelete { indices: vec![0] }).unwrap();
     assert_eq!(session.roi_manager.len().to_string(), value("RM_AFTER_DELETE:"));
+}
+
+#[test]
+fn parity_roi_manager_select_restores_stored_stack_slice() {
+    let doc = distinct_stack_8bit(4, 4, 3);
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "setSlice(1); makeRectangle(0,0,1,1); roiManager(\"Add\"); \
+         setSlice(2); makeRectangle(1,1,1,1); roiManager(\"Add\"); \
+         setSlice(3); roiManager(\"Select\",0); print(\"SELECT_0=\"+getSliceNumber()); \
+         setSlice(3); roiManager(\"Select\",1); print(\"SELECT_1=\"+getSliceNumber()); \
+         run(\"Select None\");"
+    ).unwrap();
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.dispatch(Command::SetSlice { index: 2 }).unwrap();
+    session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    for index in 0..2 {
+        session.dispatch(Command::SetSlice { index: 3 }).unwrap();
+        session.dispatch(Command::RoiManagerSelect { index }).unwrap();
+        let prefix = format!("SELECT_{index}=");
+        let expected = oracle_line(&java.stdout, &prefix).strip_prefix(&prefix).unwrap();
+        assert_eq!(session.active_doc().unwrap().current_slice.to_string(), expected);
+    }
+}
+
+#[test]
+fn parity_roi_manager_renamed_stack_roi_keeps_position() {
+    let doc = distinct_stack_8bit(4, 4, 3);
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "setSlice(1); makeRectangle(0,0,1,1); roiManager(\"Add\"); \
+         roiManager(\"Select\",0); roiManager(\"Rename\",\"renamed\"); \
+         setSlice(3); roiManager(\"Select\",0); print(\"SELECT=\"+getSliceNumber()); \
+         run(\"Select None\");"
+    ).unwrap();
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.roi_manager[0].name = "renamed".into();
+    session.dispatch(Command::SetSlice { index: 3 }).unwrap();
+    session.dispatch(Command::RoiManagerSelect { index: 0 }).unwrap();
+    let expected = oracle_line(&java.stdout, "SELECT=").strip_prefix("SELECT=").unwrap();
+    assert_eq!(session.active_doc().unwrap().current_slice.to_string(), expected);
+}
+
+#[test]
+fn parity_roi_manager_particle_roi_restores_stack_slice() {
+    let mut particle = vec![0; 25];
+    particle[12] = 255;
+    let doc = ImageDocument::new_stack("particle-stack", 5, 5, vec![
+        PixelPlane::Gray8(vec![0; 25]), PixelPlane::Gray8(particle), PixelPlane::Gray8(vec![0; 25]),
+    ]).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "setSlice(2); setThreshold(255,255); setOption(\"BlackBackground\",true); \
+         run(\"Analyze Particles...\",\"size=0-Infinity circularity=0.00-1.00 show=Nothing display clear add slice\"); \
+         print(\"COUNT=\"+roiManager(\"count\")); setSlice(3); \
+         roiManager(\"Select\",0); print(\"SELECT=\"+getSliceNumber()); \
+         Overlay.remove; run(\"Select None\");"
+    ).unwrap();
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::SetSlice { index: 2 }).unwrap();
+    session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions { black_background: true, ..Default::default() },
+        clear_results: true, add_to_manager: true, summarize: false,
+    }).unwrap();
+    let expected = oracle_line(&java.stdout, "COUNT=").strip_prefix("COUNT=").unwrap();
+    assert_eq!(session.roi_manager.len().to_string(), expected);
+    session.dispatch(Command::SetSlice { index: 3 }).unwrap();
+    session.dispatch(Command::RoiManagerSelect { index: 0 }).unwrap();
+    let expected = oracle_line(&java.stdout, "SELECT=").strip_prefix("SELECT=").unwrap();
+    assert_eq!(session.active_doc().unwrap().current_slice.to_string(), expected);
+}
+
+#[test]
+fn parity_roi_manager_measure_stack_slices_and_restore_current_slice() {
+    let doc = distinct_stack_8bit(4, 4, 3);
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "run(\"Set Measurements...\",\"area mean stack decimal=3\"); \
+         setSlice(1); makeRectangle(0,0,1,1); roiManager(\"Add\"); \
+         roiManager(\"Select\",0); roiManager(\"Rename\",\"renamed\"); \
+         setSlice(2); makeRectangle(1,1,1,1); roiManager(\"Add\"); \
+         roiManager(\"Select\",0); setSlice(3); roiManager(\"Measure\"); \
+         print(\"SINGLE_AFTER=\"+getSliceNumber()); \
+         roiManager(\"Deselect\"); setSlice(3); roiManager(\"Measure\"); \
+         print(\"ALL_AFTER=\"+getSliceNumber()+\",\"+selectionType());"
+    ).unwrap();
+    let java_rows: Vec<(f64, u32)> = java.stdout.lines().filter_map(|line| {
+        let columns: Vec<&str> = line.split('\t').collect();
+        if columns.len() == 4 && columns[0] == "1" {
+            Some((columns[2].parse().unwrap(), columns[3].parse().unwrap()))
+        } else {
+            None
+        }
+    }).collect();
+    assert_eq!(java_rows.len(), 3, "{}", java.stdout);
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::SetMeasurements {
+        flags: MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::STACK_POSITION,
+        precision: 3,
+    }).unwrap();
+    session.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.roi_manager[0].name = "renamed".into();
+    session.dispatch(Command::SetSlice { index: 2 }).unwrap();
+    session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.dispatch(Command::RoiManagerSelect { index: 0 }).unwrap();
+    session.dispatch(Command::SetSlice { index: 3 }).unwrap();
+    session.dispatch(Command::RoiManagerMeasure { indices: vec![0] }).unwrap();
+    let single_after = oracle_line(&java.stdout, "SINGLE_AFTER=").strip_prefix("SINGLE_AFTER=").unwrap();
+    assert_eq!(session.active_doc().unwrap().current_slice.to_string(), single_after);
+    session.dispatch(Command::RoiManagerMeasure { indices: vec![] }).unwrap();
+    let all_after = oracle_line(&java.stdout, "ALL_AFTER=").strip_prefix("ALL_AFTER=").unwrap();
+    let doc = session.active_doc().unwrap();
+    let selection_type = if doc.roi.is_none() { -1 } else { 0 };
+    assert_eq!(format!("{},{selection_type}", doc.current_slice), all_after);
+    let rust_rows: Vec<(f64, u32)> = session.results.rows.iter()
+        .map(|row| (row.mean, row.stack_position.slice.unwrap())).collect();
+    assert_eq!(rust_rows, java_rows);
+}
+
+#[test]
+fn parity_roi_manager_single_image_roi_does_not_change_stack_slice() {
+    let doc = distinct_stack_8bit(4, 4, 3);
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "run(\"Set Measurements...\",\"area mean stack decimal=3\"); \
+         stack=getTitle(); newImage(\"single\",\"8-bit black\",4,4,1); \
+         makeRectangle(1,1,1,1); roiManager(\"Add\"); selectWindow(stack); \
+         setSlice(2); makeRectangle(0,0,1,1); roiManager(\"Add\"); \
+         setSlice(3); roiManager(\"Select\",0); print(\"SELECT=\"+getSliceNumber()); \
+         roiManager(\"Deselect\"); roiManager(\"Measure\"); \
+         print(\"AFTER=\"+getSliceNumber());"
+    ).unwrap();
+    let java_rows: Vec<(f64, u32)> = java.stdout.lines().filter_map(|line| {
+        let columns: Vec<&str> = line.split('\t').collect();
+        if columns.len() == 4 && columns[0] == "1" {
+            Some((columns[2].parse().unwrap(), columns[3].parse().unwrap()))
+        } else {
+            None
+        }
+    }).collect();
+    assert_eq!(java_rows.len(), 2, "{}", java.stdout);
+
+    let mut session = Session::new();
+    let stack = session.insert_doc(doc);
+    session.dispatch(Command::SetMeasurements {
+        flags: MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::STACK_POSITION,
+        precision: 3,
+    }).unwrap();
+    session.insert_doc(ImageDocument::new_ramp_8bit("single", 4, 4).unwrap());
+    session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.set_active_image(stack).unwrap();
+    session.dispatch(Command::SetSlice { index: 2 }).unwrap();
+    session.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.dispatch(Command::SetSlice { index: 3 }).unwrap();
+    session.dispatch(Command::RoiManagerSelect { index: 0 }).unwrap();
+    let expected = oracle_line(&java.stdout, "SELECT=").strip_prefix("SELECT=").unwrap();
+    assert_eq!(session.active_doc().unwrap().current_slice.to_string(), expected);
+    session.dispatch(Command::RoiManagerMeasure { indices: vec![] }).unwrap();
+    let expected = oracle_line(&java.stdout, "AFTER=").strip_prefix("AFTER=").unwrap();
+    assert_eq!(session.active_doc().unwrap().current_slice.to_string(), expected);
+    let rust_rows: Vec<(f64, u32)> = session.results.rows.iter()
+        .map(|row| (row.mean, row.stack_position.slice.unwrap())).collect();
+    assert_eq!(rust_rows, java_rows);
 }
 
 fn oracle_wand_points(doc: &ImageDocument, prelude: &str, x: i32, y: i32) -> Vec<(i32, i32)> {
@@ -16645,6 +17397,217 @@ fn parity_8bit_binary_stack_matches_java_oracle() {
     doc.binary_morphology_stack(ij_core::binary_morphology::BinaryMorphology::Erode, 1, 1, true)
         .unwrap();
     assert_eq!(doc.slices, oracle.slices);
+}
+
+#[test]
+fn parity_binary_morphology_stack_preserves_selected_slice() {
+    let mut doc = ImageDocument::new_stack(
+        "binary-stack-position",
+        12,
+        10,
+        (0..3)
+            .map(|_| binary_morphology_pattern().slices.remove(0))
+            .collect(),
+    )
+    .unwrap();
+    doc.set_slice(2).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge
+        .run_macro_on_image(
+            &doc,
+            "setSlice(2); run(\"Options...\", \"iterations=1 count=1 black stack do=Erode\"); \
+             Stack.getPosition(c,z,t); print(\"POSITION:\"+c+\",\"+z+\",\"+t); \
+             print(\"SLICE:\"+getSliceNumber());",
+        )
+        .unwrap();
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::BinaryErode {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack: true,
+        })
+        .unwrap();
+    let rust = session.get_image(id).unwrap();
+    assert_eq!(rust.slices, java.output_image.unwrap().slices);
+    assert_eq!(
+        oracle_line(&java.stdout, "SLICE:"),
+        format!("SLICE:{}", rust.current_slice)
+    );
+    let (c, z, t) = rust.get_position();
+    assert_eq!(
+        oracle_line(&java.stdout, "POSITION:"),
+        format!("POSITION:{c},{z},{t}")
+    );
+}
+
+#[test]
+fn parity_binary_morphology_stack_processes_nonbinary_unselected_slices() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut mixed = vec![255; 9 * 7];
+    for y in 3..7 {
+        for x in 5..9 {
+            mixed[y * 9 + x] = 0;
+        }
+    }
+    for index in [0, 10, 3 * 9 + 4, 5 * 9 + 7] {
+        mixed[index] = 128;
+    }
+    let binary: Vec<u8> = mixed
+        .iter()
+        .map(|&p| if p == 128 { 255 } else { p })
+        .collect();
+    let source = ImageDocument::new_stack(
+        "binary-stack-mixed",
+        9,
+        7,
+        vec![
+            PixelPlane::Gray8(binary.clone()),
+            PixelPlane::Gray8(mixed),
+            PixelPlane::Gray8(binary),
+        ],
+    )
+    .unwrap();
+
+    for selected in [1, 3] {
+        for black_background in [true, false] {
+            for operation in ["Erode", "Dilate", "Open", "Close"] {
+                let mut doc = source.clone();
+                doc.set_slice(selected).unwrap();
+                let (iterations, count, roi_macro) = if selected == 3 {
+                    doc.set_oval_roi(1, 1, 7, 5).unwrap();
+                    (2, 2, "makeOval(1,1,7,5); ")
+                } else {
+                    (1, 1, "")
+                };
+                doc.save_snapshot();
+                let black_option = if black_background { " black" } else { "" };
+                let java = bridge.run_macro_on_image(&doc, &format!(
+                    "setSlice({selected}); {roi_macro}run(\"Options...\", \"iterations={iterations} count={count}{black_option} stack do={operation}\");"
+                )).unwrap().output_image.unwrap();
+                let mut session = Session::new();
+                let id = session.insert_doc(doc);
+                let command = match operation {
+                    "Erode" => Command::BinaryErode {
+                        iterations,
+                        count,
+                        black_background,
+                        whole_stack: true,
+                    },
+                    "Dilate" => Command::BinaryDilate {
+                        iterations,
+                        count,
+                        black_background,
+                        whole_stack: true,
+                    },
+                    "Open" => Command::BinaryOpen {
+                        iterations,
+                        count,
+                        black_background,
+                        whole_stack: true,
+                    },
+                    "Close" => Command::BinaryClose {
+                        iterations,
+                        count,
+                        black_background,
+                        whole_stack: true,
+                    },
+                    _ => unreachable!(),
+                };
+                session.dispatch(command).unwrap();
+                assert_eq!(
+                    session.get_image(id).unwrap().slices,
+                    java.slices,
+                    "{operation}, black={black_background}, slice={selected}"
+                );
+                assert_eq!(
+                    session.dispatch(Command::Undo).unwrap(),
+                    CommandOutcome::NothingToUndo
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn binary_morphology_stack_rejects_invalid_input_without_changes() {
+    let binary = PixelPlane::Gray8(vec![255; 25]);
+    let mut nonbinary = vec![255; 25];
+    nonbinary[12] = 128;
+    let mut doc = ImageDocument::new_stack(
+        "selected-nonbinary",
+        5,
+        5,
+        vec![binary.clone(), PixelPlane::Gray8(nonbinary), binary.clone()],
+    )
+    .unwrap();
+    doc.set_slice(2).unwrap();
+    doc.save_snapshot();
+    let java_error = JavaOracleBridge::locate_from_repo_root(repo_root())
+        .unwrap()
+        .run_macro_on_image(&doc, "setSlice(2); run(\"Erode\", \"stack\");")
+        .unwrap_err();
+    assert!(java_error
+        .to_string()
+        .contains("8-bit binary (0 and 255 only) image required."));
+    let before = doc.clone();
+    assert!(doc
+        .binary_morphology_stack(
+            ij_core::binary_morphology::BinaryMorphology::Erode,
+            1,
+            1,
+            true,
+        )
+        .is_err());
+    assert_eq!(doc, before);
+
+    let mut mixed_types = ImageDocument::new_stack(
+        "mixed-types",
+        5,
+        5,
+        vec![
+            binary.clone(),
+            PixelPlane::Gray16(vec![0; 25]),
+            binary.clone(),
+        ],
+    )
+    .unwrap();
+    mixed_types.set_slice(3).unwrap();
+    mixed_types.save_snapshot();
+    let before = mixed_types.clone();
+    assert!(mixed_types
+        .binary_morphology_stack(
+            ij_core::binary_morphology::BinaryMorphology::Erode,
+            1,
+            1,
+            true,
+        )
+        .is_err());
+    assert_eq!(mixed_types, before);
+
+    for (iterations, count) in [(0, 1), (101, 1), (1, 0), (1, 9)] {
+        let mut invalid = ImageDocument::new_stack(
+            "invalid-parameters",
+            5,
+            5,
+            vec![binary.clone(), binary.clone()],
+        )
+        .unwrap();
+        invalid.set_slice(2).unwrap();
+        invalid.save_snapshot();
+        let before = invalid.clone();
+        assert!(invalid
+            .binary_morphology_stack(
+                ij_core::binary_morphology::BinaryMorphology::Erode,
+                iterations,
+                count,
+                true,
+            )
+            .is_err());
+        assert_eq!(invalid, before, "iterations={iterations}, count={count}");
+    }
 }
 
 #[test]

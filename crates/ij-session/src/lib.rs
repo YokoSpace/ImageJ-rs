@@ -28,6 +28,8 @@ pub struct NamedRoi {
     pub roi: Roi,
     pub source_image: ImageId,
     pub slice: u32,
+    #[serde(default)]
+    pub stack_positioned: bool,
 }
 
 /// One row of ImageJ's separate Analyze Particles `Summary` table.
@@ -1339,6 +1341,7 @@ impl Session {
                     roi,
                     source_image: image_id,
                     slice: doc.current_slice,
+                    stack_positioned: doc.stack_size() > 1,
                 };
                 self.roi_manager.push(entry);
                 self.roi_manager_selected.clear();
@@ -1350,6 +1353,9 @@ impl Session {
                     return Ok(CommandOutcome::Updated);
                 };
                 let doc = self.active_doc_mut()?;
+                if entry.stack_positioned {
+                    doc.set_slice(entry.slice as i32)?;
+                }
                 let mut roi = entry.roi;
                 let (x, y, width, height) = roi.bounds();
                 if x >= doc.width as i32
@@ -1397,15 +1403,26 @@ impl Session {
                     .filter_map(|index| self.roi_manager.get(index).cloned())
                     .collect::<Vec<_>>();
                 let config = self.results.config;
-                let mut doc = self.active_doc()?.clone();
+                let doc = self.active_doc()?;
+                let current_slice = doc.current_slice;
+                let change_slices = doc.stack_size() > 1
+                    && entries.iter().any(|entry| entry.stack_positioned && entry.slice > 1);
                 for entry in &entries {
-                    doc.roi = Some(entry.roi.clone());
-                    self.results.push(doc.measure_with_config(config)?);
+                    let row = {
+                        let doc = self.active_doc_mut()?;
+                        if change_slices && entry.stack_positioned {
+                            doc.set_slice(entry.slice as i32)?;
+                        }
+                        doc.roi = Some(entry.roi.clone());
+                        doc.measure_with_config(config)?
+                    };
+                    self.results.push(row);
+                }
+                if !entries.is_empty() {
+                    self.active_doc_mut()?.set_slice(current_slice as i32)?;
                 }
                 if entries.len() > 1 {
                     self.active_doc_mut()?.clear_roi();
-                } else if let Some(entry) = entries.first() {
-                    self.active_doc_mut()?.roi = Some(entry.roi.clone());
                 }
                 if !entries.is_empty() {
                     self.macro_recorder.push("roiManager(\"Measure\");".into());
@@ -1881,12 +1898,21 @@ impl Session {
             Command::SetThreshold { lower, upper } => {
                 let upper = upper.max(lower);
                 let levels = ThresholdLevels { lower, upper };
+                let is_float = matches!(self.active_doc()?.plane(), PixelPlane::Gray32(_));
                 self.active_doc_mut()?.threshold = Some(levels);
-                self.macro_recorder.push(format!(
-                    "setThreshold({}, {}, \"raw\");",
-                    ij_core::format_ij_num(lower),
-                    ij_core::format_ij_num(upper)
-                ));
+                // ThresholdAdjuster.java 800-819 records floating thresholds
+                // through Recorder.record(double,double), and integer ones as raw.
+                let recorded = if is_float {
+                    let places = if lower.abs() < 0.0001 || upper.abs() < 0.0001 { 9 } else { 4 };
+                    format!("setThreshold({lower:.places$}, {upper:.places$});")
+                } else {
+                    format!(
+                        "setThreshold({}, {}, \"raw\");",
+                        ij_core::format_ij_num(lower),
+                        ij_core::format_ij_num(upper)
+                    )
+                };
+                self.macro_recorder.push(recorded);
                 Ok(CommandOutcome::Thresholded(levels))
             }
             Command::MakeBinary { black_background, stack_options } => {
@@ -2145,6 +2171,7 @@ impl Session {
                             roi: particle.roi,
                             source_image: image_id,
                             slice: doc.current_slice,
+                            stack_positioned: doc.stack_size() > 1,
                         });
                     }
                     self.results.push(particle.measurement);

@@ -29,7 +29,7 @@ impl Default for ParticleAnalysisOptions {
             exclude_on_edges: false,
             include_holes: false,
             pixel_units: false,
-            black_background: false,
+            black_background: true,
         }
     }
 }
@@ -98,6 +98,20 @@ impl ImageDocument {
             .flatten();
         let max_x = left + width;
         let max_y = top + height;
+        if source_roi.is_some() {
+            // ParticleAnalyzer.java 590-603 erases the processor outside the
+            // source selection before tracing. Filtering seeds alone lets a
+            // connected particle extend past the selected area.
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    let in_bounds = x >= left && x < max_x && y >= top && y < max_y;
+                    let in_mask = source_mask.as_ref().is_none_or(|mask| mask.contains(x, y));
+                    if !in_bounds || !in_mask {
+                        erase(work.plane_mut(), self.width, x, y, levels);
+                    }
+                }
+            }
+        }
         let unit_squared = if options.pixel_units {
             1.0
         } else {

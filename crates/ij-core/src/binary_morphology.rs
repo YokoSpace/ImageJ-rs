@@ -48,6 +48,29 @@ impl ImageDocument {
         count: u32,
         black_background: bool,
     ) -> Result<(), CoreError> {
+        self.validate_binary_morphology(iterations, count)?;
+        let region = self.filter_region()?;
+        let width = self.width;
+        let height = self.height;
+        self.save_snapshot();
+        let plane = match self.plane_mut() {
+            PixelPlane::Gray8(pixels) => pixels,
+            _ => unreachable!("checked above"),
+        };
+        apply_binary_morphology(
+            plane,
+            width,
+            height,
+            &region,
+            operation,
+            iterations,
+            count,
+            black_background,
+        );
+        Ok(())
+    }
+
+    fn validate_binary_morphology(&self, iterations: u32, count: u32) -> Result<(), CoreError> {
         if iterations == 0 || iterations > MAX_ITERATIONS {
             return Err(CoreError::InvalidFilterParameter {
                 filter: "binary morphology",
@@ -77,91 +100,13 @@ impl ImageDocument {
                 ));
             }
         }
-
-        self.save_snapshot();
-
-        let width = self.width;
-        let height = self.height;
-        let region = self.filter_region()?;
-        let plane = match self.plane_mut() {
-            PixelPlane::Gray8(pixels) => pixels,
-            _ => unreachable!("checked above"),
-        };
-
-        // Binary.run lines 133-140: Erode/Dilate repeat their own pass
-        // `iterations` times; Open runs erode then dilate and Close runs
-        // dilate then erode, each half `iterations` single passes.
-        let mut passes = Vec::new();
-        match operation {
-            BinaryMorphology::Erode => {
-                for _ in 0..iterations {
-                    passes.push(true);
-                }
-            }
-            BinaryMorphology::Dilate => {
-                for _ in 0..iterations {
-                    passes.push(false);
-                }
-            }
-            BinaryMorphology::Open => {
-                for _ in 0..iterations {
-                    passes.push(true);
-                }
-                for _ in 0..iterations {
-                    passes.push(false);
-                }
-            }
-            BinaryMorphology::Close => {
-                for _ in 0..iterations {
-                    passes.push(false);
-                }
-                for _ in 0..iterations {
-                    passes.push(true);
-                }
-            }
-        }
-
-        // Binary.run lines 122-124: foreground = Prefs.blackBackground ? 255
-        // : 0 and background = 255 - foreground.
-        let (foreground, background) = if black_background { (255u8, 0u8) } else { (0u8, 255u8) };
-
-        // PlugInFilterRunner's masking step (lines 268-272) restores pixels
-        // outside an irregular mask from the pre-command snapshot; the mask
-        // never changes during the passes.
-        let original = plane.clone();
-        for erode_pass in passes {
-            let snapshot = plane.clone();
-            filter_pass(
-                &snapshot,
-                plane,
-                width,
-                height,
-                &region,
-                erode_pass,
-                foreground,
-                background,
-                count,
-            );
-        }
-        if let Some(mask) = &region.mask {
-            for y in region.y..region.y + region.height {
-                for x in region.x..region.x + region.width {
-                    if !mask.contains(x, y) {
-                        let index = (y * width + x) as usize;
-                        plane[index] = original[index];
-                    }
-                }
-            }
-        }
         Ok(())
     }
 
     /// The whole-stack answer (`run("Options...", "... stack do=Erode")`),
     /// reached when `IJ.setupDialog` adds DOES_STACKS: every slice runs the
     /// same morphology with the reused ROI rectangle. `PlugInFilterRunner`
-    /// drops the undo snapshot for whole-stack runs (PlugInFilterRunner.java
-    /// line 126, `Undo.reset()`), which matches the other whole-stack
-    /// filters' "no undo" contract.
+    /// drops the undo snapshot for whole-stack runs.
     pub fn binary_morphology_stack(
         &mut self,
         operation: BinaryMorphology,
@@ -169,17 +114,116 @@ impl ImageDocument {
         count: u32,
         black_background: bool,
     ) -> Result<(), CoreError> {
-        for index in 0..self.slices.len() {
-            self.current_slice = (index + 1) as u32;
-            self.binary_morphology(operation, iterations, count, black_background)?;
+        // Binary.showDialog validates the current processor once, before
+        // PlugInFilterRunner processes the other stack pixels.
+        self.validate_binary_morphology(iterations, count)?;
+        if self
+            .slices
+            .iter()
+            .any(|plane| !matches!(plane, PixelPlane::Gray8(_)))
+        {
+            return Err(CoreError::InvalidOperation(
+                "8-bit binary (0 and 255 only) image required.",
+            ));
         }
-        self.current_slice = (self.slices.len()) as u32;
+        let region = self.filter_region()?;
+        let width = self.width;
+        let height = self.height;
+        for slice in &mut self.slices {
+            let PixelPlane::Gray8(plane) = slice else {
+                unreachable!("checked above");
+            };
+            apply_binary_morphology(
+                plane,
+                width,
+                height,
+                &region,
+                operation,
+                iterations,
+                count,
+                black_background,
+            );
+        }
         // PlugInFilterRunner's whole-stack path calls Undo.reset()
         // (PlugInFilterRunner.java line 126): no undo for whole-stack runs.
         self.snapshot = None;
         self.snapshot_dimensions = None;
         self.snapshot_display_range = None;
         Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_binary_morphology(
+    plane: &mut [u8],
+    width: u32,
+    height: u32,
+    region: &FilterRegion,
+    operation: BinaryMorphology,
+    iterations: u32,
+    count: u32,
+    black_background: bool,
+) {
+    // Binary.run lines 133-140: Erode/Dilate repeat their own pass
+    // `iterations` times; Open runs erode then dilate and Close runs
+    // dilate then erode, each half `iterations` single passes.
+    let mut passes = Vec::new();
+    match operation {
+        BinaryMorphology::Erode => {
+            for _ in 0..iterations {
+                passes.push(true);
+            }
+        }
+        BinaryMorphology::Dilate => {
+            for _ in 0..iterations {
+                passes.push(false);
+            }
+        }
+        BinaryMorphology::Open => {
+            for _ in 0..iterations {
+                passes.push(true);
+            }
+            for _ in 0..iterations {
+                passes.push(false);
+            }
+        }
+        BinaryMorphology::Close => {
+            for _ in 0..iterations {
+                passes.push(false);
+            }
+            for _ in 0..iterations {
+                passes.push(true);
+            }
+        }
+    }
+
+    // Binary.run lines 122-124: foreground = Prefs.blackBackground ? 255
+    // : 0 and background = 255 - foreground.
+    let (foreground, background) = if black_background {
+        (255u8, 0u8)
+    } else {
+        (0u8, 255u8)
+    };
+
+    // PlugInFilterRunner's masking step (lines 268-272) restores pixels
+    // outside an irregular mask from the pre-command snapshot; the mask
+    // never changes during the passes.
+    let original = plane.to_vec();
+    for erode_pass in passes {
+        let snapshot = plane.to_vec();
+        filter_pass(
+            &snapshot, plane, width, height, region, erode_pass, foreground, background, count,
+        );
+    }
+    if let Some(mask) = &region.mask {
+        for y in region.y..region.y + region.height {
+            for x in region.x..region.x + region.width {
+                if !mask.contains(x, y) {
+                    let index = (y * width + x) as usize;
+                    plane[index] = original[index];
+                }
+            }
+        }
     }
 }
 
@@ -244,7 +288,7 @@ fn filter_pass(
             if matching >= count {
                 plane[index] = target;
             } else {
-                plane[index] = snapshot[index];
+                plane[index] = 255 - target;
             }
         }
     }

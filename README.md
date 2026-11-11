@@ -29,15 +29,15 @@ You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick t
 
 - A desktop toolbar, separate image windows, zoom, a Results window, and ImageJ-style status and image information.
 - 8-bit grayscale and indexed color, 16-bit grayscale, 32-bit float, and RGB image data; multi-slice stacks and C/Z/T dimensions in the data model and TIFF round trips.
-- Rectangle, oval, line, polygon, freehand, Wand, point, angle, segmented line, and freehand line selections. The ROI Manager can store, select, delete, and measure selections.
-- Display range, Brightness & Contrast, threshold controls with live histogram previews, selected filters, measurements, TIFF I/O, and macro recording for supported commands.
-- Edit → Clear, Fill, and Draw with foreground and background colors, ROI masks, and Undo.
-- Crop, Duplicate, 8-bit/16-bit/32-bit/RGB type conversion, Set Measurements, Set Scale, Histogram, Plot Profile, and 14 Process → Math operations. Supported filters and math operations can process stacks.
+- All 14 toolbar tools are enabled, including point, angle, segmented and freehand lines, Text, and Color Picker. The ROI Manager can store, select, delete, and measure selections.
+- Display range, Brightness & Contrast, threshold controls with live histogram previews and mask conversion, binary Erode/Dilate/Open/Close, measurements, and macro recording for supported commands.
+- Edit → Cut, Copy, Paste, Clear, Fill, and Draw with foreground and background colors, ROI masks, and Undo.
+- Crop, Duplicate, 8-bit/16-bit/32-bit/RGB type conversion, Set Measurements, Set Scale, Analyze Particles, Histogram, Plot Profile, 14 Process → Math operations, and Image Calculator. Supported filters, math operations, and binary conversions can process stacks.
 - TIFF, PNG, and JPEG opening and saving, plus Results table export. PNG and TIFF preserve pixels on supported lossless round trips; JPEG uses lossy compression.
 - Hyperstack C/Z/T navigation, slice animation, and the ImageJ-style native macOS menu bar (the in-window menu is used on other platforms).
 - A Java compatibility path for a **limited subset** of classic ImageJ plug-ins and an API for Rust image plug-ins, described below.
 
-The app is still being expanded. Current gaps include Edit clipboard commands, stack-wide binary conversion and binary morphology, Image Calculator, Analyze Particles, and the Text and Color Picker tools. See the [Phase 3 roadmap](docs/roadmap_phase3_practical_workflows.md) for the remaining workflow and the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for earlier UI work.
+The [Phase 3 daily workflow](docs/roadmap_phase3_practical_workflows.md) is implemented for the supported image types. The project remains narrower than ImageJ: some TIFF variants, advanced plug-in APIs and dialogs, and specialized image commands are not yet supported. Text uses a small built-in bitmap font, and automatic threshold selection is unavailable for 32-bit images and stacks. The [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) records earlier UI work.
 
 ## Classic ImageJ plug-ins
 
@@ -51,7 +51,7 @@ Plug-ins do **not** run in a security sandbox. Run only code you trust. The [`ij
 ./tools/verify.sh
 ```
 
-This checks the untouched Java reference, builds the ImageJ 1.54u oracle, runs Rust tests including differential comparisons, and exercises a TIFF → ROI → measurement → save workflow. Success ends with `VERIFY_ALL_OK`; artifacts are written to `verification/evidence/latest/`.
+This checks the untouched Java reference, builds the ImageJ 1.54u oracle, runs Rust tests including differential comparisons and the Phase 3 compressed TIFF → particle analysis → save workflow, and exercises the original TIFF → ROI → measurement → save slice. Success ends with `VERIFY_ALL_OK`; artifacts are written to `verification/evidence/latest/`.
 
 For a shorter environment check:
 
