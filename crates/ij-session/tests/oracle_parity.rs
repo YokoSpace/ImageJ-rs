@@ -10250,6 +10250,7 @@ fn parity_convert_to_rgb_gray8_display_ranges_match_java_oracle() {
         (100.0, 100.0),
         (0.0, 0.0),
         (255.0, 255.0),
+        (200.0, 50.0),
     ] {
         let mut doc = ImageDocument::new(
             "rgb_gray8.tif",
