@@ -11,6 +11,8 @@ pub enum AppAction {
     /// (original_imagej/ij/plugin/Commands.java 58-69).
     Save,
     SaveAs,
+    SaveAsPng,
+    SaveAsJpeg,
     SaveResults,
     Close,
     CloseImage(ImageId),
@@ -104,10 +106,11 @@ const SEPARATOR: MenuNode = MenuNode {
 };
 
 const FILE_NEW: &[MenuNode] = &[item("Image... (8-bit Ramp)", None, AppAction::NewRamp)];
-// IJ_Props.txt File>Save As entries (original_imagej/IJ_Props.txt 49-66). Only
-// the two formats this app can actually write are wired.
+// IJ_Props.txt File>Save As entries (original_imagej/IJ_Props.txt 49-66).
 const FILE_SAVE_AS: &[MenuNode] = &[
     item("Tiff...", None, AppAction::SaveAs),
+    item("Jpeg...", None, AppAction::SaveAsJpeg),
+    item("PNG...", None, AppAction::SaveAsPng),
     item("Results...", None, AppAction::SaveResults),
 ];
 const FILE_MENU: &[MenuNode] = &[
@@ -407,7 +410,7 @@ impl ImageJApp {
                 if self.session.image_path(id).is_some() {
                     Ok(())
                 } else {
-                    Err("Image has not been saved to a TIFF file".into())
+                    Err("Image has not been saved to a file".into())
                 }
             }
             CloseAll => {
@@ -499,10 +502,10 @@ impl ImageJApp {
             }
             OpenTiff => {
                 if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("TIFF Image", &["tif", "tiff"])
+                    .add_filter("Image", &["tif", "tiff", "png", "jpg", "jpeg"])
                     .pick_file()
                 {
-                    let _ = self.open_tiff_file(path);
+                    let _ = self.open_image_file(path);
                 }
             }
             Save => {
@@ -516,7 +519,7 @@ impl ImageJApp {
                         .save_file(),
                 };
                 if let Some(path) = path {
-                    let _ = self.save_active_tiff(path);
+                    let _ = self.save_active_image(path);
                 }
             }
             Revert => {
@@ -528,6 +531,22 @@ impl ImageJApp {
                     .save_file()
                 {
                     let _ = self.save_active_tiff(path);
+                }
+            }
+            SaveAsPng => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PNG Image", &["png"])
+                    .save_file()
+                {
+                    let _ = self.save_active_png(path);
+                }
+            }
+            SaveAsJpeg => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("JPEG Image", &["jpg", "jpeg"])
+                    .save_file()
+                {
+                    let _ = self.save_active_jpeg(path);
                 }
             }
             SaveResults => {

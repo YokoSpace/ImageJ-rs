@@ -28,6 +28,8 @@ RUST_SLICE_1_COMMANDS = {
     "Open...",
     "Save",
     "Tiff...",
+    "Jpeg...",
+    "PNG...",
     "Results...",
     "Undo",
     "Invert",

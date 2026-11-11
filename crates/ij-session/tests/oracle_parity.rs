@@ -5,7 +5,7 @@ use ij_core::{
     MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
     ThresholdLevels, Wand, WandMode,
 };
-use ij_io::{load_tiff, save_tiff};
+use ij_io::{load_image, load_tiff, save_jpeg, save_png, save_tiff};
 use ij_session::{Command, CommandOutcome, Session};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -13664,4 +13664,237 @@ fn parity_select_all_and_restore_selection() {
     session.dispatch(Command::RestoreSelection).unwrap();
     let (x, y, w, h) = session.active_doc().unwrap().roi.as_ref().unwrap().bounds();
     assert_eq!(oracle_line, format!("CENTERED:{x},{y},{w},{h}"));
+}
+
+#[test]
+fn parity_png_gray8_gray16_and_rgb_roundtrip_with_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        ("gray8", PixelPlane::Gray8(vec![0, 17, 128, 255, 91, 200]), 8),
+        (
+            "gray16",
+            PixelPlane::Gray16(vec![0, 257, 32768, 65535, 1000, 54321]),
+            16,
+        ),
+        (
+            "rgb",
+            PixelPlane::ColorRgb(vec![
+                0xff000000, 0xff123456, 0xffabcdef, 0xffffffff, 0xff00ff00, 0xffff0000,
+            ]),
+            24,
+        ),
+    ];
+    for (name, plane, bit_depth) in cases {
+        let doc = ImageDocument::new(name, 3, 2, plane.clone()).unwrap();
+        let path = dir.path().join(format!("{name}.png"));
+        save_png(&path, &doc).unwrap();
+        let reloaded = load_image(&path).unwrap();
+        assert_eq!((reloaded.width, reloaded.height), (3, 2));
+        assert_eq!(reloaded.plane(), &plane, "Rust PNG roundtrip {name}");
+
+        let macro_text = format!(
+            "open(\"{}\"); print(\"TYPE:\"+bitDepth()); \
+             for(y=0;y<getHeight();y++) for(x=0;x<getWidth();x++) print(\"PX:\"+getPixel(x,y));",
+            path.display()
+        );
+        let output = bridge.eval_macro(&macro_text).unwrap();
+        assert_eq!(oracle_line(&output.stdout, "TYPE:"), format!("TYPE:{bit_depth}"));
+        let java_pixels: Vec<u32> = output
+            .stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("PX:"))
+            .map(|value| {
+                let pixel = value.parse::<i64>().unwrap() as u32;
+                if bit_depth == 24 { pixel & 0xffffff } else { pixel }
+            })
+            .collect();
+        let expected: Vec<u32> = match plane {
+            PixelPlane::Gray8(values) => values.into_iter().map(u32::from).collect(),
+            PixelPlane::Gray16(values) => values.into_iter().map(u32::from).collect(),
+            PixelPlane::ColorRgb(values) => values.into_iter().map(|v| v & 0xffffff).collect(),
+            _ => unreachable!(),
+        };
+        assert_eq!(java_pixels, expected, "Java PNG decode {name}");
+    }
+}
+
+#[test]
+fn parity_jpeg_dimensions_and_lossy_pixels_with_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = Vec::new();
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            let r = x * 13 + y * 2;
+            let g = y * 13 + x * 2;
+            let b = (x + y) * 7;
+            source.push(0xff000000 | (r << 16) | (g << 8) | b);
+        }
+    }
+    let doc = ImageDocument::new("jpeg", 16, 16, PixelPlane::ColorRgb(source.clone())).unwrap();
+    let path = dir.path().join("rust.jpg");
+    save_jpeg(&path, &doc, 90).unwrap();
+    let reloaded = load_image(&path).unwrap();
+    assert_eq!((reloaded.width, reloaded.height), (16, 16));
+    let PixelPlane::ColorRgb(actual) = reloaded.plane() else {
+        panic!("RGB JPEG must decode as RGB");
+    };
+    let squared_error: f64 = source
+        .iter()
+        .zip(actual)
+        .flat_map(|(&a, b)| {
+            [16, 8, 0].map(move |shift| {
+                let delta = ((a >> shift) & 255) as f64 - ((b >> shift) & 255) as f64;
+                delta * delta
+            })
+        })
+        .sum();
+    let mse = squared_error / (source.len() * 3) as f64;
+    assert!(mse < 100.0, "JPEG MSE {mse}");
+    let output = bridge
+        .eval_macro(&format!(
+            "open(\"{}\"); print(\"JPEG:\"+getWidth()+\",\"+getHeight()+\",\"+bitDepth());",
+            path.display()
+        ))
+        .unwrap();
+    assert_eq!(oracle_line(&output.stdout, "JPEG:"), "JPEG:16,16,24");
+
+    let java_path = dir.path().join("java.jpg");
+    bridge
+        .eval_macro(&format!(
+            "newImage(\"gray\", \"8-bit ramp\", 16, 16, 1); saveAs(\"Jpeg\", \"{}\");",
+            java_path.display()
+        ))
+        .unwrap();
+    let java_jpeg = load_image(&java_path).unwrap();
+    assert_eq!((java_jpeg.width, java_jpeg.height), (16, 16));
+    let PixelPlane::Gray8(decoded) = java_jpeg.plane() else {
+        panic!("Java grayscale JPEG must decode as Gray8");
+    };
+    let PixelPlane::Gray8(ramp) = ImageDocument::new_ramp_8bit("gray", 16, 16)
+        .unwrap()
+        .plane()
+        .clone()
+    else {
+        unreachable!()
+    };
+    let mse = ramp
+        .iter()
+        .zip(decoded)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+        .sum::<f64>()
+        / ramp.len() as f64;
+    assert!(mse < 100.0, "Java JPEG MSE {mse}");
+}
+
+#[test]
+fn png_and_jpeg_failed_save_keep_previous_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = ImageDocument::new("bad", 2, 2, PixelPlane::Gray8(vec![1; 4])).unwrap();
+    doc.slices[0] = PixelPlane::Gray8(vec![1]);
+    for extension in ["png", "jpg"] {
+        let path = dir.path().join(format!("previous.{extension}"));
+        std::fs::write(&path, b"previous contents").unwrap();
+        let saved = if extension == "png" {
+            save_png(&path, &doc)
+        } else {
+            save_jpeg(&path, &doc, 75)
+        };
+        assert!(saved.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous contents");
+    }
+}
+
+#[test]
+fn parity_java_png_files_decode_to_matching_rust_planes() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (name, kind, pixels, expected) in [
+        (
+            "gray8",
+            "8-bit black",
+            "setPixel(0,0,17); setPixel(1,0,128); setPixel(2,0,255);",
+            PixelPlane::Gray8(vec![17, 128, 255]),
+        ),
+        (
+            "gray16",
+            "16-bit black",
+            "setPixel(0,0,257); setPixel(1,0,32768); setPixel(2,0,65535);",
+            PixelPlane::Gray16(vec![257, 32768, 65535]),
+        ),
+        (
+            "rgb",
+            "RGB black",
+            "setPixel(0,0,1193046); setPixel(1,0,11259375); setPixel(2,0,16711680);",
+            PixelPlane::ColorRgb(vec![0xff123456, 0xffabcdef, 0xffff0000]),
+        ),
+    ] {
+        let path = dir.path().join(format!("java_{name}.png"));
+        bridge
+            .eval_macro(&format!(
+                "newImage(\"{name}\", \"{kind}\", 3, 1, 1); {pixels} saveAs(\"PNG\", \"{}\");",
+                path.display()
+            ))
+            .unwrap();
+        let doc = load_image(&path).unwrap();
+        assert_eq!((doc.width, doc.height), (3, 1));
+        assert_eq!(doc.plane(), &expected, "Java PNG {name}");
+    }
+}
+
+#[test]
+fn session_image_format_commands_use_magic_and_preserve_revert() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new("source", 2, 2, PixelPlane::Gray8(vec![1, 2, 3, 4])).unwrap();
+    let misleading_path = dir.path().join("source.jpg");
+    save_png(&misleading_path, &source).unwrap();
+    let mut session = Session::new();
+    session
+        .dispatch(Command::OpenImage {
+            path: misleading_path.clone(),
+        })
+        .unwrap();
+    assert_eq!(session.active_doc().unwrap().plane(), source.plane());
+    let id = session.active_image_id().unwrap();
+    session.save_image(id, &misleading_path).unwrap();
+    assert!(std::fs::read(&misleading_path)
+        .unwrap()
+        .starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let extensionless_path = dir.path().join("extensionless");
+    session
+        .dispatch(Command::SavePng {
+            path: extensionless_path.clone(),
+        })
+        .unwrap();
+    session.save_image(id, &extensionless_path).unwrap();
+    assert!(std::fs::read(&extensionless_path)
+        .unwrap()
+        .starts_with(b"\x89PNG\r\n\x1a\n"));
+
+    let png_path = dir.path().join("saved.png");
+    session
+        .dispatch(Command::SavePng {
+            path: png_path.clone(),
+        })
+        .unwrap();
+    assert!(std::fs::read(&png_path)
+        .unwrap()
+        .starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert_eq!(session.image_path(id), Some(png_path.as_path()));
+    session.dispatch(Command::Invert).unwrap();
+    assert!(session.is_dirty(id));
+    session.dispatch(Command::Revert).unwrap();
+    assert_eq!(session.active_doc().unwrap().plane(), source.plane());
+    assert!(!session.is_dirty(id));
+
+    let jpeg_path = dir.path().join("saved.jpeg");
+    session
+        .dispatch(Command::SaveJpeg {
+            path: jpeg_path.clone(),
+        })
+        .unwrap();
+    assert!(std::fs::read(&jpeg_path).unwrap().starts_with(&[0xff, 0xd8, 0xff]));
+    assert_eq!(session.image_path(id), Some(jpeg_path.as_path()));
 }

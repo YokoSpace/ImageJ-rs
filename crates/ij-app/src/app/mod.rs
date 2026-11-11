@@ -307,13 +307,13 @@ impl ImageJApp {
         }
     }
 
-    pub fn open_tiff_file(&mut self, path: PathBuf) -> Result<ImageId, SessionError> {
+    pub fn open_image_file(&mut self, path: PathBuf) -> Result<ImageId, SessionError> {
         if let Some(err) = self.reject_while_closing("Open") {
             return Err(err);
         }
         let outcome = match self
             .session
-            .dispatch(Command::OpenTiff { path: path.clone() })
+            .dispatch(Command::OpenImage { path: path.clone() })
         {
             Ok(o) => o,
             Err(e) => {
@@ -338,11 +338,40 @@ impl ImageJApp {
         }
     }
 
+    pub fn open_tiff_file(&mut self, path: PathBuf) -> Result<ImageId, SessionError> {
+        self.open_image_file(path)
+    }
+
     pub fn save_active_tiff(&mut self, path: PathBuf) -> Result<(), SessionError> {
-        match self
-            .session
-            .dispatch(Command::SaveTiff { path: path.clone() })
-        {
+        self.save_active_command(path.clone(), Command::SaveTiff { path })
+    }
+
+    pub fn save_active_png(&mut self, path: PathBuf) -> Result<(), SessionError> {
+        self.save_active_command(path.clone(), Command::SavePng { path })
+    }
+
+    pub fn save_active_jpeg(&mut self, path: PathBuf) -> Result<(), SessionError> {
+        self.save_active_command(path.clone(), Command::SaveJpeg { path })
+    }
+
+    pub fn save_active_image(&mut self, path: PathBuf) -> Result<(), SessionError> {
+        let id = self.active_image_id().ok_or(SessionError::NoActiveImage)?;
+        match self.session.save_image(id, &path) {
+            Ok(()) => {
+                self.status_message = format!("Saved \"{}\"", path.display());
+                Ok(())
+            }
+            Err(error) => {
+                self.status_message = format!("Save failed: {error}");
+                self.dialogs.last_error =
+                    Some(format!("Failed to save \"{}\": {error}", path.display()));
+                Err(error)
+            }
+        }
+    }
+
+    fn save_active_command(&mut self, path: PathBuf, command: Command) -> Result<(), SessionError> {
+        match self.session.dispatch(command) {
             Ok(_) => {
                 self.status_message = format!("Saved \"{}\"", path.display());
                 Ok(())
@@ -362,7 +391,7 @@ impl ImageJApp {
         }
         match self.session.dispatch(Command::Revert) {
             Ok(outcome) => {
-                self.status_message = "Reverted to saved TIFF".to_string();
+                self.status_message = "Reverted to saved image".to_string();
                 Ok(outcome)
             }
             Err(error) => {

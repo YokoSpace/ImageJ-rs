@@ -1618,6 +1618,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "ij-core",
+ "image",
  "serde",
  "thiserror 2.0.21",
  "weezl",
@@ -1648,6 +1649,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

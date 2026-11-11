@@ -863,7 +863,7 @@ pub const COMMAND_SPECS: [CommandSpec; 414] = [
         shortcut: "",
         java_class: "ij.plugin.filter.Writer",
         java_arg: "jpeg",
-        tier: ExecutionTier::JavaBridge,
+        tier: ExecutionTier::RustTier1,
     },
     CommandSpec {
         prop_key: "save04",
@@ -926,7 +926,7 @@ pub const COMMAND_SPECS: [CommandSpec; 414] = [
         shortcut: "",
         java_class: "ij.plugin.filter.Writer",
         java_arg: "png",
-        tier: ExecutionTier::JavaBridge,
+        tier: ExecutionTier::RustTier1,
     },
     CommandSpec {
         prop_key: "save11",

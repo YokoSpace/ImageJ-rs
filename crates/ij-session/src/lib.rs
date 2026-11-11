@@ -9,7 +9,7 @@ use ij_core::{
     MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
     Roi, ThresholdLevels,
 };
-use ij_io::{IoError, load_tiff, save_tiff};
+use ij_io::{ImageFileFormat, IoError, detect_image_format, load_image, save_jpeg, save_png, save_tiff};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -35,7 +35,7 @@ pub enum SessionError {
     File(#[from] std::io::Error),
     #[error("no active image in session")]
     NoActiveImage,
-    #[error("active image has no saved TIFF path")]
+    #[error("active image has no saved file path")]
     NoSavedTiffPath,
     #[error("unknown command label: {0}")]
     UnknownCommand(String),
@@ -63,12 +63,21 @@ pub enum Command {
     OpenTiff {
         path: PathBuf,
     },
+    OpenImage {
+        path: PathBuf,
+    },
     /// `File > Revert`: reloads the active image from its last opened/saved
     /// TIFF path (ImagePlus.revert, original_imagej/ij/ImagePlus.java
     /// 2293-2333). The current ROI is restored after the pixels and metadata
     /// are reloaded, matching ImagePlus.revert's saveRoi/setRoi sequence.
     Revert,
     SaveTiff {
+        path: PathBuf,
+    },
+    SavePng {
+        path: PathBuf,
+    },
+    SaveJpeg {
         path: PathBuf,
     },
     SetDisplayRange {
@@ -408,6 +417,23 @@ pub struct PreparedPluginFilter {
     pub request: PluginFilterRequest,
 }
 
+#[derive(Clone, Copy)]
+enum RasterSaveFormat {
+    Tiff,
+    Png,
+    Jpeg,
+}
+
+impl RasterSaveFormat {
+    fn macro_label(self) -> &'static str {
+        match self {
+            Self::Tiff => "Tiff",
+            Self::Png => "PNG",
+            Self::Jpeg => "Jpeg",
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Session {
     next_id: u32,
@@ -417,10 +443,10 @@ pub struct Session {
     pub macro_recorder: Vec<String>,
     dirty_images: BTreeSet<ImageId>,
     preview_display_ranges: BTreeMap<ImageId, DisplayRange>,
-    /// Last TIFF path this document was opened from or successfully saved to.
-    /// `FileSaver.save()` re-saves a TIFF opened from disk at this path instead
+    /// Last image path this document was opened from or successfully saved to.
+    /// `FileSaver.save()` re-saves an image opened from disk at this path instead
     /// of showing a Save dialog (original_imagej/ij/io/FileSaver.java 42-69).
-    saved_tiff_paths: BTreeMap<ImageId, PathBuf>,
+    saved_image_paths: BTreeMap<ImageId, PathBuf>,
     /// Per-image change counter. Any mutable access or session mutation bumps
     /// it, so a result prepared before the change is rejected as stale.
     image_revisions: BTreeMap<ImageId, u64>,
@@ -618,21 +644,21 @@ impl Session {
                 self.dirty_images.insert(id);
                 Ok(CommandOutcome::ImageOpened(id))
             }
-            Command::OpenTiff { path } => {
+            Command::OpenTiff { path } | Command::OpenImage { path } => {
                 self.save_roi();
                 let remembered_path = std::path::absolute(&path)?;
-                let doc = load_tiff(&path)?;
+                let doc = load_image(&path)?;
                 self.macro_recorder
                     .push(format!("open(\"{}\");", path.display()));
                 let id = self.insert_doc(doc);
                 self.dirty_images.remove(&id);
-                self.saved_tiff_paths.insert(id, remembered_path);
+                self.saved_image_paths.insert(id, remembered_path);
                 Ok(CommandOutcome::ImageOpened(id))
             }
             Command::Revert => {
                 let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
                 let path = self
-                    .saved_tiff_paths
+                    .saved_image_paths
                     .get(&id)
                     .cloned()
                     .ok_or(SessionError::NoSavedTiffPath)?;
@@ -642,7 +668,7 @@ impl Session {
                     .ok_or(SessionError::NoActiveImage)?
                     .roi
                     .clone();
-                let mut reverted = load_tiff(&path)?;
+                let mut reverted = load_image(&path)?;
                 reverted.roi = saved_roi;
                 self.images.insert(id, reverted);
                 self.preview_display_ranges.remove(&id);
@@ -653,7 +679,17 @@ impl Session {
             }
             Command::SaveTiff { path } => {
                 let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
-                self.save_image(id, &path)?;
+                self.save_image_as(id, &path, RasterSaveFormat::Tiff)?;
+                Ok(CommandOutcome::Saved(path))
+            }
+            Command::SavePng { path } => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                self.save_image_as(id, &path, RasterSaveFormat::Png)?;
+                Ok(CommandOutcome::Saved(path))
+            }
+            Command::SaveJpeg { path } => {
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                self.save_image_as(id, &path, RasterSaveFormat::Jpeg)?;
                 Ok(CommandOutcome::Saved(path))
             }
             Command::SetDisplayRange { min, max } => {
@@ -1511,20 +1547,49 @@ impl Session {
     }
 
     pub fn save_image(&mut self, id: ImageId, path: &std::path::Path) -> Result<(), SessionError> {
+        let extension = path
+            .extension()
+            .map(|value| value.to_string_lossy().to_ascii_lowercase());
+        let format = match detect_image_format(path) {
+            Ok(ImageFileFormat::Png) => RasterSaveFormat::Png,
+            Ok(ImageFileFormat::Jpeg) => RasterSaveFormat::Jpeg,
+            Ok(ImageFileFormat::Tiff) => RasterSaveFormat::Tiff,
+            Err(_) => match extension.as_deref() {
+                Some("png") => RasterSaveFormat::Png,
+                Some("jpg" | "jpeg") => RasterSaveFormat::Jpeg,
+                _ => RasterSaveFormat::Tiff,
+            },
+        };
+        self.save_image_as(id, path, format)
+    }
+
+    fn save_image_as(
+        &mut self,
+        id: ImageId,
+        path: &std::path::Path,
+        format: RasterSaveFormat,
+    ) -> Result<(), SessionError> {
         let remembered_path = std::path::absolute(path)?;
         let doc = self.images.get(&id).ok_or(SessionError::NoActiveImage)?;
-        save_tiff(path, doc)?;
+        match format {
+            RasterSaveFormat::Tiff => save_tiff(path, doc)?,
+            RasterSaveFormat::Png => save_png(path, doc)?,
+            RasterSaveFormat::Jpeg => save_jpeg(path, doc, 75)?,
+        }
         self.dirty_images.remove(&id);
-        self.saved_tiff_paths.insert(id, remembered_path);
-        self.macro_recorder
-            .push(format!("saveAs(\"Tiff\", \"{}\");", path.display()));
+        self.saved_image_paths.insert(id, remembered_path);
+        self.macro_recorder.push(format!(
+            "saveAs(\"{}\", \"{}\");",
+            format.macro_label(),
+            path.display()
+        ));
         Ok(())
     }
 
-    /// The TIFF destination a close prompt should re-save to, or `None` for a
+    /// The destination a close prompt should re-save to, or `None` for a
     /// document that has never been opened from or saved to a file.
     pub fn image_path(&self, id: ImageId) -> Option<&std::path::Path> {
-        self.saved_tiff_paths.get(&id).map(PathBuf::as_path)
+        self.saved_image_paths.get(&id).map(PathBuf::as_path)
     }
 
     fn mark_active_dirty(&mut self) {
@@ -1536,7 +1601,7 @@ impl Session {
     pub fn close_image(&mut self, id: ImageId) -> bool {
         self.preview_display_ranges.remove(&id);
         self.dirty_images.remove(&id);
-        self.saved_tiff_paths.remove(&id);
+        self.saved_image_paths.remove(&id);
         self.image_revisions.remove(&id);
         let removed = self.images.remove(&id).is_some();
         if self.active_image == Some(id) {
@@ -1548,7 +1613,7 @@ impl Session {
     pub fn close_all_images(&mut self) {
         self.preview_display_ranges.clear();
         self.dirty_images.clear();
-        self.saved_tiff_paths.clear();
+        self.saved_image_paths.clear();
         self.image_revisions.clear();
         self.images.clear();
         self.active_image = None;

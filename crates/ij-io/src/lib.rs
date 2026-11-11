@@ -7,10 +7,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
+mod raster_formats;
+pub use raster_formats::{ImageFileFormat, detect_image_format, load_image, save_jpeg, save_png};
+
 #[derive(Debug, Error)]
 pub enum IoError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("image codec error: {0}")]
+    ImageCodec(#[from] image::ImageError),
+    #[error("invalid image: {0}")]
+    InvalidImage(String),
     #[error("core model error: {0}")]
     Core(#[from] CoreError),
     #[error("invalid TIFF header or unsupported byte order")]

@@ -49,6 +49,43 @@ fn cmd_s_saves_to_existing_path_and_clears_dirty_state() {
 }
 
 #[test]
+fn png_and_jpeg_save_as_actions_and_png_resave_are_wired() {
+    let file = MENU_TREE.iter().find(|node| node.label == "File").unwrap();
+    let MenuKind::Submenu(file_items) = file.kind else {
+        panic!("File menu must be a submenu");
+    };
+    let save_as = file_items.iter().find(|node| node.label == "Save As").unwrap();
+    let MenuKind::Submenu(formats) = save_as.kind else {
+        panic!("Save As must be a submenu");
+    };
+    assert!(formats.iter().any(|node| {
+        node.label == "PNG..." && matches!(node.kind, MenuKind::Item(AppAction::SaveAsPng))
+    }));
+    assert!(formats.iter().any(|node| {
+        node.label == "Jpeg..." && matches!(node.kind, MenuKind::Item(AppAction::SaveAsJpeg))
+    }));
+
+    let dir = tempfile::tempdir().unwrap();
+    let png_path = dir.path().join("saved.png");
+    let jpeg_path = dir.path().join("saved.jpg");
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("formats", 8, 8).unwrap();
+    app.save_active_png(png_path.clone()).unwrap();
+    assert!(std::fs::read(&png_path).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+    app.invert_active().unwrap();
+    assert!(app.is_dirty(id));
+    app.perform(AppAction::Save, &egui::Context::default());
+    assert!(!app.is_dirty(id));
+    assert_eq!(ij_io::load_image(&png_path).unwrap().slices, app.session.get_image(id).unwrap().slices);
+    app.save_active_jpeg(jpeg_path.clone()).unwrap();
+    assert!(std::fs::read(&jpeg_path).unwrap().starts_with(&[0xff, 0xd8, 0xff]));
+
+    let mut other = ImageJApp::new();
+    let opened = other.open_image_file(png_path).unwrap();
+    assert!(other.image_views.contains_key(&opened));
+}
+
+#[test]
 fn duplicate_and_profile_shortcuts_reach_the_target_image() {
     for (key, modifiers) in [
         (egui::Key::D, egui::Modifiers::SHIFT),
@@ -173,13 +210,21 @@ fn file_menu_matches_imagej_save_entries() {
         panic!("Save As must be a submenu");
     };
     let labels: Vec<_> = children.iter().map(|node| node.label).collect();
-    assert_eq!(labels, ["Tiff...", "Results..."]);
+    assert_eq!(labels, ["Tiff...", "Jpeg...", "PNG...", "Results..."]);
     assert!(matches!(
         children[0].kind,
         MenuKind::Item(AppAction::SaveAs)
     ));
     assert!(matches!(
         children[1].kind,
+        MenuKind::Item(AppAction::SaveAsJpeg)
+    ));
+    assert!(matches!(
+        children[2].kind,
+        MenuKind::Item(AppAction::SaveAsPng)
+    ));
+    assert!(matches!(
+        children[3].kind,
         MenuKind::Item(AppAction::SaveResults)
     ));
 }
@@ -189,11 +234,15 @@ fn save_actions_are_enabled_only_when_they_can_run() {
     let mut app = ImageJApp::new();
     assert!(app.action_enabled(AppAction::Save).is_err());
     assert!(app.action_enabled(AppAction::SaveAs).is_err());
+    assert!(app.action_enabled(AppAction::SaveAsPng).is_err());
+    assert!(app.action_enabled(AppAction::SaveAsJpeg).is_err());
     assert!(app.action_enabled(AppAction::SaveResults).is_err());
 
     app.open_ramp_8bit("save", 4, 4).unwrap();
     assert!(app.action_enabled(AppAction::Save).is_ok());
     assert!(app.action_enabled(AppAction::SaveAs).is_ok());
+    assert!(app.action_enabled(AppAction::SaveAsPng).is_ok());
+    assert!(app.action_enabled(AppAction::SaveAsJpeg).is_ok());
     // Save As > Results... needs a row to write.
     assert!(app.action_enabled(AppAction::SaveResults).is_err());
 }

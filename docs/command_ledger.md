@@ -3,8 +3,8 @@
 Generated from `original_imagej/ij/Menus.java` and `original_imagej/IJ_Props.txt` by `tools/ledger/sync_ledger.py`. Do not edit by hand.
 
 - Total registered menu commands: **414**
-- Rust Vertical Slice 1 target (`RustTier1`): **16**
-- Delegated to Java compatibility session (`JavaBridge`): **398**
+- Rust Vertical Slice 1 target (`RustTier1`): **18**
+- Delegated to Java compatibility session (`JavaBridge`): **396**
 
 | Key | Menu section | Command label | Shortcut | Java class | Arg | Target tier |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -101,14 +101,14 @@ Generated from `original_imagej/ij/Menus.java` and `original_imagej/IJ_Props.txt
 | `import12` | File/Import | `XY Coordinates... ` | `` | `ij.plugin.XY_Reader` | `` | `JavaBridge` |
 | `save01` | File/Save A | `Tiff...` | `` | `ij.plugin.filter.Writer` | `tiff` | `RustTier1` |
 | `save02` | File/Save A | `Gif...` | `` | `ij.plugin.filter.Writer` | `gif` | `JavaBridge` |
-| `save03` | File/Save A | `Jpeg...` | `` | `ij.plugin.filter.Writer` | `jpeg` | `JavaBridge` |
+| `save03` | File/Save A | `Jpeg...` | `` | `ij.plugin.filter.Writer` | `jpeg` | `RustTier1` |
 | `save04` | File/Save A | `Text Image...` | `` | `ij.plugin.filter.Writer` | `text` | `JavaBridge` |
 | `save05` | File/Save A | `ZIP...` | `` | `ij.plugin.filter.Writer` | `zip` | `JavaBridge` |
 | `save06` | File/Save A | `Raw Data...` | `` | `ij.plugin.filter.Writer` | `raw` | `JavaBridge` |
 | `save07` | File/Save A | `Image Sequence... ` | `` | `ij.plugin.StackWriter` | `` | `JavaBridge` |
 | `save08` | File/Save A | `AVI... ` | `` | `ij.plugin.filter.AVI_Writer` | `` | `JavaBridge` |
 | `save09` | File/Save A | `BMP...` | `` | `ij.plugin.filter.Writer` | `bmp` | `JavaBridge` |
-| `save10` | File/Save A | `PNG...` | `` | `ij.plugin.filter.Writer` | `png` | `JavaBridge` |
+| `save10` | File/Save A | `PNG...` | `` | `ij.plugin.filter.Writer` | `png` | `RustTier1` |
 | `save11` | File/Save A | `PGM...` | `` | `ij.plugin.filter.Writer` | `pgm` | `JavaBridge` |
 | `save12` | File/Save A | `FITS...` | `` | `ij.plugin.filter.Writer` | `fits` | `JavaBridge` |
 | `save13` | File/Save A | `LUT...` | `` | `ij.plugin.filter.Writer` | `lut` | `JavaBridge` |
