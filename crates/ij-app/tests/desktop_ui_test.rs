@@ -136,18 +136,5 @@ fn wired_session_commands_execute_and_record_macros() {
 
 #[test]
 fn unsupported_actions_guardrail() {
-    // Verify that unsupported tools are correctly flagged so UI can disable
-    // them. Text and Dropper remain pending in P3.7c.
-    let unsupported_tools = [
-        Tool::Text,
-        Tool::Dropper,
-    ];
-
-    for tool in unsupported_tools {
-        assert!(
-            !tool.is_supported(),
-            "Tool {:?} must be marked unsupported so UI does not misleadingly enable it",
-            tool
-        );
-    }
+    assert!(Tool::ALL.iter().all(Tool::is_supported));
 }

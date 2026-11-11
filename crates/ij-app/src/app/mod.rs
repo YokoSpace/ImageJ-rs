@@ -165,6 +165,7 @@ pub struct AnimationState {
 }
 
 pub struct ImageJApp {
+    pub text_selection: Option<(ImageId, i32, i32, String)>,
     pub session: Session,
     pub active_tool: Tool,
     pub status_message: String,
@@ -258,6 +259,7 @@ impl ImageJApp {
             texture_cache: HashMap::new(),
             texture_upload_count: 0,
             texture_cache_hit_count: 0,
+            text_selection: None,
         }
     }
 
@@ -677,6 +679,33 @@ impl ImageJApp {
     pub fn draw_active(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("Draw") {
             return Err(err);
+        }
+        if let Some((id, x, y, text)) = self.text_selection.clone().filter(|t| Some(t.0) == self.session.active_image_id() && self.session.get_image(t.0).is_some_and(|doc| matches!(&doc.roi, Some(ij_core::Roi::Rect(rect)) if rect.x == t.1 && rect.y == t.2))) {
+            use font8x8::UnicodeFonts;
+            let color = self.session.foreground_color;
+            let doc = self.session.get_image_mut(id).unwrap();
+            let mut painted = doc.clone();
+            for (line, text) in text.lines().enumerate() {
+                for (column, ch) in text.chars().enumerate() {
+                    if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
+                        for (row, bits) in glyph.iter().enumerate() {
+                            for bit in 0..8 {
+                                if bits & (1 << bit) != 0 {
+                                    painted.roi = Some(ij_core::Roi::Rect(ij_core::RectRoi::new(x + column as i32 * 8 + bit, y + line as i32 * 8 + row as i32, 1, 1)?));
+                                    painted.fill_roi_or_plane(color)?;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            doc.save_snapshot();
+            *doc.plane_mut() = painted.plane().clone();
+            doc.display_range = painted.display_range;
+            self.session.set_dirty(id, true);
+            self.session.bump_image_revision(id);
+            self.status_message = "Draw".into();
+            return Ok(());
         }
         match self.session.dispatch(Command::Draw) {
             Ok(_) => {

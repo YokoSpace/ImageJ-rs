@@ -80,7 +80,7 @@ impl Tool {
     pub fn is_supported(&self) -> bool {
         matches!(
             self,
-            Self::Rectangle
+            Self::Text | Self::Dropper | Self::Rectangle
                 | Self::Oval
                 | Self::Polygon
                 | Self::Freehand

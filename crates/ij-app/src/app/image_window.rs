@@ -834,6 +834,34 @@ impl ImageJApp {
             }
         }
 
+        if matches!(tool, Tool::Dropper | Tool::Text) && response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos().filter(|p| img_rect.contains(*p)) {
+                let (x, y) = view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y);
+                if tool == Tool::Dropper {
+                    let doc = self.session.get_image(image_id).unwrap();
+                    let rgba = plane_to_rgba(doc.plane(), doc.width, doc.height, doc.display_range, doc.threshold);
+                    if x >= 0 && y >= 0 && x < doc.width as i32 && y < doc.height as i32 {
+                        let index = (y as usize * doc.width as usize + x as usize) * 4;
+                        let color = [rgba[index], rgba[index+1], rgba[index+2]];
+                        let background = ui.input(|i| i.modifiers.alt);
+                        let command = if background { Command::SetBackgroundColor { color } } else { Command::SetForegroundColor { color } };
+                        let _ = self.session.dispatch(command);
+                        self.status_message = format!("{} color: ({}, {}, {})", if background { "Background" } else { "Foreground" }, color[0], color[1], color[2]);
+                    }
+                } else {
+                    self.text_selection = Some((image_id, x, y, String::new()));
+                }
+            }
+        }
+        if let Some((id, x, y, text)) = &mut self.text_selection {
+            if *id == image_id && tool == Tool::Text {
+                egui::Window::new("Text selection").show(ui.ctx(), |ui| {
+                    ui.text_edit_multiline(text);
+                });
+                self.session.get_image_mut(image_id).unwrap().roi = Some(ij_core::Roi::Rect(ij_core::RectRoi::new(*x, *y, (text.lines().map(str::len).max().unwrap_or(1).max(1) * 8) as i32, (text.lines().count().max(1) * 8) as i32).unwrap()));
+                painter.text(Pos2::new(img_rect.min.x + *x as f32 * view.zoom as f32, img_rect.min.y + *y as f32 * view.zoom as f32), egui::Align2::LEFT_TOP, text.as_str(), egui::FontId::monospace(8.0 * view.zoom as f32), Color32::YELLOW);
+            }
+        }
         let angle_key = angle_build_id(image_id);
         let mut angle_finish = None;
         if tool == Tool::Angle {

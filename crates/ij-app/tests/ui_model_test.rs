@@ -24,7 +24,7 @@ fn tool_definitions_match_classic_imagej() {
     assert!(Tool::Angle.is_supported());
 
     // Unsupported actions must not misleadingly appear functional
-    assert!(!Tool::Text.is_supported());
+    assert!(Tool::Text.is_supported());
 }
 
 #[test]
