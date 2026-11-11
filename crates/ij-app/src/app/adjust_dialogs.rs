@@ -2416,8 +2416,10 @@ impl ImageJApp {
             options: self.particles.options,
             clear_results: self.particles.clear_results,
             add_to_manager: self.particles.add_to_manager,
+            summarize: self.particles.summarize,
         })?;
         self.show_results_window = self.particles.display_results;
+        if self.particles.summarize { self.show_particle_summary_window = true; }
         if self.particles.add_to_manager { self.show_roi_manager_window = true; }
         self.particles.open = false;
         Ok(())
@@ -2445,6 +2447,7 @@ impl ImageJApp {
             ui.checkbox(&mut d.display_results, "Display results");
             ui.checkbox(&mut d.clear_results, "Clear results");
             ui.checkbox(&mut d.add_to_manager, "Add to Manager");
+            ui.checkbox(&mut d.summarize, "Summarize");
             ui.horizontal(|ui| {
                 apply = ui.button("OK").clicked();
                 cancel = ui.button("Cancel").clicked();

@@ -77,11 +77,15 @@ fn particle_dialog_opens_and_applies() {
  app.open_ramp_8bit("particles", 8, 8).unwrap();
  app.session.dispatch(ij_session::Command::SetThreshold { lower: 1.0, upper: 255.0 }).unwrap();
  app.particles.add_to_manager = true;
+ app.particles.summarize = true;
  app.perform(AppAction::AnalyzeParticles, &egui::Context::default());
  assert!(app.particles.open);
  app.apply_particle_dialog().unwrap();
  assert!(!app.particles.open);
  assert!(!app.session.roi_manager.is_empty());
+ assert!(app.show_particle_summary_window);
+ assert_eq!(app.session.particle_summaries.len(), 1);
+ assert_eq!(app.session.particle_summaries[0].count, app.session.roi_manager.len());
  app.session.dispatch(ij_session::Command::RoiManagerSelect { index: 0 }).unwrap();
  assert!(app.session.active_doc().unwrap().roi.is_some());
 }

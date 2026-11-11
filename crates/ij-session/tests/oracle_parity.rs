@@ -63,7 +63,7 @@ fn parity_analyze_particles_holes_edges_and_size_match_java_oracle() {
         session.insert_doc(source.clone());
         session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
         session.dispatch(Command::SetMeasurements { flags, precision: 3 }).unwrap();
-        session.dispatch(Command::AnalyzeParticles { options, clear_results: true, add_to_manager: true }).unwrap();
+        session.dispatch(Command::AnalyzeParticles { options, clear_results: true, add_to_manager: true, summarize: false }).unwrap();
         assert_eq!(session.results.rows.len(), oracle_rows.len(), "{macro_options}");
         for (rust, java) in session.results.rows.iter().zip(&oracle_rows) {
             for (actual, expected) in [rust.area, rust.mean, rust.x_centroid, rust.y_centroid,
@@ -106,7 +106,7 @@ fn parity_analyze_particles_calibrated_size_matches_java_oracle() {
     session.dispatch(Command::SetMeasurements { flags: MeasurementFlags::AREA | MeasurementFlags::MEAN, precision: 3 }).unwrap();
     session.dispatch(Command::AnalyzeParticles {
         options: ParticleAnalysisOptions { min_size: 3.0, max_size: 5.0, ..Default::default() },
-        clear_results: true, add_to_manager: false,
+        clear_results: true, add_to_manager: false, summarize: false,
     }).unwrap();
     assert_eq!(session.results.rows.len() as f64, java_value("COUNT="));
     assert_eq!(session.results.rows[0].area, java_value("AREA="));
@@ -125,10 +125,61 @@ fn parity_analyze_particles_full_byte_threshold_runs_once_like_java() {
     session.insert_doc(doc);
     session.dispatch(Command::SetThreshold { lower: 0.0, upper: 255.0 }).unwrap();
     session.dispatch(Command::AnalyzeParticles {
-        options: ParticleAnalysisOptions::default(), clear_results: true, add_to_manager: false,
+        options: ParticleAnalysisOptions::default(), clear_results: true, add_to_manager: false, summarize: false,
     }).unwrap();
     assert_eq!(session.results.rows.len() as f64, value("COUNT="));
     assert_eq!(session.results.rows[0].area, value("AREA="));
+}
+
+#[test]
+fn parity_analyze_particles_summary_matches_java_table() {
+    let mut pixels = vec![0_u8; 20 * 20];
+    pixels[2 * 20 + 2] = 255;
+    pixels[10 * 20 + 10] = 255;
+    let source = ImageDocument::new("summary-particles", 20, 20, PixelPlane::Gray8(pixels)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.tif");
+    save_tiff(&input, &source).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.eval_macro(&format!(
+        "open(\"{}\"); setThreshold(255,255); \
+         run(\"Set Measurements...\",\"area mean perimeter redirect=None decimal=3\"); \
+         run(\"Analyze Particles...\",\"size=0-Infinity circularity=0.00-1.00 show=Nothing display clear summarize\"); \
+         selectWindow(\"Summary\"); \
+         print(\"SCOUNT=\"+Table.get(\"Count\",0)); \
+         print(\"STOTAL=\"+Table.get(\"Total Area\",0)); \
+         print(\"SAVERAGE=\"+Table.get(\"Average Size\",0)); \
+         print(\"SPERCENT=\"+Table.get(\"%Area\",0)); \
+         print(\"SMEAN=\"+Table.get(\"Mean\",0)); \
+         print(\"SPERIM=\"+Table.get(\"Perim.\",0));",
+        input.display(),
+    )).unwrap();
+    let java_value = |prefix: &str| java.stdout.lines().find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("missing {prefix} in {}", java.stdout)).parse::<f64>().unwrap();
+    let mut session = Session::new();
+    session.insert_doc(source);
+    session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+    session.dispatch(Command::SetMeasurements {
+        flags: MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::PERIMETER,
+        precision: 3,
+    }).unwrap();
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions::default(), clear_results: true,
+        add_to_manager: false, summarize: true,
+    }).unwrap();
+    assert_eq!(session.particle_summaries.len(), 1);
+    let summary = &session.particle_summaries[0];
+    assert_eq!(summary.count as f64, java_value("SCOUNT="));
+    for (rust, prefix) in [
+        (summary.total_area, "STOTAL="),
+        (summary.average_size, "SAVERAGE="),
+        (summary.area_percent, "SPERCENT="),
+        (summary.means["Mean"], "SMEAN="),
+        (summary.means["Perim."], "SPERIM="),
+    ] {
+        assert!((rust - java_value(prefix)).abs() < 1e-3, "{prefix}: {rust} != {}", java_value(prefix));
+    }
+    assert!(session.macro_recorder.last().unwrap().contains("summarize"));
 }
 
 #[test]

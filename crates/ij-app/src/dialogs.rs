@@ -429,10 +429,11 @@ pub struct ParticleDialog {
     pub clear_results: bool,
     pub add_to_manager: bool,
     pub display_results: bool,
+    pub summarize: bool,
 }
 impl Default for ParticleDialog {
     fn default() -> Self {
         Self { open: false, options: Default::default(), clear_results: false,
-            add_to_manager: false, display_results: true }
+            add_to_manager: false, display_results: true, summarize: false }
     }
 }

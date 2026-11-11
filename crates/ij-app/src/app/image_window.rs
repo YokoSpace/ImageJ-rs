@@ -266,6 +266,9 @@ impl ImageJApp {
         if self.show_results_window {
             self.render_results_window(ctx);
         }
+        if self.show_particle_summary_window {
+            self.render_particle_summary_window(ctx);
+        }
 
         if self.quit_app {
             self.cancel_plugin_catalog_job();
@@ -396,6 +399,52 @@ impl ImageJApp {
         if !is_open {
             self.show_results_window = false;
         }
+    }
+
+    pub fn render_particle_summary_window(&mut self, ctx: &egui::Context) {
+        let mut is_open = true;
+        let rows = self.session.particle_summaries.clone();
+        let headings = ["Slice", "Count", "Total Area", "Average Size", "%Area",
+            "Mean", "Mode", "Perim.", "Major", "Minor", "Angle", "Circ.",
+            "Solidity", "IntDen", "Median", "Skew", "Kurt"];
+        let extra: Vec<&str> = headings[5..].iter().copied()
+            .filter(|heading| rows.iter().any(|row| row.means.contains_key(*heading)))
+            .collect();
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_particle_summary_window"),
+            egui::ViewportBuilder::default()
+                .with_title("Summary")
+                .with_inner_size([600.0, 230.0])
+                .with_resizable(true),
+            |ctx, _class| {
+                if ctx.input(|input| input.viewport().close_requested()) {
+                    is_open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        egui::Grid::new("particle_summary_grid").striped(true).show(ui, |ui| {
+                            for heading in &headings[..5] { ui.label(*heading); }
+                            for heading in &extra { ui.label(*heading); }
+                            ui.end_row();
+                            for row in &rows {
+                                ui.label(&row.slice);
+                                ui.label(row.count.to_string());
+                                for value in [row.total_area, row.average_size, row.area_percent] {
+                                    ui.label(ij_core::format_ij_num(value));
+                                }
+                                for heading in &extra {
+                                    ui.label(row.means.get(*heading)
+                                        .map(|value| ij_core::format_ij_num(*value))
+                                        .unwrap_or_default());
+                                }
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+            },
+        );
+        if !is_open { self.show_particle_summary_window = false; }
     }
 
     /// Renders an image window with canvas, pixel display, zoom, pan, ROI tools, and slice slider.

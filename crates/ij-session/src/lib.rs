@@ -7,7 +7,8 @@ pub use ij_bridge::plugin::{
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
     MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
-    AngleRoi, ParticleAnalysisOptions, PointRoi, Roi, StackBinaryOptions, ThresholdLevels,
+    AnalyzedParticle, AngleRoi, ParticleAnalysisOptions, PointRoi, Roi, StackBinaryOptions,
+    ThresholdLevels,
 };
 use ij_io::{ImageFileFormat, IoError, detect_image_format, load_image, save_jpeg, save_png, save_tiff};
 use ij_plugin_api::{PluginContext, RustImagePlugin};
@@ -27,6 +28,75 @@ pub struct NamedRoi {
     pub roi: Roi,
     pub source_image: ImageId,
     pub slice: u32,
+}
+
+/// One row of ImageJ's separate Analyze Particles `Summary` table.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParticleSummary {
+    pub slice: String,
+    pub count: usize,
+    pub total_area: f64,
+    pub average_size: f64,
+    pub area_percent: f64,
+    pub means: BTreeMap<String, f64>,
+}
+
+fn summarize_particles(
+    doc: &ImageDocument,
+    particles: &[AnalyzedParticle],
+    config: MeasurementConfig,
+) -> Result<ParticleSummary, CoreError> {
+    let total_pixels = match doc.roi.as_ref().filter(|roi| roi.is_area()) {
+        Some(roi) => match roi.raster_mask(doc.width, doc.height)? {
+            Some(mask) => mask.pixels.iter().filter(|&&inside| inside).count() as f64,
+            None => {
+                let (_, _, width, height) = roi.clipped_bounds(doc.width, doc.height)?;
+                f64::from(width) * f64::from(height)
+            }
+        },
+        None => f64::from(doc.width) * f64::from(doc.height),
+    };
+    let image_area = total_pixels * doc.calibration.pixel_width * doc.calibration.pixel_height;
+    let total_area: f64 = particles.iter().map(|particle| particle.measurement.area).sum();
+    let count = particles.len();
+    let mut means = BTreeMap::new();
+    let mut add_mean = |flag: u32, heading: &str, field: fn(&MeasurementSummary) -> f64| {
+        if config.contains(flag) {
+            let value = if count == 0 { f64::NAN } else {
+                particles.iter().map(|particle| field(&particle.measurement)).sum::<f64>()
+                    / count as f64
+            };
+            means.insert(heading.to_string(), value);
+        }
+    };
+    add_mean(MeasurementFlags::MEAN, "Mean", |row| row.mean);
+    add_mean(MeasurementFlags::MODE, "Mode", |row| row.mode);
+    add_mean(MeasurementFlags::PERIMETER, "Perim.", |row| row.perimeter);
+    add_mean(MeasurementFlags::ELLIPSE, "Major", |row| row.major);
+    add_mean(MeasurementFlags::ELLIPSE, "Minor", |row| row.minor);
+    add_mean(MeasurementFlags::ELLIPSE, "Angle", |row| row.ellipse_angle);
+    add_mean(MeasurementFlags::SHAPE_DESCRIPTORS, "Circ.", |row| row.circularity);
+    add_mean(MeasurementFlags::SHAPE_DESCRIPTORS, "Solidity", |row| row.solidity);
+    add_mean(MeasurementFlags::INTEGRATED_DENSITY, "IntDen", |row| row.int_den);
+    add_mean(MeasurementFlags::MEDIAN, "Median", |row| row.median);
+    add_mean(MeasurementFlags::SKEWNESS, "Skew", |row| row.skewness);
+    add_mean(MeasurementFlags::KURTOSIS, "Kurt", |row| row.kurtosis);
+    let slice = if doc.stack_size() > 1 {
+        doc.slice_labels.get((doc.current_slice - 1) as usize)
+            .and_then(|label| label.clone())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| doc.current_slice.to_string())
+    } else {
+        doc.title.clone()
+    };
+    Ok(ParticleSummary {
+        slice,
+        count,
+        total_area,
+        average_size: total_area / count as f64,
+        area_percent: total_area * 100.0 / image_area,
+        means,
+    })
 }
 
 // PlugInFilter.NO_CHANGES, NO_UNDO, DOES_STACKS and NO_UNDO_RESET
@@ -355,6 +425,7 @@ pub enum Command {
         options: ParticleAnalysisOptions,
         clear_results: bool,
         add_to_manager: bool,
+        summarize: bool,
     },
     /// `Analyze > Set Scale...` (ScaleDialog.java 80-108). The dialog fields
     /// become `Calibration.pixelWidth = known/distance`,
@@ -638,6 +709,7 @@ pub struct Session {
     pub previous_roi: Option<Roi>,
     pub roi_manager: Vec<NamedRoi>,
     pub roi_manager_selected: Vec<usize>,
+    pub particle_summaries: Vec<ParticleSummary>,
     /// Toolbar foreground color (default black), used by Edit > Fill / Draw
     /// (Editor.setColor / Toolbar.setForegroundColor).
     pub foreground_color: [u8; 3],
@@ -1870,9 +1942,14 @@ impl Session {
                 ));
                 Ok(CommandOutcome::Updated)
             }
-            Command::AnalyzeParticles { options, clear_results, add_to_manager } => {
+            Command::AnalyzeParticles { options, clear_results, add_to_manager, summarize } => {
                 let image_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
                 let particles = self.active_doc()?.analyze_particles(options, self.results.config)?;
+                let summary = if summarize {
+                    Some(summarize_particles(self.active_doc()?, &particles, self.results.config)?)
+                } else {
+                    None
+                };
                 if clear_results {
                     self.results.clear();
                 }
@@ -1888,6 +1965,9 @@ impl Session {
                     }
                     self.results.push(particle.measurement);
                 }
+                if let Some(summary) = summary {
+                    self.particle_summaries.push(summary);
+                }
                 let max_size = if options.max_size.is_infinite() { "Infinity".into() }
                     else { ij_core::format_ij_num(options.max_size) };
                 let mut macro_options = format!(
@@ -1899,6 +1979,7 @@ impl Session {
                 if options.exclude_on_edges { macro_options.push_str(" exclude"); }
                 if options.include_holes { macro_options.push_str(" include"); }
                 if add_to_manager { macro_options.push_str(" add"); }
+                if summarize { macro_options.push_str(" summarize"); }
                 self.macro_recorder.push(format!("run(\"Analyze Particles...\", \"{macro_options}\");"));
                 Ok(CommandOutcome::Updated)
             }
