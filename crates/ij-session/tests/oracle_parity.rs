@@ -1,7 +1,7 @@
 use ij_bridge::JavaOracleBridge;
 use ij_core::{
-    display_histogram, format_ij_num, DisplayHistogram, DisplayRange, ImageDocument, LineRoi,
-    Lut256, MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi,
+    display_histogram, format_ij_num, CoreError, DisplayHistogram, DisplayRange, ImageDocument,
+    LineRoi, Lut256, MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi,
     ThresholdLevels, Wand, WandMode,
 };
 use ij_io::{load_tiff, save_tiff};
@@ -9014,3 +9014,292 @@ fn parity_display_histogram_32bit_nonfinite_matches_java_oracle() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// M1 Image > Crop (original_imagej/ij/plugin/Resizer.java 25-195). Crop keeps
+// the ROI rectangle's pixel size as the new image size, so the calibration
+// ratio origWidth/newWidth at Resizer.java 160 is 1 for every crop here.
+// ---------------------------------------------------------------------------
+
+fn distinct_stack_16bit(width: u32, height: u32, depth: u32) -> ImageDocument {
+    let mut slices = Vec::new();
+    for s in 0..depth {
+        let mut pixels = vec![0u16; (width as usize) * (height as usize)];
+        for y in 0..height {
+            for x in 0..width {
+                pixels[(y * width + x) as usize] =
+                    ((x * 1237 + y * 7919 + s * 104729) % 65521) as u16;
+            }
+        }
+        slices.push(PixelPlane::Gray16(pixels));
+    }
+    ImageDocument::new_stack("stack16.tif", width, height, slices).unwrap()
+}
+
+#[test]
+fn parity_crop_gray8_rect_roi_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("crop8.tif", 10, 8).unwrap();
+    doc.set_rect_roi(2, 1, 4, 3).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(&doc, "makeRectangle(2,1,4,3); run(\"Crop\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.crop().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.get_dimensions(), oracle_doc.get_dimensions());
+    assert_eq!((doc.width, doc.height), (4, 3));
+    // Resizer only deletes the ROI for non-rectangular selections, and
+    // ImagePlus does not keep a rectangle whose bounds equal the new image
+    // (measured with the 1.54u oracle).
+    assert_eq!(doc.roi, None);
+}
+
+#[test]
+fn parity_crop_gray16_stack_matches_java_oracle_and_preserves_labels() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = distinct_stack_16bit(8, 6, 3);
+    doc.set_rect_roi(1, 2, 5, 3).unwrap();
+    doc.slice_labels = vec![
+        Some("first".into()),
+        Some("second".into()),
+        Some("third".into()),
+    ];
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "Property.setSliceLabel(\"first\",1); Property.setSliceLabel(\"second\",2); Property.setSliceLabel(\"third\",3); \
+             makeRectangle(1,2,5,3); run(\"Crop\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.crop().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.get_dimensions(), oracle_doc.get_dimensions());
+    assert_eq!(doc.slice_labels, oracle_doc.slice_labels);
+    assert_eq!(
+        doc.slice_labels,
+        vec![
+            Some("first".into()),
+            Some("second".into()),
+            Some("third".into())
+        ]
+    );
+    assert_eq!((doc.width, doc.height), (5, 3));
+    assert_eq!(doc.roi, None);
+}
+
+#[test]
+fn parity_crop_oval_roi_is_relocated_to_origin() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("crop_oval.tif", 10, 8).unwrap();
+    doc.set_oval_roi(2, 1, 4, 3).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeOval(2,1,4,3); run(\"Crop\"); \
+             getSelectionBounds(x,y,w,h); \
+             print(\"TYPE:\"+selectionType()+\";BOUNDS:\"+x+\",\"+y+\",\"+w+\",\"+h);",
+        )
+        .unwrap();
+    let oracle_roi = oracle_line(&oracle.stdout, "TYPE:");
+    assert_eq!(oracle_roi, "TYPE:1;BOUNDS:0,0,4,3");
+
+    doc.crop().unwrap();
+    assert_eq!(
+        doc.roi,
+        Some(Roi::Oval(RectRoi {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 3
+        }))
+    );
+    assert_eq!((doc.width, doc.height), (4, 3));
+}
+
+#[test]
+fn parity_crop_preserves_calibration_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("crop_cal.tif", 10, 8).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    doc.calibration.unit = "mm".to_string();
+    doc.set_rect_roi(2, 1, 4, 3).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(&doc, "makeRectangle(2,1,4,3); run(\"Crop\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    assert_eq!(oracle_doc.calibration.pixel_width, 0.5);
+    assert_eq!(oracle_doc.calibration.pixel_height, 0.25);
+    assert_eq!(oracle_doc.calibration.unit, "mm");
+
+    doc.crop().unwrap();
+    assert_eq!(doc.calibration, oracle_doc.calibration);
+}
+
+#[test]
+fn parity_crop_float_rgb_and_indexed_pixels_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    let float_doc = ImageDocument::new_ramp_32bit("crop32.tif", 10, 8).unwrap();
+    let rgb_doc = ImageDocument::new(
+        "crop_rgb.tif",
+        10,
+        8,
+        PixelPlane::ColorRgb(
+            (0..80)
+                .map(|i| 0xff00_0000 | ((i * 17) << 16) | ((i * 29) << 8) | (i * 43))
+                .collect(),
+        ),
+    )
+    .unwrap();
+    let lut = Lut256 {
+        r: (0..=255).map(|i| i as u8).collect(),
+        g: (0..=255).map(|i| 255 - i as u8).collect(),
+        b: (0..=255).map(|i| ((i * 7) % 256) as u8).collect(),
+    };
+    let indexed_doc = ImageDocument::new(
+        "crop_indexed.tif",
+        10,
+        8,
+        PixelPlane::Color256 {
+            pixels: (0..80).map(|i| ((i * 13) % 256) as u8).collect(),
+            lut: Box::new(lut.clone()),
+        },
+    )
+    .unwrap();
+
+    for (name, mut doc) in [
+        ("32-bit", float_doc),
+        ("RGB", rgb_doc),
+        ("8-bit color", indexed_doc),
+    ] {
+        doc.set_rect_roi(2, 1, 6, 4).unwrap();
+        let oracle = bridge
+            .run_macro_on_image(&doc, "makeRectangle(2,1,6,4); run(\"Crop\");")
+            .unwrap();
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.crop().unwrap();
+        assert_eq!(doc.slices, oracle_doc.slices, "{name}: crop pixels differ");
+        assert_eq!(
+            doc.get_dimensions(),
+            oracle_doc.get_dimensions(),
+            "{name}: crop dimensions differ"
+        );
+        if name == "8-bit color" {
+            assert_eq!(
+                match doc.plane() {
+                    PixelPlane::Color256 { lut, .. } => lut.as_ref(),
+                    other => panic!("expected Color256 after crop, got {other:?}"),
+                },
+                &lut,
+                "crop must keep the Color256 LUT"
+            );
+        }
+    }
+}
+
+#[test]
+fn session_crop_records_macro_and_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new_ramp_8bit("session_crop.tif", 10, 8).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(&source, "makeRectangle(2,1,4,3); run(\"Crop\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    let path = temp_tiff("session_crop.tif");
+    save_tiff(&path, &source).unwrap();
+    let mut session = Session::new();
+    session.dispatch(Command::OpenTiff { path }).unwrap();
+    session.macro_recorder.clear();
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        })
+        .unwrap();
+    session.macro_recorder.clear();
+    session.dispatch(Command::Crop).unwrap();
+
+    let doc = session.active_doc().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.get_dimensions(), oracle_doc.get_dimensions());
+    assert_eq!(doc.roi, None);
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"Crop\");".to_string()],
+        "Crop must record exactly one macro line without a trailing newline"
+    );
+}
+
+#[test]
+fn parity_crop_polygon_roi_is_relocated_to_origin() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("crop_polygon.tif", 10, 8).unwrap();
+    doc.set_polygon_roi(&[(3, 2), (7, 2), (7, 6), (3, 6)])
+        .unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makePolygon(3,2,7,2,7,6,3,6); run(\"Crop\");              getSelectionBounds(x,y,w,h);              print(\"TYPE:\"+selectionType()+\";BOUNDS:\"+x+\",\"+y+\",\"+w+\",\"+h);",
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "TYPE:"), "TYPE:2;BOUNDS:0,0,4,4");
+
+    doc.crop().unwrap();
+    assert_eq!(
+        doc.roi,
+        Some(Roi::Polygon(PolygonRoi {
+            xpoints: vec![0, 4, 4, 0],
+            ypoints: vec![0, 0, 4, 4],
+        }))
+    );
+    assert_eq!((doc.width, doc.height), (4, 4));
+}
+
+#[test]
+fn crop_rejects_missing_line_and_outside_selections() {
+    let mut doc = ImageDocument::new_ramp_8bit("crop_errors.tif", 10, 8).unwrap();
+    assert_eq!(
+        doc.crop(),
+        Err(CoreError::InvalidOperation("Area selection required"))
+    );
+
+    doc.set_line_roi(1, 1, 5, 4);
+    assert_eq!(
+        doc.crop(),
+        Err(CoreError::InvalidOperation("Area selection required"))
+    );
+
+    // Resizer.java 52-61 rejects a selection whose intersection with the
+    // image is empty.
+    doc.set_rect_roi(20, 20, 4, 4).unwrap();
+    assert_eq!(
+        doc.crop(),
+        Err(CoreError::InvalidOperation("Selection is outside image"))
+    );
+}

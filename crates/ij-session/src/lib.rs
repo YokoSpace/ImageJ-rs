@@ -136,6 +136,9 @@ pub enum Command {
         index: i32,
     },
     Invert,
+    /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
+    /// clipped area-selection bounds and records `run("Crop");`.
+    Crop,
     Smooth,
     Sharpen,
     FindEdges,
@@ -714,6 +717,12 @@ impl Session {
                     self.macro_recorder.push("run(\"Invert\");".into());
                 }
                 self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Crop => {
+                self.active_doc_mut()?.crop()?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Crop\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Smooth => {

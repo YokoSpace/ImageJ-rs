@@ -14,6 +14,7 @@ pub enum AppAction {
     Quit,
     Undo,
     Invert,
+    Crop,
     SelectNone,
     BrightnessContrast,
     Threshold,
@@ -132,7 +133,7 @@ const IMAGE_MENU: &[MenuNode] = &[
     submenu("Stacks", IMAGE_STACKS),
     unsupported("Type > 8-bit", None),
     unsupported("Duplicate...", None),
-    unsupported("Crop", None),
+    item("Crop", Some("Shift+X"), AppAction::Crop),
 ];
 
 const PROCESS_FILTERS: &[MenuNode] = &[
@@ -242,6 +243,10 @@ impl ImageJApp {
                 };
                 match action {
                     BrightnessContrast if matches!(doc.plane(), PixelPlane::ColorRgb(_)) => Err("B&C is not supported on RGB images".into()),
+                    Crop => match doc.roi.as_ref() {
+                        Some(roi) if roi.is_area() => Ok(()),
+                        _ => Err("Area selection required".into()),
+                    },
                     Threshold if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_)) || doc.stack_size() != 1 => Err("Threshold is only supported on single-slice 8-bit or 16-bit grayscale images".into()),
                     Median if !matches!(doc.plane(), PixelPlane::Gray8(_)) => Err("Median requires an 8-bit image".into()),
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
@@ -303,6 +308,9 @@ impl ImageJApp {
             }
             Invert => {
                 let _ = self.invert_active();
+            }
+            Crop => {
+                let _ = self.crop_active();
             }
             SelectNone => {
                 let _ = self.clear_roi();

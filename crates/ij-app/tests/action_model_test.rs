@@ -51,3 +51,89 @@ fn menu_has_the_classic_top_level_order() {
         ]
     );
 }
+
+#[test]
+fn crop_requires_an_area_selection() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::Crop).is_err());
+
+    let _id = app.open_ramp_8bit("gray", 8, 6).unwrap();
+    assert!(app.action_enabled(AppAction::Crop).is_err());
+
+    app.session
+        .dispatch(ij_session::Command::MakeLineRoi {
+            x1: 1,
+            y1: 1,
+            x2: 5,
+            y2: 4,
+        })
+        .unwrap();
+    assert!(
+        app.action_enabled(AppAction::Crop).is_err(),
+        "line selections are not areas"
+    );
+
+    app.session
+        .dispatch(ij_session::Command::MakeRectRoi {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        })
+        .unwrap();
+    assert!(app.action_enabled(AppAction::Crop).is_ok());
+
+    app.session
+        .dispatch(ij_session::Command::MakeOvalRoi {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        })
+        .unwrap();
+    assert!(app.action_enabled(AppAction::Crop).is_ok());
+}
+
+#[test]
+fn crop_action_crops_the_active_document_and_records_the_macro() {
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("gray", 8, 6).unwrap();
+    app.session
+        .dispatch(ij_session::Command::MakeRectRoi {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        })
+        .unwrap();
+
+    app.perform(AppAction::Crop, &Context::default());
+
+    let doc = app.session.get_image(id).unwrap();
+    assert_eq!((doc.width, doc.height), (4, 3));
+    assert_eq!(doc.roi, None);
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Crop\");")
+    );
+}
+
+#[test]
+fn image_menu_wires_crop_with_shift_x() {
+    let image = MENU_TREE
+        .iter()
+        .find(|node| node.label == "Image")
+        .expect("Image menu");
+    let ij_app::action::MenuKind::Submenu(nodes) = image.kind else {
+        panic!("Image must be a submenu");
+    };
+    let crop = nodes
+        .iter()
+        .find(|node| node.label == "Crop")
+        .expect("Crop item");
+    assert_eq!(crop.shortcut, Some("Shift+X"));
+    assert!(matches!(
+        crop.kind,
+        ij_app::action::MenuKind::Item(AppAction::Crop)
+    ));
+}

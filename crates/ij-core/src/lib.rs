@@ -49,6 +49,8 @@ pub enum CoreError {
     },
     #[error("empty selection or no pixels inside threshold")]
     EmptySelection,
+    #[error("{0}")]
+    InvalidOperation(&'static str),
     #[error("polygon ROI needs at least 3 non-collinear points")]
     InvalidPolygon,
     #[error("measurement of {0} ROIs is not implemented")]
@@ -1111,6 +1113,61 @@ impl ImageDocument {
         self.roi = None;
     }
 
+    /// Crops every stack plane to the area selection's clipped bounds
+    /// (Resizer.java 25-195, StackProcessor.java 137-152). A rectangular
+    /// selection is cleared; oval and polygon selections move to (0, 0).
+    pub fn crop(&mut self) -> Result<(), CoreError> {
+        let roi = self
+            .roi
+            .clone()
+            .ok_or(CoreError::InvalidOperation("Area selection required"))?;
+        if !roi.is_area() {
+            return Err(CoreError::InvalidOperation("Area selection required"));
+        }
+        let (x, y, width, height) = roi
+            .clipped_bounds(self.width, self.height)
+            .map_err(|_| CoreError::InvalidOperation("Selection is outside image"))?;
+        if width == 0 || height == 0 {
+            return Err(CoreError::InvalidOperation("Selection is outside image"));
+        }
+
+        // Undo.setup(Undo.TRANSFORM, imp) runs before the resize and only for
+        // single-slice images (Resizer.java 145-146). Whole-stack filters
+        // clear ImageJ's undo state.
+        if self.stack_size() == 1 {
+            self.save_snapshot();
+        } else {
+            self.snapshot = None;
+        }
+
+        let source_width = self.width;
+        let source_slices = std::mem::take(&mut self.slices);
+        self.slices = source_slices
+            .iter()
+            .map(|plane| crop_plane(plane, source_width, x, y, width, height))
+            .collect();
+        self.width = width;
+        self.height = height;
+
+        self.roi = match roi {
+            Roi::Rect(_) => None,
+            Roi::Oval(r) => Some(Roi::Oval(RectRoi {
+                x: 0,
+                y: 0,
+                width: r.width,
+                height: r.height,
+            })),
+            // roi.setLocation(0, 0) moves the polygon points relative to the
+            // crop origin (Resizer.java 181-183).
+            Roi::Polygon(p) => Some(Roi::Polygon(PolygonRoi {
+                xpoints: p.xpoints.iter().map(|px| px - x as i32).collect(),
+                ypoints: p.ypoints.iter().map(|py| py - y as i32).collect(),
+            })),
+            Roi::Line(_) => unreachable!("line ROIs are rejected above"),
+        };
+        Ok(())
+    }
+
     pub fn save_snapshot(&mut self) {
         self.snapshot = Some(self.slices.clone());
     }
@@ -1885,6 +1942,72 @@ impl ImageDocument {
             }
         }
         finish_moments(count as f64, mean, sum1, sum2, sum3, sum4, xsum, ysum)
+    }
+}
+
+fn crop_rows<T: Copy>(
+    src: &[T],
+    source_width: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Vec<T> {
+    let mut out = Vec::with_capacity(width * height);
+    for row in 0..height {
+        let start = (y + row) * source_width + x;
+        out.extend_from_slice(&src[start..start + width]);
+    }
+    out
+}
+
+fn crop_plane(
+    plane: &PixelPlane,
+    source_width: u32,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> PixelPlane {
+    let source_width = source_width as usize;
+    let (x, y, width, height) = (x as usize, y as usize, width as usize, height as usize);
+    match plane {
+        PixelPlane::Gray8(pixels) => PixelPlane::Gray8(crop_rows(
+            pixels,
+            source_width,
+            x,
+            y,
+            width,
+            height,
+        )),
+        PixelPlane::Color256 { pixels, lut } => PixelPlane::Color256 {
+            pixels: crop_rows(pixels, source_width, x, y, width, height),
+            lut: lut.clone(),
+        },
+        PixelPlane::Gray16(pixels) => PixelPlane::Gray16(crop_rows(
+            pixels,
+            source_width,
+            x,
+            y,
+            width,
+            height,
+        )),
+        PixelPlane::Gray32(pixels) => PixelPlane::Gray32(crop_rows(
+            pixels,
+            source_width,
+            x,
+            y,
+            width,
+            height,
+        )),
+        PixelPlane::ColorRgb(pixels) => PixelPlane::ColorRgb(crop_rows(
+            pixels,
+            source_width,
+            x,
+            y,
+            width,
+            height,
+        )),
     }
 }
 
