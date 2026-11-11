@@ -3140,6 +3140,481 @@ fn base_fixture_entries(
     ]
 }
 
+// P3.9a: independent JDK TIFF encoders supply compressed strips. Expected
+// pixels always come from ImageJ 1.54u opening the assembled TIFF itself.
+fn compressed_tiff_oracle() -> JavaOracleBridge {
+    let root = std::env::var_os("IJ_TIFF_ORACLE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(repo_root);
+    JavaOracleBridge::locate_from_repo_root(root).unwrap()
+}
+
+fn encode_tiff_fixture_strips(dir: &std::path::Path) {
+    let source = r#"
+import java.awt.image.*;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import javax.imageio.*;
+import javax.imageio.stream.*;
+import javax.imageio.plugins.tiff.*;
+public class CompressedTiffEncoders {
+    public static void main(String[] args) throws Exception {
+        Path dir = Paths.get("__DIR__");
+        try (var paths = Files.list(dir)) {
+            for (Path path : paths.filter(p -> p.toString().endsWith(".raw")).toList()) {
+                byte[] raw = Files.readAllBytes(path);
+                String type = path.getFileName().toString().split("_")[0];
+                BufferedImage image = new BufferedImage(raw.length, 1, BufferedImage.TYPE_BYTE_GRAY);
+                System.arraycopy(raw, 0, ((DataBufferByte)image.getRaster().getDataBuffer()).getData(), 0, raw.length);
+                ImageWriter writer = ImageIO.getImageWritersByFormatName("TIFF").next();
+                ImageWriteParam param = writer.getDefaultWriteParam();
+                param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+                param.setCompressionType(type);
+                ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+                try (ImageOutputStream out = new MemoryCacheImageOutputStream(bytes)) {
+                    writer.setOutput(out);
+                    writer.write(null, new IIOImage(image, null, null), param);
+                } finally { writer.dispose(); }
+                byte[] tiff = bytes.toByteArray();
+                ImageReader reader = ImageIO.getImageReadersByFormatName("TIFF").next();
+                try (ImageInputStream in = new MemoryCacheImageInputStream(new ByteArrayInputStream(tiff))) {
+                    reader.setInput(in);
+                    TIFFDirectory tags = TIFFDirectory.createFromMetadata(reader.getImageMetadata(0));
+                    TIFFField offsets = tags.getTIFFField(273), counts = tags.getTIFFField(279);
+                    if (offsets.getCount()!=1) throw new AssertionError("expected one strip");
+                    TIFFField predictor = tags.getTIFFField(317);
+                    if (predictor!=null && predictor.getAsInt(0)!=1) throw new AssertionError("unexpected predictor");
+                    int start = (int)offsets.getAsLong(0), length = (int)counts.getAsLong(0);
+                    Files.write(Paths.get(path.toString()+".encoded"), Arrays.copyOfRange(tiff, start, start+length));
+                } finally { reader.dispose(); }
+            }
+        }
+    }
+}
+"#.replace("__DIR__", &dir.to_string_lossy());
+    let suffix: String = dir
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let class_name = format!("CompressedTiffEncoders{suffix}");
+    run_java_harness(
+        &class_name,
+        &source.replace("CompressedTiffEncoders", &class_name),
+    );
+}
+
+struct CompressedTiffFixture {
+    width: u32,
+    height: u32,
+    bits: u16,
+    samples: u16,
+    compression: u16,
+    predictor: u16,
+    rows: u32,
+    le: bool,
+    strips: Vec<Vec<u8>>,
+    description: Option<String>,
+}
+
+fn compressed_tiff_fixture(fixture: &CompressedTiffFixture) -> Vec<u8> {
+    compressed_tiff_fixture_at(fixture, 0)
+}
+
+fn compressed_tiff_fixture_at(f: &CompressedTiffFixture, base: u32) -> Vec<u8> {
+    let word = |v: u32| {
+        if f.le {
+            v.to_le_bytes()
+        } else {
+            v.to_be_bytes()
+        }
+    };
+    let mut out = if f.le { b"II".to_vec() } else { b"MM".to_vec() };
+    out.extend_from_slice(&if f.le {
+        42u16.to_le_bytes()
+    } else {
+        42u16.to_be_bytes()
+    });
+    out.extend_from_slice(&[0; 4]);
+    let mut offsets = Vec::new();
+    for strip in &f.strips {
+        // Gaps ensure strip offsets, rather than physical contiguity, are used.
+        out.extend_from_slice(&[0x5a; 6]);
+        offsets.push(base + out.len() as u32);
+        out.extend_from_slice(strip);
+    }
+    let mut entries = vec![
+        (256, 4, 1, f.width),
+        (257, 4, 1, f.height),
+        (258, 3, 1, u32::from(f.bits)),
+        (259, 3, 1, u32::from(f.compression)),
+        (262, 3, 1, if f.samples == 3 { 2 } else { 1 }),
+        (273, 4, f.strips.len() as u32, offsets[0]),
+        (277, 3, 1, u32::from(f.samples)),
+        (278, 4, 1, f.rows),
+        (279, 4, f.strips.len() as u32, f.strips[0].len() as u32),
+        (317, 3, 1, u32::from(f.predictor)),
+        (339, 3, 1, 1),
+    ];
+    if f.strips.len() > 1 {
+        entries[5].3 = base + out.len() as u32;
+        for offset in offsets {
+            out.extend_from_slice(&word(offset));
+        }
+        entries[8].3 = base + out.len() as u32;
+        for strip in &f.strips {
+            out.extend_from_slice(&word(strip.len() as u32));
+        }
+    }
+    if let Some(description) = &f.description {
+        entries.push((
+            270,
+            2,
+            description.len() as u32 + 1,
+            base + out.len() as u32,
+        ));
+        out.extend_from_slice(description.as_bytes());
+        out.push(0);
+    }
+    if out.len() % 2 == 1 {
+        out.push(0);
+    }
+    let ifd_offset = base + out.len() as u32;
+    out[4..8].copy_from_slice(&word(ifd_offset));
+    if f.le {
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    } else {
+        out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+    }
+    entries.sort_by_key(|e| e.0);
+    for (tag, field, count, value) in entries {
+        if f.le {
+            push_tiff_entry(&mut out, tag, field, count, value);
+        } else {
+            push_big_endian_tiff_entry(&mut out, tag, field, count, value);
+        }
+    }
+    out.extend_from_slice(&[0; 4]);
+    out
+}
+
+fn assert_compressed_tiffs_match_oracle(paths: &[PathBuf]) {
+    let mut macro_text = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        macro_text.push_str(&format!(
+            "open(\"{}\"); print(\"TIFF_{index}:\"+getWidth()+\",\"+getHeight()+\",\"+bitDepth()+\",\"+nSlices); \
+             for(s=1;s<=nSlices;s++) {{ setSlice(s); for(y=0;y<getHeight();y++) for(x=0;x<getWidth();x++) print(\"PX:\"+d2s(getPixel(x,y),0)); }} close();\n",
+            path.display()
+        ));
+    }
+    let oracle = compressed_tiff_oracle().eval_macro(&macro_text).unwrap();
+    let mut lines = oracle.stdout.lines();
+    for (index, path) in paths.iter().enumerate() {
+        let mut session = Session::new();
+        session
+            .dispatch(Command::OpenTiff { path: path.clone() })
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let doc = session.active_doc().unwrap();
+        let bits = match doc.slices[0] {
+            PixelPlane::Gray16(_) => 16,
+            PixelPlane::ColorRgb(_) => 24,
+            _ => 8,
+        };
+        assert_eq!(
+            lines.next().unwrap(),
+            format!(
+                "TIFF_{index}:{},{},{bits},{}",
+                doc.width,
+                doc.height,
+                doc.slices.len()
+            ),
+            "{}",
+            path.display()
+        );
+        for plane in &doc.slices {
+            let values: Vec<u32> = match plane {
+                PixelPlane::Gray8(v) => v.iter().map(|&v| u32::from(v)).collect(),
+                PixelPlane::Gray16(v) => v.iter().map(|&v| u32::from(v)).collect(),
+                PixelPlane::ColorRgb(v) => v.iter().map(|&v| v & 0xffffff).collect(),
+                _ => panic!("unexpected fixture pixel type"),
+            };
+            for (pixel, value) in values.into_iter().enumerate() {
+                let java: i64 = lines
+                    .next()
+                    .unwrap()
+                    .strip_prefix("PX:")
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let java = if bits == 24 {
+                    java as u32 & 0xffffff
+                } else {
+                    java as u32
+                };
+                assert_eq!(value, java, "{} pixel {pixel}", path.display());
+            }
+        }
+    }
+    assert!(lines.next().is_none());
+}
+
+#[test]
+fn parity_compressed_tiff_codecs_predictor_endianness_and_strips() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixtures = Vec::new();
+    for (compression, codec) in [
+        (32773, "PackBits"),
+        (8, "ZLib"),
+        (32946, "Deflate"),
+        (5, "LZW"),
+    ] {
+        for (bits, samples) in [(8, 1), (16, 1), (8, 3)] {
+            for le in [true, false] {
+                for predictor in [1, 2] {
+                    for (width, rows) in [(7usize, 2), (7, 5), (1, 2)] {
+                        let height = 5usize;
+                        let stride = width * samples * (bits / 8);
+                        let mut raw = Vec::new();
+                        for y in 0..height {
+                            for x in 0..width {
+                                for c in 0..samples {
+                                    let value = (x * 193
+                                        + y * 71
+                                        + c * 103
+                                        + if x % 3 == 0 { 65500 } else { 0 })
+                                        as u16;
+                                    if bits == 16 {
+                                        raw.extend_from_slice(&if le {
+                                            value.to_le_bytes()
+                                        } else {
+                                            value.to_be_bytes()
+                                        });
+                                    } else {
+                                        raw.push(value as u8);
+                                    }
+                                }
+                            }
+                        }
+                        if predictor == 2 && compression != 32773 {
+                            for row in raw.chunks_exact_mut(stride) {
+                                if bits == 16 {
+                                    for x in (1..width).rev() {
+                                        let read = |i| {
+                                            if le {
+                                                u16::from_le_bytes([row[i], row[i + 1]])
+                                            } else {
+                                                u16::from_be_bytes([row[i], row[i + 1]])
+                                            }
+                                        };
+                                        let value = read(x * 2).wrapping_sub(read((x - 1) * 2));
+                                        row[x * 2..x * 2 + 2].copy_from_slice(&if le {
+                                            value.to_le_bytes()
+                                        } else {
+                                            value.to_be_bytes()
+                                        });
+                                    }
+                                } else {
+                                    for i in (samples..stride).rev() {
+                                        row[i] = row[i].wrapping_sub(row[i - samples]);
+                                    }
+                                }
+                            }
+                        }
+                        let id = fixtures.len();
+                        let mut strips = Vec::new();
+                        for (s, strip) in raw.chunks(stride * rows).enumerate() {
+                            let path = dir.path().join(format!("{codec}_{id}_{s}.raw"));
+                            std::fs::write(&path, strip).unwrap();
+                            strips.push(path);
+                        }
+                        fixtures.push((format!("compressed_{id}_{codec}_{bits}_{samples}_{le}_{predictor}_{rows}.tif"),
+                            CompressedTiffFixture { width: width as u32, height: height as u32, bits: bits as u16, samples: samples as u16,
+                                compression, predictor, rows: rows as u32, le, strips: Vec::new(), description: None }, strips));
+                    }
+                }
+            }
+        }
+    }
+    encode_tiff_fixture_strips(dir.path());
+    let mut paths = Vec::new();
+    for (name, mut fixture, strips) in fixtures {
+        fixture.strips = strips
+            .iter()
+            .map(|p| std::fs::read(format!("{}.encoded", p.display())).unwrap())
+            .collect();
+        paths.push(write_fixture(&name, &compressed_tiff_fixture(&fixture)));
+    }
+    assert_compressed_tiffs_match_oracle(&paths);
+}
+
+#[test]
+fn parity_compressed_tiff_high_expansion_and_lzw_dictionary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixtures = Vec::new();
+    for codec in ["PackBits", "ZLib", "Deflate", "LZW"] {
+        for repeated in [true, false] {
+            let raw: Vec<u8> = (0..32768u32)
+                .map(|i| {
+                    if repeated {
+                        71
+                    } else {
+                        ((i.wrapping_mul(1664525)
+                            .wrapping_add(i.wrapping_mul(i).wrapping_mul(17)))
+                            >> 16) as u8
+                    }
+                })
+                .collect();
+            let path = dir.path().join(format!("{codec}_{repeated}.raw"));
+            std::fs::write(&path, &raw).unwrap();
+            fixtures.push((codec, repeated, path));
+        }
+    }
+    encode_tiff_fixture_strips(dir.path());
+    let mut paths = Vec::new();
+    for (codec, repeated, path) in fixtures {
+        let compression = match codec {
+            "PackBits" => 32773,
+            "ZLib" => 8,
+            "Deflate" => 32946,
+            _ => 5,
+        };
+        let strip = std::fs::read(format!("{}.encoded", path.display())).unwrap();
+        if repeated {
+            assert!(strip.len() < 32768 / 8);
+        }
+        paths.push(write_fixture(
+            &format!("compressed_expansion_{codec}_{repeated}.tif"),
+            &compressed_tiff_fixture(&CompressedTiffFixture {
+                width: 256,
+                height: 128,
+                bits: 8,
+                samples: 1,
+                compression,
+                predictor: 1,
+                rows: 128,
+                le: true,
+                strips: vec![strip],
+                description: None,
+            }),
+        ));
+    }
+    assert_compressed_tiffs_match_oracle(&paths);
+}
+
+#[test]
+fn parity_compressed_tiff_stacks_and_imagej_description() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fixtures = Vec::new();
+    for (compression, codec) in [
+        (32773, "PackBits"),
+        (8, "ZLib"),
+        (32946, "Deflate"),
+        (5, "LZW"),
+    ] {
+        for (bits, samples) in [(8, 1), (16, 1), (8, 3)] {
+            let mut inputs = Vec::new();
+            for slice in 0..2 {
+                let raw: Vec<u8> = (0..7 * 5 * samples * (bits / 8))
+                    .map(|i| ((i * 17 + slice * 31) % 256) as u8)
+                    .collect();
+                let path = dir
+                    .path()
+                    .join(format!("{codec}_{bits}_{samples}_{slice}.raw"));
+                std::fs::write(&path, &raw).unwrap();
+                inputs.push(path);
+            }
+            fixtures.push((compression, codec, bits, samples, inputs));
+        }
+    }
+    encode_tiff_fixture_strips(dir.path());
+    let mut paths = Vec::new();
+    for (compression, codec, bits, samples, inputs) in fixtures {
+        let mut f = CompressedTiffFixture {
+            width: 7,
+            height: 5,
+            bits,
+            samples,
+            compression,
+            predictor: 1,
+            rows: 5,
+            le: true,
+            strips: vec![std::fs::read(format!("{}.encoded", inputs[0].display())).unwrap()],
+            // TiffDecoder.saveImageDescription ignores images= for compression.
+            description: Some("ImageJ=1.54u\nimages=99\nunit=mm\nmin=3\nmax=200\n".into()),
+        };
+        let mut bytes = compressed_tiff_fixture(&f);
+        paths.push(write_fixture(
+            &format!("compressed_desc_{codec}_{bits}_{samples}.tif"),
+            &bytes,
+        ));
+        f.strips = vec![std::fs::read(format!("{}.encoded", inputs[1].display())).unwrap()];
+        f.description = None;
+        let second = compressed_tiff_fixture_at(&f, bytes.len() as u32);
+        let next_position = bytes.len() - 4;
+        bytes[next_position..].copy_from_slice(&second[4..8]);
+        bytes.extend_from_slice(&second);
+        paths.push(write_fixture(
+            &format!("compressed_stack_{codec}_{bits}_{samples}.tif"),
+            &bytes,
+        ));
+    }
+    assert_compressed_tiffs_match_oracle(&paths);
+}
+
+#[test]
+fn parity_compressed_tiff_packbits_controls_and_lzw_clear_codes() {
+    let mut packbits = vec![128, 127]; // -128 is a no-op; 127 copies 128 literals.
+    packbits.extend(0..128);
+    packbits.extend_from_slice(&[129, 91, 0, 7]); // -127 repeats 128 bytes; 0 copies one.
+    let mut paths = vec![write_fixture(
+        "compressed_packbits_controls.tif",
+        &compressed_tiff_fixture(&CompressedTiffFixture {
+            width: 257,
+            height: 1,
+            bits: 8,
+            samples: 1,
+            compression: 32773,
+            predictor: 1,
+            rows: 1,
+            le: true,
+            strips: vec![packbits],
+            description: None,
+        }),
+    )];
+    for (name, width, codes) in [
+        ("clear", 4, vec![256u16, 65, 66, 256, 67, 68, 257]),
+        ("next_symbol", 3, vec![256u16, 65, 258, 257]),
+        ("no_eoi", 3, vec![256u16, 65, 258]),
+    ] {
+        let mut encoded = vec![0; (codes.len() * 9).div_ceil(8)];
+        for (i, code) in codes.iter().enumerate() {
+            for bit in 0..9 {
+                encoded[(i * 9 + bit) / 8] |=
+                    (((code >> (8 - bit)) & 1) as u8) << (7 - (i * 9 + bit) % 8);
+            }
+        }
+        paths.push(write_fixture(
+            &format!("compressed_lzw_{name}.tif"),
+            &compressed_tiff_fixture(&CompressedTiffFixture {
+                width,
+                height: 1,
+                bits: 8,
+                samples: 1,
+                compression: 5,
+                predictor: 1,
+                rows: 1,
+                le: true,
+                strips: vec![encoded],
+                description: None,
+            }),
+        ));
+    }
+    assert_compressed_tiffs_match_oracle(&paths);
+}
+
 fn description_blob(description: &str) -> Vec<u8> {
     let mut bytes = description.as_bytes().to_vec();
     bytes.push(0);

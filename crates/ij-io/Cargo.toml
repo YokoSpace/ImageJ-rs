@@ -8,3 +8,5 @@ license.workspace = true
 ij-core = { path = "../ij-core" }
 serde.workspace = true
 thiserror.workspace = true
+flate2 = "1.1"
+weezl = "0.1"

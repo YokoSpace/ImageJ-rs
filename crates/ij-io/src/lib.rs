@@ -38,6 +38,7 @@ const TAG_X_RESOLUTION: u16 = 282;
 const TAG_Y_RESOLUTION: u16 = 283;
 const TAG_PLANAR_CONFIG: u16 = 284;
 const TAG_RESOLUTION_UNIT: u16 = 296;
+const TAG_PREDICTOR: u16 = 317;
 const TAG_COLOR_MAP: u16 = 320;
 const TAG_TILE_WIDTH: u16 = 322;
 const TAG_TILE_LENGTH: u16 = 323;
@@ -70,6 +71,167 @@ const ROI_SUB_PIXEL_RESOLUTION: u16 = 128;
 
 const NUM_IFD_TAGS: u16 = 10;
 const HEADER_SIZE: u32 = 8;
+
+// Compressed pixel bytes need an independent bound: their size is no longer
+// bounded by the input file length. Share this budget across the whole stack.
+const MAX_DECODED_TIFF_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+enum TiffCompression {
+    None,
+    PackBits,
+    Lzw,
+    Deflate,
+}
+
+impl TiffCompression {
+    fn from_tag(tag: u16) -> Result<Self, IoError> {
+        match tag {
+            0 | 1 => Ok(Self::None),
+            32773 => Ok(Self::PackBits),
+            5 => Ok(Self::Lzw),
+            8 | 32946 => Ok(Self::Deflate),
+            _ => Err(IoError::UnsupportedFormat(format!(
+                "TIFF Compression={tag}"
+            ))),
+        }
+    }
+
+    fn is_compressed(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+fn decompress_tiff_strip(
+    input: &[u8],
+    compression: TiffCompression,
+    expected: usize,
+) -> Result<Vec<u8>, IoError> {
+    let malformed = |message: &str| IoError::Malformed(format!("compressed TIFF strip: {message}"));
+    let mut output = Vec::new();
+    match compression {
+        TiffCompression::None => unreachable!("uncompressed strips are copied directly"),
+        TiffCompression::PackBits => {
+            let mut position = 0;
+            while output.len() < expected && position < input.len() {
+                let control = input[position] as i8;
+                position += 1;
+                match control {
+                    0..=127 => {
+                        let count = control as usize + 1;
+                        let end = position + count;
+                        let literal = input
+                            .get(position..end)
+                            .ok_or_else(|| malformed("truncated PackBits literal"))?;
+                        if count > expected - output.len() {
+                            return Err(malformed("PackBits output exceeds strip size"));
+                        }
+                        output.extend_from_slice(literal);
+                        position = end;
+                    }
+                    -127..=-1 => {
+                        let count = (1 - i16::from(control)) as usize;
+                        let value = *input
+                            .get(position)
+                            .ok_or_else(|| malformed("truncated PackBits repeat"))?;
+                        position += 1;
+                        if count > expected - output.len() {
+                            return Err(malformed("PackBits output exceeds strip size"));
+                        }
+                        output.resize(output.len() + count, value);
+                    }
+                    -128 => {}
+                }
+            }
+        }
+        TiffCompression::Lzw => {
+            // ImageReader.java 1030-1032 switches at 511/1023/2047, one code
+            // before GIF LZW. ImageJ stops at the image length without an EOI.
+            let mut decoder =
+                weezl::decode::Configuration::with_tiff_size_switch(weezl::BitOrder::Msb, 8)
+                    .with_yield_on_full_buffer(true)
+                    .build();
+            let mut position = 0;
+            let mut buffer = [0u8; 8192];
+            while output.len() < expected {
+                let limit = buffer.len().min(expected - output.len());
+                let result = decoder.decode_bytes(&input[position..], &mut buffer[..limit]);
+                position += result.consumed_in;
+                output.extend_from_slice(&buffer[..result.consumed_out]);
+                match result.status.map_err(|e| malformed(&format!("LZW: {e}")))? {
+                    weezl::LzwStatus::Done => break,
+                    weezl::LzwStatus::NoProgress => return Err(malformed("truncated LZW data")),
+                    weezl::LzwStatus::Ok => {}
+                }
+            }
+        }
+        TiffCompression::Deflate => {
+            // Both TIFF Deflate tags use Java Inflater's zlib wrapper, not
+            // a raw DEFLATE stream (ImageReader.java 957-975).
+            let mut decoder = flate2::Decompress::new(true);
+            let mut buffer = [0u8; 8192];
+            loop {
+                let before_in = decoder.total_in();
+                let before_out = decoder.total_out();
+                let limit = buffer.len().min(expected - output.len() + 1);
+                let status = decoder
+                    .decompress(
+                        &input[before_in as usize..],
+                        &mut buffer[..limit],
+                        flate2::FlushDecompress::None,
+                    )
+                    .map_err(|e| malformed(&format!("Deflate: {e}")))?;
+                let count = (decoder.total_out() - before_out) as usize;
+                if count > expected - output.len() {
+                    return Err(malformed("Deflate output exceeds strip size"));
+                }
+                output.extend_from_slice(&buffer[..count]);
+                if status == flate2::Status::StreamEnd {
+                    break;
+                }
+                if decoder.total_in() == before_in && count == 0 {
+                    return Err(malformed("truncated Deflate data"));
+                }
+            }
+        }
+    }
+    if output.len() != expected {
+        return Err(malformed(&format!(
+            "decoded {} of {expected} bytes",
+            output.len()
+        )));
+    }
+    Ok(output)
+}
+
+fn undo_tiff_predictor(raw: &mut [u8], width: usize, bits: u16, samples: u16, le: bool) {
+    let stride = width * usize::from(samples) * usize::from(bits / 8);
+    for row in raw.chunks_exact_mut(stride) {
+        if bits == 16 {
+            for x in 1..width {
+                let read = |i| {
+                    if le {
+                        u16::from_le_bytes([row[i], row[i + 1]])
+                    } else {
+                        u16::from_be_bytes([row[i], row[i + 1]])
+                    }
+                };
+                let value = read(x * 2).wrapping_add(read((x - 1) * 2));
+                let bytes = if le {
+                    value.to_le_bytes()
+                } else {
+                    value.to_be_bytes()
+                };
+                row[x * 2..x * 2 + 2].copy_from_slice(&bytes);
+            }
+        } else {
+            let samples = usize::from(samples);
+            for i in samples..stride {
+                row[i] = row[i].wrapping_add(row[i - samples]);
+            }
+        }
+    }
+}
 
 struct PlaneEncodingInfo {
     bits_per_sample: u16,
@@ -1338,6 +1500,7 @@ struct ParsedIfd {
     data_bytes: usize,
     data_offset: usize,
     orientation: bool,
+    compressed: bool,
     format: PlaneFormat,
     metadata: Vec<ImageJMetadata>,
 }
@@ -1347,6 +1510,7 @@ fn parse_ifd(
     ifd_offset: usize,
     le: bool,
     data_budget: usize,
+    decoded_budget: usize,
 ) -> Result<ParsedIfd, IoError> {
     let num_entries = read_u16(bytes, ifd_offset, le)? as usize;
 
@@ -1354,6 +1518,8 @@ fn parse_ifd(
     let mut height: Option<u32> = None;
     let mut bits_per_sample: u16 = 8;
     let mut compression: u16 = 1;
+    let mut horizontal_predictor = false;
+    let mut rows_per_strip: Option<u32> = None;
     let mut samples_per_pixel: u16 = 1;
     let mut sample_format: u16 = 1;
     let mut photometric: Option<u16> = None;
@@ -1425,6 +1591,15 @@ fn parse_ifd(
             }
             TAG_COMPRESSION => {
                 compression = read_tag_u16(bytes, field_type, "Compression", val_pos, le)?
+            }
+            TAG_PREDICTOR => {
+                let value = read_tag_u16(bytes, field_type, "Predictor", val_pos, le)?;
+                // TiffDecoder.java 526-532 enables differencing only after
+                // encountering LZW/ZIP, and ignores it for PackBits/none.
+                horizontal_predictor = value == 2 && matches!(compression, 5 | 8 | 32946);
+            }
+            TAG_ROWS_PER_STRIP => {
+                rows_per_strip = Some(read_tag_u32(bytes, field_type, val_pos, le)?);
             }
             TAG_PHOTO_INTERP => {
                 photometric = Some(read_tag_u16(
@@ -1521,11 +1696,13 @@ fn parse_ifd(
         }
     }
 
-    // TiffDecoder accepts both 1 (none) and 0 as uncompressed.
-    if compression != 0 && compression != 1 {
-        return Err(IoError::UnsupportedFormat(format!(
-            "compressed TIFF (compression={compression}) not yet supported in baseline slice"
-        )));
+    let compression = TiffCompression::from_tag(compression)?;
+    let compressed = compression.is_compressed();
+    if horizontal_predictor && !matches!((bits_per_sample, samples_per_pixel), (8, 1 | 3) | (16, 1))
+    {
+        return Err(IoError::UnsupportedFormat(
+            "TIFF Predictor=2 requires 8-bit grayscale/RGB or 16-bit grayscale".into(),
+        ));
     }
 
     let metadata = match (meta_data_counts, meta_data) {
@@ -1596,6 +1773,11 @@ fn parse_ifd(
 
     let w = width.ok_or_else(|| IoError::UnsupportedFormat("missing ImageWidth".into()))?;
     let h = height.ok_or_else(|| IoError::UnsupportedFormat("missing ImageLength".into()))?;
+    if w == 0 || h == 0 {
+        return Err(IoError::Malformed(
+            "image width and height must be positive".into(),
+        ));
+    }
     if strip_offsets.is_empty() {
         return Err(IoError::UnsupportedFormat("missing StripOffsets".into()));
     }
@@ -1616,16 +1798,39 @@ fn parse_ifd(
         .ok_or_else(|| IoError::TooLarge("image data size overflow".into()))?;
     let expected_bytes = usize::try_from(expected_bytes)
         .map_err(|_| IoError::TooLarge("image data size exceeds addressable memory".into()))?;
-    if expected_bytes > bytes.len() || expected_bytes > data_budget {
+    let stored_bytes = if compressed {
+        strip_byte_counts.iter().try_fold(0usize, |sum, &count| {
+            sum.checked_add(count as usize)
+                .ok_or_else(|| IoError::TooLarge("compressed strip sizes overflow".into()))
+        })?
+    } else {
+        expected_bytes
+    };
+    if (!compressed && expected_bytes > bytes.len())
+        || stored_bytes > data_budget
+        || (compressed && expected_bytes > decoded_budget)
+    {
         return Err(IoError::TooLarge(format!(
-            "image requires {expected_bytes} pixel bytes but only {data_budget} bytes are available in the {} byte file",
+            "image requires {expected_bytes} decoded bytes and {stored_bytes} stored bytes; remaining budgets are {decoded_budget} decoded and {data_budget} stored in the {} byte file",
             bytes.len()
         )));
     }
     let pixel_count = usize::try_from(pixel_count)
         .map_err(|_| IoError::TooLarge("pixel count exceeds addressable memory".into()))?;
 
-    let mut raw = Vec::with_capacity(expected_bytes);
+    let row_bytes = expected_bytes / h as usize;
+    let rows_per_strip = rows_per_strip.unwrap_or(h) as usize;
+    if compressed
+        && (rows_per_strip == 0
+            || strip_offsets.len() != (h as usize).div_ceil(rows_per_strip)
+            || strip_byte_counts.len() != strip_offsets.len())
+    {
+        return Err(IoError::Malformed(
+            "compressed TIFF requires matching strip offsets/counts and nonzero RowsPerStrip"
+                .into(),
+        ));
+    }
+    let mut raw = Vec::new();
     for (idx, &offset) in strip_offsets.iter().enumerate() {
         if raw.len() >= expected_bytes {
             break;
@@ -1651,8 +1856,24 @@ fn parse_ifd(
                 "strip {idx} extends beyond the end of the file"
             )));
         }
-        let take = requested.min(remaining);
-        raw.extend_from_slice(&bytes[start..start + take]);
+        if compressed {
+            let rows = rows_per_strip.min((h as usize) - raw.len() / row_bytes);
+            let mut strip =
+                decompress_tiff_strip(&bytes[start..declared_end], compression, rows * row_bytes)?;
+            if horizontal_predictor {
+                undo_tiff_predictor(
+                    &mut strip,
+                    w as usize,
+                    bits_per_sample,
+                    samples_per_pixel,
+                    le,
+                );
+            }
+            raw.extend_from_slice(&strip);
+        } else {
+            let take = requested.min(remaining);
+            raw.extend_from_slice(&bytes[start..start + take]);
+        }
     }
     if raw.len() < expected_bytes {
         return Err(IoError::Malformed(format!(
@@ -1691,9 +1912,10 @@ fn parse_ifd(
         x_resolution,
         y_resolution,
         resolution_unit,
-        data_bytes: expected_bytes,
+        data_bytes: stored_bytes,
         data_offset,
         orientation,
+        compressed,
         format,
         metadata,
     })
@@ -1840,7 +2062,10 @@ fn read_color_map(bytes: &[u8], start: usize, le: bool) -> Result<Box<Lut256>, I
     Ok(lut)
 }
 
-/// Reads a baseline TIFF and restores the metadata that `save_tiff` writes.
+/// Reads a strip-based TIFF, including PackBits, LZW and zlib Deflate, and
+/// restores the metadata that `save_tiff` writes. LZW/Deflate Predictor=2 is
+/// supported for 8-bit grayscale/palette/RGB and 16-bit unsigned grayscale.
+/// Compressed stacks share a 512 MiB decoded pixel budget.
 ///
 /// An `ImageDescription` starting with `ImageJ` is decoded as Java Properties
 /// and supplies `min`/`max` (display range), `unit`, `spacing`, `inverty`,
@@ -1905,21 +2130,25 @@ pub fn load_tiff(path: impl AsRef<Path>) -> Result<ImageDocument, IoError> {
     let mut resolution_unit: Option<u16> = None;
     let mut first_ifd = true;
     let mut first_orientation = false;
+    let mut first_compressed = false;
     let mut first_format: Option<PlaneFormat> = None;
     let mut first_data_offset = 0usize;
     let mut first_metadata: Vec<ImageJMetadata> = Vec::new();
-    // Uncompressed slices cannot overlap in a valid file, so the decoded pixel
-    // bytes of the whole stack must fit in the file. This also bounds repeated
-    // IFDs that all point at the same strip data.
+    // Stored bytes must fit in the file across the whole stack. A separate
+    // decoded budget bounds expansion and repeated compressed IFD references.
     let mut remaining_data = bytes.len();
+    let mut remaining_decoded = MAX_DECODED_TIFF_BYTES;
 
     while ifd_offset != 0 {
         if visited.contains(&ifd_offset) {
             return Err(IoError::Malformed("cyclic TIFF IFD chain".into()));
         }
         visited.push(ifd_offset);
-        let ifd = parse_ifd(&bytes, ifd_offset, le, remaining_data)?;
+        let ifd = parse_ifd(&bytes, ifd_offset, le, remaining_data, remaining_decoded)?;
         remaining_data -= ifd.data_bytes;
+        if ifd.compressed {
+            remaining_decoded -= ifd.format.plane_bytes;
+        }
         if first_ifd {
             // TiffDecoder decodes IMAGE_DESCRIPTION only while ifdCount==1
             // (TiffDecoder.java 555-559), so a later IFD's description must
@@ -1929,6 +2158,7 @@ pub fn load_tiff(path: impl AsRef<Path>) -> Result<ImageDocument, IoError> {
             y_resolution = ifd.y_resolution;
             resolution_unit = ifd.resolution_unit;
             first_orientation = ifd.orientation;
+            first_compressed = ifd.compressed;
             first_format = Some(ifd.format.clone());
             first_data_offset = ifd.data_offset;
             first_metadata = ifd.metadata;
@@ -2010,7 +2240,7 @@ pub fn load_tiff(path: impl AsRef<Path>) -> Result<ImageDocument, IoError> {
     // present (TiffDecoder.java 205-216, 560-563). FileInfo.nImages then makes
     // ImageJ ignore the rest of the IFD chain and read N contiguous planes
     // from the first strip offset (Opener.java 795-813, FileOpener.openStack).
-    if let Some(images) = declared_images.filter(|_| !first_orientation) {
+    if let Some(images) = declared_images.filter(|_| !first_orientation && !first_compressed) {
         let images = images as usize;
         if planes.len() > 1 && planes.len() != images {
             return Err(IoError::UnsupportedFormat(format!(
@@ -3073,6 +3303,40 @@ mod tests {
     use std::env;
 
     #[test]
+    fn compressed_strips_reject_truncation_corruption_and_excess_output() {
+        for input in [&[127, 1][..], &[255][..], &[254, 1][..], &[0, 1][..]] {
+            assert!(matches!(
+                decompress_tiff_strip(input, TiffCompression::PackBits, 2),
+                Err(IoError::Malformed(_))
+            ));
+        }
+        for input in [&[][..], &[255, 255][..]] {
+            assert!(matches!(
+                decompress_tiff_strip(input, TiffCompression::Lzw, 2),
+                Err(IoError::Malformed(_))
+            ));
+        }
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&[7; 1024]).unwrap();
+        let valid = encoder.finish().unwrap();
+        let mut corrupt = valid.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        for (input, expected) in [
+            (&valid[..valid.len() - 1], 1024),
+            (corrupt.as_slice(), 1024),
+            (valid.as_slice(), 4),
+            (valid.as_slice(), 1025),
+            (&[][..], 1024),
+        ] {
+            assert!(matches!(
+                decompress_tiff_strip(input, TiffCompression::Deflate, expected),
+                Err(IoError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
     fn tiff_8bit_roundtrip_preserves_pixels_and_dimensions() {
         let doc = ImageDocument::new_ramp_8bit("ramp.tif", 32, 24).unwrap();
         let tmp = env::temp_dir().join("ij_rs_roundtrip_8bit.tif");
@@ -3453,6 +3717,50 @@ mod tests {
         let entries = base_entries(u32::MAX, u32::MAX, 8, 1, 1, 1, 1);
         let bytes = make_tiff(&entries, &[0]);
         assert!(load_fixture("huge_dims", &bytes).is_err());
+    }
+
+    #[test]
+    fn compressed_tiff_rejects_oversized_dimensions_and_invalid_strip_layout() {
+        for (index, (width, height, rows, count)) in [
+            (u32::MAX, u32::MAX, 1, Some(2)),
+            (1, MAX_DECODED_TIFF_BYTES as u32 + 1, 1, Some(2)),
+            (2, 1, 0, Some(2)),
+            (2, 3, 1, Some(2)),
+            (2, 1, 1, None),
+            (2, 1, 1, Some(u32::MAX)),
+            (0, 1, 1, Some(2)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut entries = base_entries(width, height, 8, 1, 1, 1, 2);
+            entries
+                .iter_mut()
+                .find(|e| e.0 == TAG_COMPRESSION)
+                .unwrap()
+                .3 = 32773;
+            entries
+                .iter_mut()
+                .find(|e| e.0 == TAG_ROWS_PER_STRIP)
+                .unwrap()
+                .3 = rows;
+            if let Some(count) = count {
+                entries
+                    .iter_mut()
+                    .find(|e| e.0 == TAG_STRIP_BYTE_COUNTS)
+                    .unwrap()
+                    .3 = count;
+            } else {
+                entries.retain(|e| e.0 != TAG_STRIP_BYTE_COUNTS);
+            }
+            assert!(
+                load_fixture(
+                    &format!("compressed_invalid_{index}"),
+                    &make_tiff(&entries, &[255, 7])
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

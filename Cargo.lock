@@ -1616,9 +1616,11 @@ dependencies = [
 name = "ij-io"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "ij-core",
  "serde",
  "thiserror 2.0.21",
+ "weezl",
 ]
 
 [[package]]
