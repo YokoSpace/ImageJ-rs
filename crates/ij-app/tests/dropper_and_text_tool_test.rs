@@ -82,3 +82,41 @@ fn alt_dropper_sets_background() {
     assert_eq!(app.session.foreground_color, [0,0,0]);
     assert_ne!(app.session.background_color, [255,255,255]);
 }
+
+#[test]
+fn text_selection_stays_cleared_after_select_none() {
+    let ctx = Context::default();
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("text selection", 32, 32).unwrap();
+    app.active_tool = Tool::Text;
+    click(&ctx, &mut app, id, 2.0, 3.0);
+    app.text_selection.as_mut().unwrap().3 = "A".into();
+    frame(&ctx, &mut app, id, vec![]);
+    assert!(app.session.active_doc().unwrap().roi.is_some());
+
+    app.session.dispatch(ij_session::Command::ClearRoi).unwrap();
+    frame(&ctx, &mut app, id, vec![]);
+    assert!(app.session.active_doc().unwrap().roi.is_none());
+    assert!(app.text_selection.is_none());
+}
+
+#[test]
+fn new_selection_at_text_origin_draws_its_own_outline() {
+    let ctx = Context::default();
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("text selection", 32, 32).unwrap();
+    app.active_tool = Tool::Text;
+    click(&ctx, &mut app, id, 2.0, 3.0);
+    app.text_selection.as_mut().unwrap().3 = "A".into();
+    frame(&ctx, &mut app, id, vec![]);
+
+    let replacement = ij_core::Roi::Rect(ij_core::RectRoi::new(2, 3, 1, 1).unwrap());
+    app.session.active_doc_mut().unwrap().roi = Some(replacement);
+    app.session.foreground_color = [255, 255, 255];
+    app.draw_active().unwrap();
+    let ij_core::PixelPlane::Gray8(pixels) = app.session.active_doc().unwrap().plane() else {
+        panic!("expected Gray8 image");
+    };
+    assert_eq!(pixels[3 * 32 + 2], 255);
+    assert_ne!(pixels[3 * 32 + 6], 255);
+}

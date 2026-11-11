@@ -898,16 +898,27 @@ impl ImageJApp {
                         self.status_message = format!("{} color: ({}, {}, {})", if background { "Background" } else { "Foreground" }, color[0], color[1], color[2]);
                     }
                 } else {
-                    self.text_selection = Some((image_id, x, y, String::new()));
+                    let rect = ij_core::RectRoi::new(x, y, 8, 8).unwrap();
+                    self.session.get_image_mut(image_id).unwrap().roi = Some(ij_core::Roi::Rect(rect));
+                    self.text_selection = Some((image_id, x, y, String::new(), rect));
                 }
             }
         }
-        if let Some((id, x, y, text)) = &mut self.text_selection {
+        if self.text_selection.as_ref().is_some_and(|(id, _, _, _, rect)| {
+            *id == image_id
+                && self.session.get_image(*id).and_then(|doc| doc.roi.as_ref())
+                    != Some(&ij_core::Roi::Rect(*rect))
+        }) {
+            self.text_selection = None;
+        }
+        if let Some((id, x, y, text, last_rect)) = &mut self.text_selection {
             if *id == image_id && tool == Tool::Text {
                 egui::Window::new("Text selection").show(ui.ctx(), |ui| {
                     ui.text_edit_multiline(text);
                 });
-                self.session.get_image_mut(image_id).unwrap().roi = Some(ij_core::Roi::Rect(ij_core::RectRoi::new(*x, *y, (text.lines().map(str::len).max().unwrap_or(1).max(1) * 8) as i32, (text.lines().count().max(1) * 8) as i32).unwrap()));
+                let rect = ij_core::RectRoi::new(*x, *y, (text.lines().map(str::len).max().unwrap_or(1).max(1) * 8) as i32, (text.lines().count().max(1) * 8) as i32).unwrap();
+                self.session.get_image_mut(image_id).unwrap().roi = Some(ij_core::Roi::Rect(rect));
+                *last_rect = rect;
                 painter.text(Pos2::new(img_rect.min.x + *x as f32 * view.zoom as f32, img_rect.min.y + *y as f32 * view.zoom as f32), egui::Align2::LEFT_TOP, text.as_str(), egui::FontId::monospace(8.0 * view.zoom as f32), Color32::YELLOW);
             }
         }

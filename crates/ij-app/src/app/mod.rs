@@ -166,7 +166,7 @@ pub struct AnimationState {
 }
 
 pub struct ImageJApp {
-    pub text_selection: Option<(ImageId, i32, i32, String)>,
+    pub text_selection: Option<(ImageId, i32, i32, String, ij_core::RectRoi)>,
     pub session: Session,
     pub active_tool: Tool,
     pub status_message: String,
@@ -683,7 +683,7 @@ impl ImageJApp {
         if let Some(err) = self.reject_while_closing("Draw") {
             return Err(err);
         }
-        if let Some((id, x, y, text)) = self.text_selection.clone().filter(|t| Some(t.0) == self.session.active_image_id() && self.session.get_image(t.0).is_some_and(|doc| matches!(&doc.roi, Some(ij_core::Roi::Rect(rect)) if rect.x == t.1 && rect.y == t.2))) {
+        if let Some((id, x, y, text, _)) = self.text_selection.clone().filter(|t| Some(t.0) == self.session.active_image_id() && self.session.get_image(t.0).is_some_and(|doc| doc.roi.as_ref() == Some(&ij_core::Roi::Rect(t.4)))) {
             use font8x8::UnicodeFonts;
             let color = self.session.foreground_color;
             let doc = self.session.get_image_mut(id).unwrap();

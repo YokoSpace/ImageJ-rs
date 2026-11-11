@@ -69,18 +69,11 @@ impl ImageJApp {
                 return;
             }
         };
-        if doc.stack_size() != 1 {
-            ui.colored_label(
-                Color32::from_rgb(220, 80, 80),
-                "Stack threshold is not yet supported.",
-            );
-            return;
-        }
         let range = doc.display_range;
         let levels = doc.threshold;
         let has_threshold = levels.is_some();
         let counts = display_histogram(doc).counts;
-        let can_auto = bit_depth != 32;
+        let can_auto = bit_depth != 32 && doc.stack_size() == 1;
         if bit_depth != 16 {
             self.dialogs.threshold_16bit = false;
         }
@@ -93,8 +86,8 @@ impl ImageJApp {
         if state.image_id != Some(id) || state.last_levels != levels {
             state.image_id = Some(id);
             state.last_levels = levels;
-            state.lower_input = levels.map_or(0.0, |value| value.lower);
-            state.upper_input = levels.map_or(255.0, |value| value.upper);
+            state.lower_input = levels.map_or(range.min, |value| value.lower);
+            state.upper_input = levels.map_or(range.max, |value| value.upper);
         }
         let mut sliders = threshold_to_sliders(levels, bit_depth, range.min, range.max);
 
@@ -192,8 +185,9 @@ impl ImageJApp {
                     data.insert_temp(egui::Id::new((PALETTE_STATE, label)), response.rect)
                 });
                 if label == "Auto" && !can_auto {
-                    response
-                        .on_disabled_hover_text("Auto threshold is not supported on 32-bit images yet");
+                    response.on_disabled_hover_text(
+                        "Auto threshold is not supported on 32-bit images or stacks yet",
+                    );
                 } else if response.clicked() {
                     action = Some(label);
                 }

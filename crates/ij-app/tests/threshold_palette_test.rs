@@ -1,6 +1,8 @@
 use egui::{CentralPanel, Context, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
+use ij_app::action::AppAction;
 use ij_app::ImageJApp;
 use ij_bridge::JavaOracleBridge;
+use ij_core::{ImageDocument, PixelPlane};
 use ij_session::Command;
 
 fn render_palette(ctx: &Context, app: &mut ImageJApp, events: Vec<Event>) {
@@ -216,4 +218,196 @@ fn preview_threshold_updates_red_overlay_without_macro_or_dirty_state() {
         });
     }
     assert_eq!(app.texture_upload_count(), uploads_before + 2);
+}
+
+fn open_document(app: &mut ImageJApp, doc: ImageDocument) -> ij_session::ImageId {
+    let id = app.session.insert_doc(doc);
+    app.set_active_window(id).unwrap();
+    id
+}
+
+fn drag_lower_slider(ctx: &Context, app: &mut ImageJApp) {
+    render_palette(ctx, app, vec![]);
+    let rect = ImageJApp::threshold_lower_slider_rect(ctx).unwrap();
+    let start = Pos2::new(rect.left() + 45.0, rect.center().y);
+    let end = Pos2::new(start.x + 30.0, start.y);
+    render_palette(
+        ctx,
+        app,
+        vec![
+            Event::PointerMoved(start),
+            Event::PointerButton {
+                pos: start,
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: Modifiers::NONE,
+            },
+        ],
+    );
+    render_palette(ctx, app, vec![Event::PointerMoved(end)]);
+    render_palette(
+        ctx,
+        app,
+        vec![Event::PointerButton {
+            pos: end,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+}
+
+#[test]
+fn threshold_action_accepts_grayscale_images_and_stacks() {
+    for plane in [
+        PixelPlane::Gray8(vec![0; 4]),
+        PixelPlane::Gray16(vec![0; 4]),
+        PixelPlane::Gray32(vec![0.0; 4]),
+    ] {
+        for slice_count in [1, 2] {
+            let mut app = ImageJApp::new();
+            let doc = ImageDocument::new_stack("grayscale", 2, 2, vec![plane.clone(); slice_count])
+                .unwrap();
+            open_document(&mut app, doc);
+            assert!(
+                app.action_enabled(AppAction::Threshold).is_ok(),
+                "threshold must be available for {plane:?}, {slice_count} slices"
+            );
+            app.perform(AppAction::Threshold, &Context::default());
+            assert!(app.dialogs.show_threshold);
+        }
+    }
+
+    let mut app = ImageJApp::new();
+    open_document(
+        &mut app,
+        ImageDocument::new("RGB", 2, 2, PixelPlane::ColorRgb(vec![0; 4])).unwrap(),
+    );
+    assert!(app.action_enabled(AppAction::Threshold).is_err());
+}
+
+#[test]
+fn gray32_palette_allows_manual_threshold_and_applies_java_mask() {
+    let ctx = Context::default();
+    let mut app = ImageJApp::new();
+    let doc = ImageDocument::new_ramp_32bit("float", 16, 16).unwrap();
+    let id = open_document(&mut app, doc);
+    app.perform(AppAction::Threshold, &ctx);
+    assert!(app.dialogs.show_threshold);
+
+    render_palette(&ctx, &mut app, vec![]);
+    click_button(&ctx, &mut app, "Auto");
+    assert!(app.session.get_image(id).unwrap().threshold.is_none());
+    assert!(app.dialogs.last_error.is_none());
+    drag_lower_slider(&ctx, &mut app);
+    let levels = app.session.get_image(id).unwrap().threshold.unwrap();
+    click_button(&ctx, &mut app, "Set");
+    assert_eq!(app.session.get_image(id).unwrap().threshold, Some(levels));
+
+    let doc = app.session.get_image(id).unwrap().clone();
+    let oracle = JavaOracleBridge::locate_from_repo_root(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap(),
+    )
+    .unwrap()
+    .run_macro_on_image(
+        &doc,
+        &format!(
+            "setThreshold({}, {}); run(\"Convert to Mask\");",
+            ij_core::format_ij_num(levels.lower),
+            ij_core::format_ij_num(levels.upper)
+        ),
+    )
+    .unwrap()
+    .output_image
+    .unwrap();
+    click_button(&ctx, &mut app, "Apply");
+    assert_eq!(app.session.get_image(id).unwrap().slices, oracle.slices);
+    assert!(app.session.is_dirty(id));
+}
+
+#[test]
+fn set_without_existing_threshold_uses_display_range() {
+    let float = ImageDocument::new_ramp_32bit("float", 16, 16).unwrap();
+    let stack = ImageDocument::new_stack(
+        "stack",
+        2,
+        2,
+        vec![PixelPlane::Gray16(vec![0, 10_000, 40_000, 60_000]); 2],
+    )
+    .unwrap();
+    for doc in [float, stack] {
+        // ThresholdAdjuster.doSet starts with the display range when no
+        // threshold is set (ThresholdAdjuster.java 749-755, 583-590).
+        let expected = doc.display_range;
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let id = open_document(&mut app, doc);
+        click_button(&ctx, &mut app, "Set");
+        let levels = app.session.get_image(id).unwrap().threshold.unwrap();
+        assert_eq!((levels.lower, levels.upper), (expected.min, expected.max));
+    }
+}
+
+#[test]
+fn stack_palette_manual_threshold_opens_binary_dialog_and_applies_java_mask() {
+    for plane in [
+        PixelPlane::Gray8((0..64).map(|i| i * 4).collect()),
+        PixelPlane::Gray16((0..64).map(|i| i * 1000).collect()),
+        PixelPlane::Gray32((0..64).map(|i| i as f32 / 63.0).collect()),
+    ] {
+        let ctx = Context::default();
+        let mut app = ImageJApp::new();
+        let mut reversed = plane.clone();
+        match &mut reversed {
+            PixelPlane::Gray8(pixels) => pixels.reverse(),
+            PixelPlane::Gray16(pixels) => pixels.reverse(),
+            PixelPlane::Gray32(pixels) => pixels.reverse(),
+            _ => unreachable!(),
+        }
+        let mut doc = ImageDocument::new_stack("stack", 8, 8, vec![plane, reversed]).unwrap();
+        doc.set_slice(2).unwrap();
+        let id = open_document(&mut app, doc);
+        app.dialogs.threshold_method = "Otsu".into();
+        app.dialogs.threshold_dark_bg = true;
+        app.perform(AppAction::Threshold, &ctx);
+        assert!(app.dialogs.show_threshold);
+
+        render_palette(&ctx, &mut app, vec![]);
+        click_button(&ctx, &mut app, "Auto");
+        assert!(app.session.get_image(id).unwrap().threshold.is_none());
+        assert!(app.dialogs.last_error.is_none());
+        drag_lower_slider(&ctx, &mut app);
+        let levels = app.session.get_image(id).unwrap().threshold.unwrap();
+        click_button(&ctx, &mut app, "Set");
+        assert_eq!(app.session.get_image(id).unwrap().threshold, Some(levels));
+
+        let doc = app.session.get_image(id).unwrap().clone();
+        let oracle = JavaOracleBridge::locate_from_repo_root(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap(),
+        )
+        .unwrap()
+        .run_macro_on_image(
+            &doc,
+            &format!(
+                "setSlice(2); setThreshold({}, {}); run(\"Convert to Mask\", \"method=Otsu background=Dark black\");",
+                ij_core::format_ij_num(levels.lower),
+                ij_core::format_ij_num(levels.upper)
+            ),
+        )
+        .unwrap()
+        .output_image
+        .unwrap();
+        click_button(&ctx, &mut app, "Apply");
+        let pending = app.dialogs.pending_stack_binary.as_mut().unwrap();
+        assert_eq!(pending.macro_command, "Convert to Mask");
+        assert_eq!(pending.options.method, "Otsu");
+        assert_eq!(pending.options.background, "Dark");
+        pending.options.calculate = false;
+        pending.black_background = true;
+        assert_eq!(app.session.get_image(id).unwrap().slices, doc.slices);
+        app.resolve_stack_binary_dialog(true);
+        assert_eq!(app.session.get_image(id).unwrap().slices, oracle.slices);
+        assert_eq!(app.session.get_image(id).unwrap().current_slice, 2);
+        assert!(app.session.is_dirty(id));
+    }
 }

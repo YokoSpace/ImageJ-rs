@@ -526,7 +526,7 @@ impl ImageJApp {
                         }
                         _ => Err("Area selection required".into()),
                     },
-                    Threshold if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_)) || doc.stack_size() != 1 => Err("Threshold is only supported on single-slice 8-bit or 16-bit grayscale images".into()),
+                    Threshold if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)) => Err("Threshold requires a grayscale image".into()),
                     ConvertTo16Bit => match doc.plane() {
                         // ImageConverter.java 59-62 rejects COLOR_256.
                         PixelPlane::Color256 { .. } => Err("16-bit conversion is not supported for 8-bit color images".into()),
