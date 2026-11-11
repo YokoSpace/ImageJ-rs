@@ -1,4 +1,4 @@
-use ij_core::{LineRoi, PolygonRoi, RectRoi, Roi};
+use ij_core::{AngleRoi, LineRoi, PointRoi, PolygonRoi, RectRoi, Roi};
 
 /// Result of hit testing a ROI with screen coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +169,22 @@ pub fn hit_test(roi: &Roi, screen: (f64, f64), mag: f64, src_origin: (f64, f64))
             }
             RoiHit::Outside
         }
+        Roi::Point(p) => p.points.iter().enumerate().find_map(|(index, &(x, y))| {
+            let px = screen_x(x as f64, mag, src_origin.0);
+            let py = screen_y(y as f64, mag, src_origin.1);
+            (index < u8::MAX as usize && (sx - px).abs() <= 5 && (sy - py).abs() <= 5)
+                .then_some(RoiHit::Handle(index as u8))
+        }).unwrap_or(RoiHit::Outside),
+        Roi::Angle(a) => {
+            for (index, &(x, y)) in a.points.iter().enumerate() {
+                let px = screen_x(x as f64, mag, src_origin.0);
+                let py = screen_y(y as f64, mag, src_origin.1);
+                if (sx - px).abs() <= 5 && (sy - py).abs() <= 5 {
+                    return RoiHit::Handle(index as u8);
+                }
+            }
+            RoiHit::Outside
+        }
     }
 }
 
@@ -186,6 +202,12 @@ pub fn move_by(roi: &Roi, dx: i32, dy: i32) -> Roi {
         Roi::Polygon(p) => Roi::Polygon(PolygonRoi {
             xpoints: p.xpoints.iter().map(|&x| x + dx).collect(),
             ypoints: p.ypoints.iter().map(|&y| y + dy).collect(),
+        }),
+        Roi::Point(p) => Roi::Point(PointRoi {
+            points: p.points.iter().map(|&(x, y)| (x + dx, y + dy)).collect(),
+        }),
+        Roi::Angle(a) => Roi::Angle(AngleRoi {
+            points: a.points.map(|(x, y)| (x + dx, y + dy)),
         }),
     }
 }
@@ -319,6 +341,20 @@ pub fn drag_handle(roi: &Roi, handle: u8, image_xy: (i32, i32)) -> Roi {
             _ => roi.clone(),
         },
         Roi::Polygon(_) => roi.clone(),
+        Roi::Point(p) => {
+            let mut next = p.clone();
+            if let Some(point) = next.points.get_mut(handle as usize) {
+                *point = (ox, oy);
+            }
+            Roi::Point(next)
+        }
+        Roi::Angle(a) => {
+            let mut next = *a;
+            if let Some(point) = next.points.get_mut(handle as usize) {
+                *point = (ox, oy);
+            }
+            Roi::Angle(next)
+        }
     }
 }
 
@@ -468,6 +504,20 @@ pub fn nudge(roi: &Roi, a: Arrow, img_w: u32, img_h: u32) -> Roi {
                 ypoints: p.ypoints.iter().map(|&y| y + dy).collect(),
             })
         }
+        Roi::Point(_) | Roi::Angle(_) => {
+            let (x, y, w, h) = roi.bounds();
+            let (dx, dy) = match a {
+                Arrow::Up => (0, -1),
+                Arrow::Down => (0, 1),
+                Arrow::Left => (-1, 0),
+                Arrow::Right => (1, 0),
+            };
+            let next_x = (x + dx).clamp(0, (x_max - w).max(0));
+            let next_y = (y + dy).clamp(0, (y_max - h).max(0));
+            let mut next = roi.clone();
+            next.set_location(next_x, next_y);
+            next
+        }
     }
 }
 
@@ -581,7 +631,7 @@ pub fn nudge_corner(roi: &Roi, a: Arrow, img_w: u32, img_h: u32) -> Roi {
                 y2,
             })
         }
-        Roi::Polygon(_) => {
+        Roi::Polygon(_) | Roi::Point(_) | Roi::Angle(_) => {
             // PolygonRoi is type > OVAL, so Roi.java line 1233 returns early without changes.
             roi.clone()
         }

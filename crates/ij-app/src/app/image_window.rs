@@ -27,6 +27,10 @@ fn polygon_build_id(image_id: ImageId) -> egui::Id {
     egui::Id::new(("ij_polygon_build", image_id.0))
 }
 
+fn angle_build_id(image_id: ImageId) -> egui::Id {
+    egui::Id::new(("ij_angle_build", image_id.0))
+}
+
 /// The integer drag path of an in-progress Freehand selection.
 ///
 /// ImageJ builds the polygon while the mouse is down (`FreehandRoi.grow`) and
@@ -590,7 +594,7 @@ impl ImageJApp {
         if let Some(hover_pos) = response.hover_pos().filter(|pos| img_rect.contains(*pos)) {
             let (ix, iy) = view.screen_to_pixel(hover_pos.x - rect.min.x, hover_pos.y - rect.min.y);
             hover_pixel = Some((ix, iy));
-            if matches!(tool, Tool::Rectangle | Tool::Oval | Tool::Line) {
+            if matches!(tool, Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Point | Tool::Angle) {
                 if let Some(roi) = self
                     .session
                     .get_image(image_id)
@@ -625,7 +629,7 @@ impl ImageJApp {
                 view.is_dragging = true;
                 view.drag_start_pixel = Some((px, py));
                 view.drag_current_pixel = Some((px, py));
-                if matches!(tool, Tool::Rectangle | Tool::Oval | Tool::Line) {
+                if matches!(tool, Tool::Rectangle | Tool::Oval | Tool::Line | Tool::Point | Tool::Angle) {
                     if let Some(roi) = self
                         .session
                         .get_image(image_id)
@@ -712,6 +716,8 @@ impl ImageJApp {
             Rect(i32, i32, i32, i32),
             Oval(i32, i32, i32, i32),
             Line(i32, i32, i32, i32),
+            Point(Vec<(i32, i32)>),
+            Angle([(i32, i32); 3]),
         }
 
         let mut drag_action = None;
@@ -736,6 +742,8 @@ impl ImageJApp {
                             Roi::Oval(r) => Some(DragAction::Oval(r.x, r.y, r.width, r.height)),
                             Roi::Line(l) => Some(DragAction::Line(l.x1, l.y1, l.x2, l.y2)),
                             Roi::Polygon(_) => None,
+                            Roi::Point(p) => Some(DragAction::Point(p.points.clone())),
+                            Roi::Angle(a) => Some(DragAction::Angle(a.points)),
                         };
                         self.session.set_dirty(image_id, true);
                     }
@@ -791,6 +799,7 @@ impl ImageJApp {
 
         let mut was_clicked = false;
         let mut wand_click = None;
+        let mut point_click = None;
         if response.clicked() {
             was_clicked = true;
             if tool == Tool::Magnifier {
@@ -809,7 +818,35 @@ impl ImageJApp {
                         view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y),
                     );
                 }
+            } else if tool == Tool::Point {
+                if let Some(pos) = response.interact_pointer_pos().filter(|pos| img_rect.contains(*pos)) {
+                    point_click = Some(view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y));
+                }
             }
+        }
+
+        let angle_key = angle_build_id(image_id);
+        let mut angle_finish = None;
+        if tool == Tool::Angle {
+            let mut build = ui.ctx().data(|data| data.get_temp::<PolygonBuild>(angle_key)).unwrap_or_default();
+            if let Some(pos) = response.hover_pos().filter(|pos| img_rect.contains(*pos)) {
+                build.cursor = Some(view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y));
+            }
+            if response.clicked() {
+                if let Some(pos) = response.interact_pointer_pos().filter(|pos| img_rect.contains(*pos)) {
+                    build.vertices.push(view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y));
+                    if build.vertices.len() == 3 {
+                        angle_finish = Some([build.vertices[0], build.vertices[1], build.vertices[2]]);
+                    }
+                }
+            }
+            if angle_finish.is_some() {
+                ui.ctx().data_mut(|data| data.remove::<PolygonBuild>(angle_key));
+            } else {
+                ui.ctx().data_mut(|data| data.insert_temp(angle_key, build));
+            }
+        } else {
+            ui.ctx().data_mut(|data| data.remove::<PolygonBuild>(angle_key));
         }
 
         // Polygon tool: every click appends a vertex; a double-click or a click
@@ -988,6 +1025,22 @@ impl ImageJApp {
                             }
                         }
                     }
+                    Roi::Point(p) => {
+                        for &(x, y) in &p.points {
+                            let center = Pos2::new(x as f32 * z + img_rect.min.x, y as f32 * z + img_rect.min.y);
+                            painter.line_segment([center + Vec2::new(-5.0, 0.0), center + Vec2::new(5.0, 0.0)], stroke);
+                            painter.line_segment([center + Vec2::new(0.0, -5.0), center + Vec2::new(0.0, 5.0)], stroke);
+                        }
+                    }
+                    Roi::Angle(a) => {
+                        let points = a.points.map(|(x, y)| Pos2::new(x as f32 * z + img_rect.min.x, y as f32 * z + img_rect.min.y));
+                        for pair in points.windows(2) {
+                            painter.line_segment([pair[0], pair[1]], stroke);
+                        }
+                        for point in points {
+                            painter.circle_filled(point, 3.0, Color32::from_rgb(255, 255, 0));
+                        }
+                    }
                 }
             }
         }
@@ -1016,6 +1069,15 @@ impl ImageJApp {
                         stroke,
                         egui::StrokeKind::Outside,
                     );
+                }
+            }
+        }
+
+        if tool == Tool::Angle {
+            if let Some(build) = ui.ctx().data(|data| data.get_temp::<PolygonBuild>(angle_key)) {
+                let to_screen = |(x, y): (i32, i32)| Pos2::new(x as f32 * z + img_rect.min.x, y as f32 * z + img_rect.min.y);
+                for (from, to) in polygon_preview_segments(&build.vertices, build.cursor) {
+                    painter.line_segment([to_screen(from), to_screen(to)], stroke);
                 }
             }
         }
@@ -1063,6 +1125,23 @@ impl ImageJApp {
             }
         }
 
+        if let Some(point) = point_click {
+            let mut points = match self.session.get_image(image_id).and_then(|doc| doc.roi.as_ref()) {
+                Some(Roi::Point(existing)) => existing.points.clone(),
+                _ => Vec::new(),
+            };
+            points.push(point);
+            if let Err(error) = self.session.dispatch(Command::MakePointRoi { points }) {
+                self.dialogs.last_error = Some(error.to_string());
+            }
+        }
+
+        if let Some(points) = angle_finish {
+            if let Err(error) = self.session.dispatch(Command::MakeAngleRoi { points }) {
+                self.dialogs.last_error = Some(error.to_string());
+            }
+        }
+
         if let Some(action) = drag_action {
             let _ = self.set_active_window(image_id);
             match action {
@@ -1074,6 +1153,12 @@ impl ImageJApp {
                 }
                 DragAction::Line(x1, y1, x2, y2) => {
                     let _ = self.dispatch_line_roi(x1, y1, x2, y2);
+                }
+                DragAction::Point(points) => {
+                    let _ = self.session.dispatch(Command::MakePointRoi { points });
+                }
+                DragAction::Angle(points) => {
+                    let _ = self.session.dispatch(Command::MakeAngleRoi { points });
                 }
             }
         }

@@ -1546,6 +1546,16 @@ pub fn validate_filter_request(doc: &ImageDocument) -> Result<(), PluginFilterIn
                 detail: "line selections are not supported".to_string(),
             });
         }
+        Some(Roi::Point(_)) => {
+            return Err(PluginFilterInputError::UnsupportedRoi {
+                detail: "point selections are not supported".to_string(),
+            });
+        }
+        Some(Roi::Angle(_)) => {
+            return Err(PluginFilterInputError::UnsupportedRoi {
+                detail: "angle selections are not supported".to_string(),
+            });
+        }
     }
 
     Ok(())

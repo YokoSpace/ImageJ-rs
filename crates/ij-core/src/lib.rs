@@ -353,6 +353,43 @@ impl PolygonRoi {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PointRoi {
+    pub points: Vec<(i32, i32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AngleRoi {
+    pub points: [(i32, i32); 3],
+}
+
+impl AngleRoi {
+    pub fn angle(&self) -> f64 {
+        let direction = |a: (i32, i32), b: (i32, i32)| {
+            let dx = f64::from(b.0) - f64::from(a.0);
+            let dy = f64::from(a.1) - f64::from(b.1);
+            (180.0 / std::f64::consts::PI) * dy.atan2(dx)
+        };
+        // PolygonRoi.getAngleAsString, lines 773-788, also defines coincident arms.
+        let angle = (180.0
+            - (direction(self.points[0], self.points[1])
+                - direction(self.points[1], self.points[2]))
+            .abs())
+        .abs();
+        if angle > 180.0 { 360.0 - angle } else { angle }
+    }
+}
+
+fn point_bounds(points: &[(i32, i32)]) -> (i32, i32, i32, i32) {
+    let xs: Vec<_> = points.iter().map(|p| p.0).collect();
+    let ys: Vec<_> = points.iter().map(|p| p.1).collect();
+    if points.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        polygon_bounds(&xs, &ys)
+    }
+}
+
 /// A straight line selection. Line ROIs are not areas: ImageJ resets the
 /// processor ROI before filters such as Invert (ImagePlus.setRoi lines
 /// 2080-2083), and Analyzer measures a sampled profile instead of a mask.
@@ -615,11 +652,13 @@ pub enum Roi {
     Oval(RectRoi),
     Polygon(PolygonRoi),
     Line(LineRoi),
+    Point(PointRoi),
+    Angle(AngleRoi),
 }
 
 impl Roi {
     pub fn is_area(&self) -> bool {
-        !matches!(self, Self::Line(_))
+        matches!(self, Self::Rect(_) | Self::Oval(_) | Self::Polygon(_))
     }
 
     pub fn bounds(&self) -> (i32, i32, i32, i32) {
@@ -627,6 +666,11 @@ impl Roi {
             Self::Rect(r) | Self::Oval(r) => (r.x, r.y, r.width, r.height),
             Self::Polygon(p) => p.bounds(),
             Self::Line(l) => l.bounds(),
+            Self::Point(p) => {
+                let (x, y, w, h) = point_bounds(&p.points);
+                (x, y, w + 1, h + 1)
+            }
+            Self::Angle(a) => point_bounds(&a.points),
         }
     }
 
@@ -661,7 +705,7 @@ impl Roi {
     ) -> Result<Option<RoiMask>, CoreError> {
         let (bx, by, bw, bh) = self.bounds();
         let local = match self {
-            Self::Rect(_) | Self::Line(_) => return Ok(None),
+            Self::Rect(_) | Self::Line(_) | Self::Point(_) | Self::Angle(_) => return Ok(None),
             Self::Oval(_) => oval_mask(bw, bh),
             Self::Polygon(p) => polygon_mask(&p.xpoints, &p.ypoints, bw, bh),
         };
@@ -696,7 +740,20 @@ impl Roi {
     /// Moves the ROI so that its bounding box top-left is at (new_x, new_y)
     /// (Roi.java lines 262-277).
     pub fn set_location(&mut self, new_x: i32, new_y: i32) {
+        let (old_x, old_y, _, _) = self.bounds();
         match self {
+            Self::Point(p) => {
+                for (x, y) in &mut p.points {
+                    *x += new_x - old_x;
+                    *y += new_y - old_y;
+                }
+            }
+            Self::Angle(a) => {
+                for (x, y) in &mut a.points {
+                    *x += new_x - old_x;
+                    *y += new_y - old_y;
+                }
+            }
             Self::Rect(r) | Self::Oval(r) => {
                 r.x = new_x;
                 r.y = new_y;
@@ -730,7 +787,7 @@ impl Roi {
     pub fn is_smaller(&self, img_width: u32, img_height: u32) -> bool {
         let (_, _, bw, bh) = self.bounds();
         let mask = match self {
-            Self::Rect(_) | Self::Line(_) => return false,
+            Self::Rect(_) | Self::Line(_) | Self::Point(_) | Self::Angle(_) => return false,
             Self::Oval(_) => oval_mask(bw, bh),
             Self::Polygon(p) => polygon_mask(&p.xpoints, &p.ypoints, bw, bh),
         };
@@ -1827,7 +1884,9 @@ impl ImageDocument {
                 xpoints: p.xpoints.iter().map(|px| px - x as i32).collect(),
                 ypoints: p.ypoints.iter().map(|py| py - y as i32).collect(),
             })),
-            Roi::Line(_) => unreachable!("line ROIs are rejected above"),
+            Roi::Line(_) | Roi::Point(_) | Roi::Angle(_) => {
+                unreachable!("non-area ROIs are rejected above")
+            }
         };
         Ok(())
     }
@@ -1881,7 +1940,7 @@ impl ImageDocument {
                 // Duplicator.java 121-123 calls roi.setLocation(0, 0) for
                 // non-rectangular area selections.
                 relocated_roi = match roi {
-                    Roi::Rect(_) | Roi::Line(_) => None,
+                    Roi::Rect(_) | Roi::Line(_) | Roi::Point(_) | Roi::Angle(_) => None,
                     Roi::Oval(r) => Some(Roi::Oval(RectRoi {
                         x: 0,
                         y: 0,
@@ -2539,7 +2598,7 @@ impl ImageDocument {
             None => (0, 0, width, height, None),
             // Line ROIs are not areas, so ImagePlus resets the processor ROI
             // and Invert affects the whole image (ImagePlus.java lines 2080-2083).
-            Some(Roi::Line(_)) => (0, 0, width, height, None),
+            Some(roi) if !roi.is_area() => (0, 0, width, height, None),
             Some(roi) => {
                 let (rx, ry, rw, rh) = roi.clipped_bounds(width, height).unwrap_or((0, 0, 0, 0));
                 let mask = roi.raster_mask(width, height).ok().flatten();
@@ -2735,6 +2794,43 @@ impl ImageDocument {
         self.measure_with_config(MeasurementConfig::default())
     }
 
+    pub fn measure_rows_with_config(
+        &self,
+        config: MeasurementConfig,
+    ) -> Result<Vec<MeasurementSummary>, CoreError> {
+        if let Some(Roi::Point(points)) = &self.roi {
+            let mut sample = self.clone();
+            return points
+                .points
+                .iter()
+                .map(|&(x, y)| {
+                    sample.roi = Some(Roi::Rect(RectRoi {
+                        x,
+                        y,
+                        width: 1,
+                        height: 1,
+                    }));
+                    let mut row = sample.measure_with_config(config)?;
+                    row.area = 0.0;
+                    row.perimeter = 0.0;
+                    row.circularity = 0.0;
+                    row.aspect_ratio = 0.0;
+                    row.roundness = 0.0;
+                    row.solidity = f64::NAN;
+                    // Analyzer.measurePoint stores uncalibrated coordinates in XM/YM.
+                    row.x_center_of_mass = f64::from(x);
+                    row.y_center_of_mass = f64::from(y);
+                    row.point = Some((
+                        self.calibration.transform_x(f64::from(x)),
+                        self.calibration.transform_y(f64::from(y), self.height),
+                    ));
+                    Ok(row)
+                })
+                .collect();
+        }
+        Ok(vec![self.measure_with_config(config)?])
+    }
+
     /// Measures the active ROI/slice with the `Analyze > Set Measurements...`
     /// options. Only `LIMIT` changes the numbers: when it is enabled and a
     /// threshold is active, each statistics class clips its histogram and
@@ -2745,6 +2841,34 @@ impl ImageDocument {
         &self,
         config: MeasurementConfig,
     ) -> Result<MeasurementSummary, CoreError> {
+        if let Some(Roi::Point(_)) = &self.roi {
+            return self
+                .measure_rows_with_config(config)?
+                .into_iter()
+                .next()
+                .ok_or(CoreError::EmptySelection);
+        }
+        if let Some(Roi::Angle(angle)) = &self.roi {
+            let (x, y, w, h) = self.roi.as_ref().unwrap().bounds();
+            let mut row = MeasurementSummary {
+                angle: Some(angle.angle()),
+                perimeter: self.roi_perimeter(),
+                roi_x: self.calibration.transform_x(f64::from(x)),
+                roi_y: self.calibration.transform_y(f64::from(y), self.height),
+                roi_width: f64::from(w) * self.calibration.pixel_width,
+                roi_height: f64::from(h) * self.calibration.pixel_height,
+                stack_position: self.stack_position(),
+                threshold_range: config.contains(MeasurementFlags::LIMIT).then_some(
+                    ThresholdLevels {
+                        lower: 0.0,
+                        upper: 0.0,
+                    },
+                ),
+                ..MeasurementSummary::default()
+            };
+            self.populate_shape_descriptors(&mut row, config);
+            return Ok(row);
+        }
         // Analyzer.java 510-511 applies the processor threshold to the profile
         // FloatProcessor before measuring a line, so LIMIT also clips line stats.
         let limit = if config.contains(MeasurementFlags::LIMIT) {
@@ -3210,6 +3334,8 @@ impl ImageDocument {
             area_fraction: raw.area_fraction,
             stack_position: self.stack_position(),
             line: None,
+            point: None,
+            angle: None,
         }
     }
 
@@ -3346,7 +3472,7 @@ impl ImageDocument {
                 convex_hull_area(&poly.xpoints.iter().copied().zip(poly.ypoints.iter().copied()).collect::<Vec<_>>())
             }
             Some(Roi::Oval(oval)) => oval_convex_area(*oval),
-            Some(Roi::Line(_)) => unreachable!(),
+            Some(Roi::Line(_) | Roi::Point(_) | Roi::Angle(_)) => unreachable!(),
         };
         summary.solidity = summary.pixel_count as f64 / convex_area;
     }
@@ -3397,6 +3523,15 @@ impl ImageDocument {
                     * (3.0 * (a + b) - ((3.0 * a + b) * (a + 3.0 * b)).sqrt())
             }
             Some(Roi::Polygon(poly)) => polygon_perimeter(poly, pw, ph),
+            Some(Roi::Point(_)) => 0.0,
+            Some(Roi::Angle(a)) => a
+                .points
+                .windows(2)
+                .map(|p| {
+                    ((f64::from(p[1].0) - f64::from(p[0].0)) * pw)
+                        .hypot((f64::from(p[1].1) - f64::from(p[0].1)) * ph)
+                })
+                .sum(),
             Some(Roi::Line(line)) => {
                 let dx = f64::from(line.x2 - line.x1) * pw;
                 let dy = f64::from(line.y2 - line.y1) * ph;
@@ -4328,7 +4463,7 @@ pub struct StackPosition {
     pub frame: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeasurementSummary {
     pub pixel_count: u64,
     pub area: f64,
@@ -4387,6 +4522,10 @@ pub struct MeasurementSummary {
     /// Area measurements leave these cells unset, exactly like ImageJ's
     /// default Results table.
     pub line: Option<LineMeasurement>,
+    #[serde(default)]
+    pub point: Option<(f64, f64)>,
+    #[serde(default)]
+    pub angle: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -4530,6 +4669,10 @@ impl ResultsTable {
                 ] {
                     fixed_places[column] = Some(precision);
                 }
+            }
+            if row.point.is_some() && self.config.contains(MeasurementFlags::CENTROID) {
+                fixed_places[6] = Some(table_precision);
+                fixed_places[7] = Some(table_precision);
             }
         }
 
@@ -4727,6 +4870,13 @@ impl MeasurementSummary {
             // (Analyzer.java 687-697).
             cells[COLUMN_ANGLE] = Some(line.angle);
             cells[COLUMN_LENGTH] = Some(line.length);
+        }
+        if let Some((x, y)) = self.point {
+            cells[6] = Some(x);
+            cells[7] = Some(y);
+        }
+        if let Some(angle) = self.angle {
+            cells[COLUMN_ANGLE] = Some(angle);
         }
         cells
     }

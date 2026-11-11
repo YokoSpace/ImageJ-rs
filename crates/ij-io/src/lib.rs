@@ -478,6 +478,7 @@ fn encode_roi_metadata(roi: &Roi) -> Result<Vec<u8>, IoError> {
         Roi::Oval(rect) => encode_rect_or_oval(rect, ROI_TYPE_OVAL),
         Roi::Polygon(polygon) => encode_polygon_roi(polygon),
         Roi::Line(line) => encode_line_roi(line),
+        Roi::Point(_) | Roi::Angle(_) => Err(unsupported_roi("with point or angle selections")),
     }
 }
 

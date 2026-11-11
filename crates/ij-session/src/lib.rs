@@ -7,7 +7,7 @@ pub use ij_bridge::plugin::{
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
     MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
-    Roi, ThresholdLevels,
+    AngleRoi, PointRoi, Roi, ThresholdLevels,
 };
 use ij_io::{ImageFileFormat, IoError, detect_image_format, load_image, save_jpeg, save_png, save_tiff};
 use ij_plugin_api::{PluginContext, RustImagePlugin};
@@ -123,6 +123,12 @@ pub enum Command {
         y: i32,
         width: i32,
         height: i32,
+    },
+    MakePointRoi {
+        points: Vec<(i32, i32)>,
+    },
+    MakeAngleRoi {
+        points: [(i32, i32); 3],
     },
     MakePolygonRoi {
         points: Vec<(i32, i32)>,
@@ -892,6 +898,52 @@ impl Session {
                     .push(format!("makeOval({x}, {y}, {width}, {height});"));
                 Ok(CommandOutcome::Updated)
             }
+            Command::MakePointRoi { points } => {
+                if points.is_empty() {
+                    return Err(CoreError::EmptySelection.into());
+                }
+                self.active_doc_mut()?.roi = Some(Roi::Point(PointRoi {
+                    points: points.clone(),
+                }));
+                self.mark_active_dirty();
+                if points.len() == 1 {
+                    self.macro_recorder
+                        .push(format!("makePoint({}, {});", points[0].0, points[0].1));
+                } else {
+                    let xs = points
+                        .iter()
+                        .map(|p| p.0.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let ys = points
+                        .iter()
+                        .map(|p| p.1.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.macro_recorder.push(format!(
+                        "makeSelection(\"point\", newArray({xs}), newArray({ys}));"
+                    ));
+                }
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MakeAngleRoi { points } => {
+                self.active_doc_mut()?.roi = Some(Roi::Angle(AngleRoi { points }));
+                self.mark_active_dirty();
+                let xs = points
+                    .iter()
+                    .map(|p| p.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ys = points
+                    .iter()
+                    .map(|p| p.1.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.macro_recorder.push(format!(
+                    "makeSelection(\"angle\", newArray({xs}), newArray({ys}));"
+                ));
+                Ok(CommandOutcome::Updated)
+            }
             Command::MakePolygonRoi { points } => {
                 let changed = {
                     let doc = self.active_doc_mut()?;
@@ -1632,8 +1684,13 @@ impl Session {
                 Ok(CommandOutcome::Updated)
             }
             Command::Measure => {
-                let stats = self.active_doc()?.measure_with_config(self.results.config)?;
-                self.results.push(stats.clone());
+                let rows = self
+                    .active_doc()?
+                    .measure_rows_with_config(self.results.config)?;
+                let stats = rows.last().cloned().ok_or(CoreError::EmptySelection)?;
+                for row in rows {
+                    self.results.push(row);
+                }
                 self.macro_recorder.push("run(\"Measure\");".into());
                 Ok(CommandOutcome::Measured(stats))
             }

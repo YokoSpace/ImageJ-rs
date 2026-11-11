@@ -140,10 +140,8 @@ fn unsupported_actions_guardrail() {
     let unsupported_tools = [
         Tool::Polyline,
         Tool::Freeline,
-        Tool::Point,
         Tool::Text,
         Tool::Dropper,
-        Tool::Angle,
     ];
 
     for tool in unsupported_tools {

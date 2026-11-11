@@ -14680,3 +14680,97 @@ fn parity_math_short_processor_fractional_and_automatic_display_bounds() {
         }
     }
 }
+
+#[test]
+fn parity_point_and_multipoint_results_match_java() {
+    for (tag, points) in [
+        ("single", vec![(2, 3)]),
+        ("multi", vec![(2, 3), (7, 9), (0, 0)]),
+    ] {
+        for options in [
+            "area mean min centroid center perimeter bounding fit shape integrated median skewness kurtosis area_fraction decimal=3",
+            "area mean standard modal min median decimal=3",
+        ] {
+            let mut session = Session::new();
+            session
+                .dispatch(Command::NewRamp8Bit {
+                    title: "points".into(),
+                    width: 16,
+                    height: 16,
+                })
+                .unwrap();
+            let config = table_config(options);
+            session
+                .dispatch(Command::SetMeasurements {
+                    flags: config.flags,
+                    precision: config.precision,
+                })
+                .unwrap();
+            session
+                .dispatch(Command::MakePointRoi {
+                    points: points.clone(),
+                })
+                .unwrap();
+            session.dispatch(Command::Measure).unwrap();
+            assert_eq!(session.results.rows.len(), points.len());
+            for (index, &(x, y)) in points.iter().enumerate() {
+                let expected = oracle_saved_results_tsv(
+                    &format!(
+                        "newImage('points','8-bit ramp',16,16,1); run('Set Measurements...', '{options}'); makePoint({x},{y}); run('Measure');"
+                    ),
+                    &format!("p37a_{tag}_{index}_{}", config.flags),
+                );
+                let one_row = ResultsTable {
+                    rows: vec![session.results.rows[index].clone()],
+                    config,
+                };
+                assert_eq!(one_row.to_tsv().trim(), expected.trim(), "{tag} point {index}: {options}");
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_angle_calibrated_results_match_java() {
+    for (index, points) in [
+        [(2, 3), (5, 8), (9, 4)],
+        [(1, 1), (5, 1), (9, 1)],
+        [(5, 1), (5, 1), (9, 1)],
+        [(9, 4), (5, 8), (2, 3)],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for calibrated in [false, true] {
+            let mut session = Session::new();
+            session
+                .dispatch(Command::NewRamp8Bit {
+                    title: "angle".into(),
+                    width: 16,
+                    height: 16,
+                })
+                .unwrap();
+            let scale = if calibrated {
+                "setVoxelSize(2,3,1,'um');"
+            } else {
+                ""
+            };
+            if calibrated {
+                let doc = session.active_doc_mut().unwrap();
+                doc.calibration.pixel_width = 2.0;
+                doc.calibration.pixel_height = 3.0;
+            }
+            session.dispatch(Command::MakeAngleRoi { points }).unwrap();
+            session.dispatch(Command::Measure).unwrap();
+            let xs = points.map(|p| p.0.to_string()).join(",");
+            let ys = points.map(|p| p.1.to_string()).join(",");
+            let expected = oracle_saved_results_tsv(
+                &format!(
+                    "newImage('angle','8-bit ramp',16,16,1); {scale} makeSelection('angle', newArray({xs}), newArray({ys})); run('Measure');"
+                ),
+                &format!("p37a_angle_{index}_{calibrated}"),
+            );
+            assert_eq!(session.results.to_tsv().trim(), expected.trim());
+        }
+    }
+}

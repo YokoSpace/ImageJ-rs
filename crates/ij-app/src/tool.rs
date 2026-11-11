@@ -85,9 +85,11 @@ impl Tool {
                 | Self::Polygon
                 | Self::Freehand
                 | Self::Line
+                | Self::Point
                 | Self::Wand
                 | Self::Magnifier
                 | Self::Hand
+                | Self::Angle
         )
     }
 }
