@@ -66,6 +66,7 @@ pub enum AppAction {
     Histogram,
     PlotProfile,
     SetMeasurements,
+    AnalyzeParticles,
     SetScale,
     ClearResults,
     InstalledPlugins,
@@ -255,6 +256,7 @@ const ANALYZE_MENU: &[MenuNode] = &[
     item("Measure", Some("M"), AppAction::Measure),
     item("Histogram", Some("H"), AppAction::Histogram),
     item("Clear Results", None, AppAction::ClearResults),
+    item("Analyze Particles...", None, AppAction::AnalyzeParticles),
     item("Set Measurements...", None, AppAction::SetMeasurements),
     item("Set Scale...", None, AppAction::SetScale),
     item("Plot Profile", Some("K"), AppAction::PlotProfile),
@@ -800,6 +802,7 @@ impl ImageJApp {
                     self.histogram_window = Some(crate::app::HistogramWindowState::new(doc, summary));
                 }
             }
+            AnalyzeParticles => { self.particles.open = true; }
             SetMeasurements => {
                 self.open_set_measurements_dialog();
             }

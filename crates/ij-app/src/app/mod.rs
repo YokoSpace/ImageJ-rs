@@ -179,6 +179,7 @@ pub struct ImageJApp {
     pub plot_profile_window: Option<PlotProfileWindowState>,
     pub dialogs: DialogState,
     /// `Analyze > Set Measurements...` window and its uncommitted options.
+    pub particles: crate::dialogs::ParticleDialog,
     pub set_measurements: SetMeasurementsDialog,
     /// `Analyze > Set Scale...` window and its uncommitted values.
     pub set_scale: SetScaleDialog,
@@ -239,6 +240,7 @@ impl ImageJApp {
             histogram_window: None,
             plot_profile_window: None,
             dialogs: DialogState::new(),
+            particles: crate::dialogs::ParticleDialog::default(),
             set_measurements: SetMeasurementsDialog::default(),
             set_scale: SetScaleDialog::default(),
             pending_close: None,

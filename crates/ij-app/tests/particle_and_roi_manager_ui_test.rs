@@ -70,3 +70,18 @@ fn roi_manager_content_adds_measures_and_confirms_delete_all() {
     assert!(app.pending_roi_manager_delete_all);
     assert_eq!(app.session.roi_manager.len(), 2);
 }
+
+#[test]
+fn particle_dialog_opens_and_applies() {
+ let mut app = ImageJApp::new();
+ app.open_ramp_8bit("particles", 8, 8).unwrap();
+ app.session.dispatch(ij_session::Command::SetThreshold { lower: 1.0, upper: 255.0 }).unwrap();
+ app.particles.add_to_manager = true;
+ app.perform(AppAction::AnalyzeParticles, &egui::Context::default());
+ assert!(app.particles.open);
+ app.apply_particle_dialog().unwrap();
+ assert!(!app.particles.open);
+ assert!(!app.session.roi_manager.is_empty());
+ app.session.dispatch(ij_session::Command::RoiManagerSelect { index: 0 }).unwrap();
+ assert!(app.session.active_doc().unwrap().roi.is_some());
+}

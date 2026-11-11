@@ -324,6 +324,7 @@ impl ImageJApp {
             self.render_threshold_palette(ctx);
         }
 
+        if self.particles.open { self.render_particle_dialog(ctx); }
         if self.set_measurements.open {
             self.render_set_measurements_dialog(ctx);
         }
@@ -2381,6 +2382,55 @@ impl ImageJApp {
         }
         if let Some(apply) = answer {
             if let Err(error) = self.resolve_math_dialog(apply) {
+                self.dialogs.last_error = Some(error.to_string());
+            }
+        }
+    }
+}
+
+impl ImageJApp {
+    pub fn apply_particle_dialog(&mut self) -> Result<(), SessionError> {
+        self.session.dispatch(Command::AnalyzeParticles {
+            options: self.particles.options,
+            clear_results: self.particles.clear_results,
+            add_to_manager: self.particles.add_to_manager,
+        })?;
+        self.show_results_window = self.particles.display_results;
+        if self.particles.add_to_manager { self.show_roi_manager_window = true; }
+        self.particles.open = false;
+        Ok(())
+    }
+
+    fn render_particle_dialog(&mut self, ctx: &egui::Context) {
+        let mut open = self.particles.open;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new("Analyze Particles").open(&mut open).show(ctx, |ui| {
+            let d = &mut self.particles;
+            ui.horizontal(|ui| {
+                ui.label("Size:");
+                ui.add(egui::DragValue::new(&mut d.options.min_size));
+                ui.add(egui::DragValue::new(&mut d.options.max_size));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Circularity:");
+                ui.add(egui::DragValue::new(&mut d.options.min_circularity).speed(0.01));
+                ui.add(egui::DragValue::new(&mut d.options.max_circularity).speed(0.01));
+            });
+            ui.checkbox(&mut d.options.pixel_units, "Pixel units");
+            ui.checkbox(&mut d.options.exclude_on_edges, "Exclude on edges");
+            ui.checkbox(&mut d.options.include_holes, "Include holes");
+            ui.checkbox(&mut d.display_results, "Display results");
+            ui.checkbox(&mut d.clear_results, "Clear results");
+            ui.checkbox(&mut d.add_to_manager, "Add to Manager");
+            ui.horizontal(|ui| {
+                apply = ui.button("OK").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        self.particles.open = open && !cancel;
+        if apply {
+            if let Err(error) = self.apply_particle_dialog() {
                 self.dialogs.last_error = Some(error.to_string());
             }
         }
