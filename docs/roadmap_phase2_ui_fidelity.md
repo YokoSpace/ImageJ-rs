@@ -367,7 +367,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 ## 5.5 ここまでの進捗（2026-11-11 時点）
 
 - **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1–M7, S1–S2, N0–N1, P1, 英語・日本語 README。
-- **機能実装済み・監査の残り**: `Results... `（読込）と `Results...`（保存）の台帳分類の是正。メニュー網羅テストの空白除去は、この区別を隠すため除去予定。見た目の厳密な実機比較も未実施。
+- **残りの Phase 2 実装タスク**: なし。台帳の `Results... `（読込）は `JavaBridge`、`Results...`（保存）は `RustTier1` と区別し、メニュー網羅テストはラベルを完全一致で比較する。見た目の厳密な実機比較は未実施。
 
 以下では、残りのタスクを `deepseek-V4.1-flash` / `Gemini flash` / `Claude Sonnet` が迷わず1タスクずつ完結できるよう、サブタスク・型シグネチャ・Java 参照行・先に書くテスト・非ゴールまで具体化しています。
 
@@ -587,6 +587,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
   - `crates/ij-app/src/app/shortcuts.rs`
   - `crates/ij-app/tests/stack_process_test.rs`
   - `crates/ij-app/tests/menu_coverage_test.rs`
+  - `tools/ledger/sync_ledger.py`（読込・保存の誤分類修正。生成物 `docs/command_ledger.md` と `crates/ij-session/src/generated_commands.rs` はスクリプトで再生成）
 - **仕様**:
   1. `ij-core`: 全スライスに対して現在の ROI を適用しながら各フィルタを回す `smooth_stack`, `sharpen_stack`, `find_edges_stack`, `gaussian_blur_stack`, `median_stack`, `minimum_stack`, `maximum_stack`, `despeckle_stack` を実装する。ImageJ と同様、スタック全体処理後は `snapshot = None`（単一スライス Undo 無効）にするか `save_snapshot()` するかを既存 `invert_stack` と揃える。
   2. `ij-session`: 各フィルタの Stack コマンド（または `whole_stack: bool` フラグ / `*Stack` バリアント）を追加し、マクロ記録に `"stack"` を付与する。

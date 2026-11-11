@@ -128,7 +128,9 @@ def parse_props(text: str, seen_labels: set):
             continue
         seen_labels.add(label)
         java_class, java_arg = classify_target(target)
-        tier = "RustTier1" if label.strip() in RUST_SLICE_1_COMMANDS else "JavaBridge"
+        # IJ_Props.txt uses "Results... " for import and "Results..." for
+        # export. Whitespace is part of the registered command identity.
+        tier = "RustTier1" if label in RUST_SLICE_1_COMMANDS else "JavaBridge"
 
         entries.append({
             "key": key,

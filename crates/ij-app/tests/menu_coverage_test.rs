@@ -115,17 +115,10 @@ fn tier_one_commands_have_menu_actions_or_an_explicit_gap() {
     let mut wired = BTreeSet::new();
     collect_wired(MENU_TREE, &mut wired);
 
-    // IJ_Props.txt registers File>Import>Results... as `"Results... "` with a
-    // trailing space (original_imagej/IJ_Props.txt line 37), and
-    // tools/ledger/sync_ledger.py classifies tiers with `label.strip()`, so the
-    // ledger's two "Results..." entries are the same Tier1 command. Compare
-    // trimmed labels so that trailing space is not reported as a phantom gap.
-    let wired: BTreeSet<&str> = wired.into_iter().map(str::trim).collect();
-
     let missing: BTreeSet<_> = COMMAND_SPECS
         .iter()
         .filter(|spec| spec.tier == ExecutionTier::RustTier1)
-        .map(|spec| spec.label.trim())
+        .map(|spec| spec.label)
         .filter(|label| !wired.contains(label))
         .collect();
     let known: BTreeSet<_> = KNOWN_UNWIRED.iter().copied().collect();
@@ -133,6 +126,21 @@ fn tier_one_commands_have_menu_actions_or_an_explicit_gap() {
         missing, known,
         "update KNOWN_UNWIRED when menu wiring changes"
     );
+}
+
+#[test]
+fn results_import_and_export_keep_distinct_labels_targets_and_tiers() {
+    // IJ_Props.txt 37/65 and SimpleCommands.java 23-24 distinguish import
+    // from MeasurementsWriter's save(path) (MeasurementsWriter.java 12-16).
+    let import = COMMAND_SPECS.iter().find(|spec| spec.prop_key == "import06").unwrap();
+    let export = COMMAND_SPECS.iter().find(|spec| spec.prop_key == "save16").unwrap();
+    assert_eq!(import.label, "Results... ");
+    assert_eq!(import.java_class, "ij.plugin.SimpleCommands");
+    assert_eq!(import.java_arg, "import");
+    assert_eq!(import.tier, ExecutionTier::JavaBridge);
+    assert_eq!(export.label, "Results...");
+    assert_eq!(export.java_class, "ij.plugin.MeasurementsWriter");
+    assert_eq!(export.tier, ExecutionTier::RustTier1);
 }
 
 fn file_menu_nodes() -> &'static [MenuNode] {

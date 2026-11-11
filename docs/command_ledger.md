@@ -3,8 +3,8 @@
 Generated from `original_imagej/ij/Menus.java` and `original_imagej/IJ_Props.txt` by `tools/ledger/sync_ledger.py`. Do not edit by hand.
 
 - Total registered menu commands: **414**
-- Rust Vertical Slice 1 target (`RustTier1`): **17**
-- Delegated to Java compatibility session (`JavaBridge`): **397**
+- Rust Vertical Slice 1 target (`RustTier1`): **16**
+- Delegated to Java compatibility session (`JavaBridge`): **398**
 
 | Key | Menu section | Command label | Shortcut | Java class | Arg | Target tier |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -92,7 +92,7 @@ Generated from `original_imagej/ij/Menus.java` and `original_imagej/IJ_Props.txt
 | `import03` | File/Import | `LUT... ` | `` | `ij.plugin.LutLoader` | `` | `JavaBridge` |
 | `import04` | File/Import | `Text Image... ` | `` | `ij.plugin.TextReader` | `` | `JavaBridge` |
 | `import05` | File/Import | `Text File... ` | `` | `ij.plugin.TextFileReader` | `` | `JavaBridge` |
-| `import06` | File/Import | `Results... ` | `` | `ij.plugin.SimpleCommands` | `import` | `RustTier1` |
+| `import06` | File/Import | `Results... ` | `` | `ij.plugin.SimpleCommands` | `import` | `JavaBridge` |
 | `import07` | File/Import | `Table... ` | `` | `ij.plugin.SimpleCommands` | `table` | `JavaBridge` |
 | `import08` | File/Import | `URL...` | `` | `ij.plugin.URLOpener` | `` | `JavaBridge` |
 | `import09` | File/Import | `Stack From List...` | `` | `ij.plugin.ListVirtualStack` | `` | `JavaBridge` |

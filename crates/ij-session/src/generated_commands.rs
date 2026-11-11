@@ -782,7 +782,7 @@ pub const COMMAND_SPECS: [CommandSpec; 414] = [
         shortcut: "",
         java_class: "ij.plugin.SimpleCommands",
         java_arg: "import",
-        tier: ExecutionTier::RustTier1,
+        tier: ExecutionTier::JavaBridge,
     },
     CommandSpec {
         prop_key: "import07",
