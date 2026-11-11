@@ -1,6 +1,6 @@
 use crate::app::ImageJApp;
 use ij_core::PixelPlane;
-use ij_session::{Command, ImageId};
+use ij_session::{Command, CommandOutcome, ImageId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAction {
@@ -32,6 +32,7 @@ pub enum AppAction {
     Maximum,
     Despeckle,
     Measure,
+    Histogram,
     SetMeasurements,
     ClearResults,
     InstalledPlugins,
@@ -168,6 +169,7 @@ const PROCESS_MENU: &[MenuNode] = &[
 
 const ANALYZE_MENU: &[MenuNode] = &[
     item("Measure", Some("M"), AppAction::Measure),
+    item("Histogram", Some("H"), AppAction::Histogram),
     item("Clear Results", None, AppAction::ClearResults),
     item("Set Measurements...", None, AppAction::SetMeasurements),
     unsupported("Plot Profile", None),
@@ -404,6 +406,14 @@ impl ImageJApp {
             }
             Measure => {
                 let _ = self.measure_active();
+            }
+            Histogram => {
+                if let (Ok(doc), Ok(CommandOutcome::HistogramComputed(summary))) = (
+                    self.session.active_doc().map(|doc| doc.title.clone()),
+                    self.session.dispatch(Command::Histogram),
+                ) {
+                    self.histogram_window = Some(crate::app::HistogramWindowState::new(doc, summary));
+                }
             }
             SetMeasurements => {
                 self.open_set_measurements_dialog();

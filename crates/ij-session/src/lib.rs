@@ -5,7 +5,7 @@ pub use ij_bridge::plugin::{
     PluginBridge, PluginBridgeError, PluginFilterInputError, PluginFilterRequest, PluginFilterRun,
 };
 use ij_core::{
-    CoreError, DisplayRange, ImageDocument, MeasurementConfig, MeasurementFlags,
+    display_histogram, CoreError, DisplayRange, ImageDocument, MeasurementConfig, MeasurementFlags,
     MeasurementSummary, PixelPlane, ResultsTable, ThresholdLevels,
 };
 use ij_io::{IoError, load_tiff, save_tiff};
@@ -199,6 +199,7 @@ pub enum Command {
     /// `Analyze > Set Measurements...` updates session measurement options.
     SetMeasurements { flags: u32, precision: u8 },
     Measure,
+    Histogram,
     ClearResults,
     SaveResultsTsv {
         path: PathBuf,
@@ -224,6 +225,7 @@ pub enum CommandOutcome {
     Saved(PathBuf),
     Updated,
     Measured(MeasurementSummary),
+    HistogramComputed(HistogramSummary),
     ResultsCleared,
     /// New `minThreshold`/`maxThreshold` state; pixels are unchanged.
     Thresholded(ThresholdLevels),
@@ -236,6 +238,20 @@ pub enum CommandOutcome {
     /// image and its dirty state are unchanged.
     NothingToUndo,
     PluginFiltered(PluginFilterOutcome),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistogramSummary {
+    pub counts: Vec<u64>,
+    pub hmin: f64,
+    pub hmax: f64,
+    pub bin_size: f64,
+    pub count: u64,
+    pub mean: f64,
+    pub std_dev: f64,
+    pub min: f64,
+    pub max: f64,
+    pub mode: f64,
 }
 
 fn measurement_macro_options(config: MeasurementConfig) -> String {
@@ -1024,6 +1040,77 @@ impl Session {
                 self.results.push(stats.clone());
                 self.macro_recorder.push("run(\"Measure\");".into());
                 Ok(CommandOutcome::Measured(stats))
+            }
+            Command::Histogram => {
+                let mut doc = self.active_doc()?.clone();
+                // ImagePlus.getStatistics resets non-area ROI before the
+                // Histogram plugin reads it (ImagePlus.java 1141-1145).
+                if doc.roi.as_ref().is_some_and(|roi| !roi.is_area()) {
+                    doc.roi = None;
+                }
+                let config = MeasurementConfig {
+                    flags: MeasurementFlags::AREA
+                        | MeasurementFlags::MEAN
+                        | MeasurementFlags::MODE
+                        | MeasurementFlags::MIN_MAX
+                        | (self.results.config.flags & MeasurementFlags::LIMIT),
+                    precision: self.results.config.precision,
+                };
+                let stats = doc.measure_with_config(config)?;
+                let mut display = display_histogram(&doc);
+                if config.contains(MeasurementFlags::LIMIT) {
+                    if let Some(levels) = doc.threshold {
+                        match doc.plane() {
+                            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => {
+                                let lower = (levels.lower as i32).clamp(0, 255) as usize;
+                                let upper = (levels.upper as i32).clamp(0, 255) as usize;
+                                for (index, count) in display.counts.iter_mut().enumerate() {
+                                    if index < lower || index > upper {
+                                        *count = 0;
+                                    }
+                                }
+                            }
+                            PixelPlane::Gray16(_) => {
+                                display.hmin = stats.min;
+                                display.hmax = stats.max;
+                                display.counts = [0; 256];
+                                let width = (stats.max - stats.min + 1.0) / 256.0;
+                                if width > 0.0 {
+                                    for (value, &count) in stats.histogram.iter().enumerate() {
+                                        if count > 0 && (value as f64) >= stats.min && (value as f64) <= stats.max {
+                                            let bin = (((value as f64 - stats.min) / width) as usize).min(255);
+                                            display.counts[bin] += count;
+                                        }
+                                    }
+                                }
+                            }
+                            PixelPlane::Gray32(_) => {
+                                display.hmin = stats.min;
+                                display.hmax = stats.max;
+                                display.counts.copy_from_slice(&stats.histogram);
+                            }
+                            PixelPlane::ColorRgb(_) => {}
+                        }
+                    }
+                }
+                let summary = HistogramSummary {
+                    counts: display.counts.to_vec(),
+                    hmin: display.hmin,
+                    hmax: display.hmax,
+                    bin_size: match doc.plane() {
+                        PixelPlane::Gray16(_) => (display.hmax - display.hmin + 1.0) / 256.0,
+                        PixelPlane::Gray32(_) => (display.hmax - display.hmin) / 256.0,
+                        _ => 1.0,
+                    },
+                    count: stats.pixel_count,
+                    mean: stats.mean,
+                    std_dev: stats.std_dev,
+                    min: stats.min,
+                    max: stats.max,
+                    mode: stats.mode,
+                };
+                self.macro_recorder.push("run(\"Histogram\");".into());
+                Ok(CommandOutcome::HistogramComputed(summary))
             }
             Command::ClearResults => {
                 self.results.clear();

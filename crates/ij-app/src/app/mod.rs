@@ -19,7 +19,7 @@ use ij_bridge::plugin_discovery::{
 };
 use ij_core::{MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, Roi};
 use ij_session::{
-    Command, CommandOutcome, ImageId, PluginFilterOutcome, PluginFilterTicket, Session,
+    Command, CommandOutcome, HistogramSummary, ImageId, PluginFilterOutcome, PluginFilterTicket, Session,
     SessionError,
 };
 use std::collections::{BTreeMap, HashMap};
@@ -35,6 +35,8 @@ mod plugin_ops;
 mod plugins_ui;
 mod close_guard;
 mod shortcuts;
+mod histogram_window;
+pub use self::histogram_window::HistogramWindowState;
 pub use self::menu::scrollable_menu;
 pub use self::image_window::draw_ellipse_stroke;
 pub use self::adjust_dialogs::{
@@ -151,6 +153,7 @@ pub struct ImageJApp {
     pub progress: Option<f32>,
     pub image_views: BTreeMap<ImageId, ImageView>,
     pub show_results_window: bool,
+    pub histogram_window: Option<HistogramWindowState>,
     pub dialogs: DialogState,
     /// `Analyze > Set Measurements...` window and its uncommitted options.
     pub set_measurements: SetMeasurementsDialog,
@@ -185,6 +188,7 @@ impl ImageJApp {
             progress: None,
             image_views: BTreeMap::new(),
             show_results_window: false,
+            histogram_window: None,
             dialogs: DialogState::new(),
             set_measurements: SetMeasurementsDialog::default(),
             pending_close: None,

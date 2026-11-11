@@ -100,6 +100,13 @@ impl ImageJApp {
             return;
         }
 
+        // Histogram: ImageJ's Analyze menu assigns unmodified H (Menus.java 221-224).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::Histogram, ctx);
+            return;
+        }
+
         // Select None: Shift+A or Command/Ctrl+Shift+A
         let select_none = ctx.input_mut(|i| {
             i.consume_key(

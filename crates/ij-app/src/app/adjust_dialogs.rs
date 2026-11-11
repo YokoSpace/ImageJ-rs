@@ -308,6 +308,8 @@ impl ImageJApp {
             self.render_set_measurements_dialog(ctx);
         }
 
+        self.render_histogram_window(ctx);
+
         // "Process Stack?" decision, matching IJ.setupDialog. Yes is offered
         // only where a verified whole-stack implementation exists; otherwise
         // the dialog says so and requires an explicit Current Slice or Cancel.

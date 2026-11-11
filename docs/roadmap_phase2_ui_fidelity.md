@@ -536,6 +536,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
   - `crates/ij-app/src/action.rs`
   - `crates/ij-app/src/app/mod.rs`
   - `crates/ij-app/src/app/adjust_dialogs.rs`（または新規 `crates/ij-app/src/app/histogram_window.rs`）
+  - `crates/ij-app/src/app/shortcuts.rs`
   - `crates/ij-app/tests/menu_coverage_test.rs`
   - `crates/ij-app/tests/histogram_window_test.rs`（新規）
 - **仕様**:
