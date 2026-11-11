@@ -9952,6 +9952,46 @@ fn parity_convert_to_32bit_gray16_matches_java_oracle() {
 }
 
 #[test]
+fn parity_convert_to_32bit_gray16_fractional_range_matches_java_oracle() {
+    // ShortProcessor.setMinAndMax rounds each bound with Math.round before
+    // ImageConverter reads it (ShortProcessor.java 267-274).
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new(
+        "fractional_range_16_to_32.tif",
+        4,
+        1,
+        PixelPlane::Gray16(vec![10, 50, 100, 200]),
+    )
+    .unwrap();
+    doc.display_range = DisplayRange { min: 10.6, max: 200.4 };
+    let oracle = bridge.run_macro_on_image(&doc, "run(\"32-bit\");").unwrap();
+    let oracle_doc = oracle.output_image.expect("oracle must return saved TIFF");
+    doc.convert_to_32bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+#[test]
+fn parity_convert_to_32bit_gray8_fractional_range_matches_java_oracle() {
+    // ByteProcessor.setMinAndMax also rounds each bound with Math.round
+    // (ByteProcessor.java 433-438).
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new(
+        "fractional_range_8_to_32.tif",
+        4,
+        1,
+        PixelPlane::Gray8(vec![10, 50, 100, 200]),
+    )
+    .unwrap();
+    doc.display_range = DisplayRange { min: 10.6, max: 200.4 };
+    let oracle = bridge.run_macro_on_image(&doc, "run(\"32-bit\");").unwrap();
+    let oracle_doc = oracle.output_image.expect("oracle must return saved TIFF");
+    doc.convert_to_32bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+#[test]
 fn parity_convert_to_32bit_rgb_matches_java_oracle() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let mut pixels = vec![0u32; 32];

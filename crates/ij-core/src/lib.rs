@@ -658,6 +658,33 @@ fn float_processor_range(pixels: &[f32]) -> DisplayRange {
     }
 }
 
+fn range_after_float_conversion(
+    source: &PixelPlane,
+    converted: &PixelPlane,
+    display_range: DisplayRange,
+) -> DisplayRange {
+    // ByteProcessor and ShortProcessor round display bounds to integers;
+    // FloatProcessor stores them as floats and treats 0/0 as resetMinAndMax.
+    let source_range = match source {
+        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) => DisplayRange {
+            min: f64::from(java_round_to_i32(display_range.min)),
+            max: f64::from(java_round_to_i32(display_range.max)),
+        },
+        _ => display_range,
+    };
+    if source_range.min == 0.0 && source_range.max == 0.0 {
+        let PixelPlane::Gray32(pixels) = converted else {
+            unreachable!("32-bit conversion must yield Gray32")
+        };
+        float_processor_range(pixels)
+    } else {
+        DisplayRange {
+            min: f64::from(source_range.min as f32),
+            max: f64::from(source_range.max as f32),
+        }
+    }
+}
+
 /// FloatProcessor.create8BitImage (FloatProcessor.java 190-208).
 fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
     let mut value = f64::from(pixel) - min;
@@ -1703,10 +1730,13 @@ impl ImageDocument {
             }
             PixelPlane::Color256 { .. } => unreachable!("COLOR_256 was rejected above"),
         };
+        let converted_range =
+            range_after_float_conversion(&self.slices[0], &converted, self.display_range);
         self.slices[0] = converted;
         // ImageConverter.java 188 restores the original display range via
         // IJ.setMinAndMax(imp, min, max).
         self.snapshot_display_range = Some(self.display_range);
+        self.display_range = converted_range;
         Ok(())
     }
 
@@ -1734,6 +1764,7 @@ impl ImageDocument {
         self.snapshot_dimensions = None;
         self.snapshot_display_range = None;
 
+        let source_plane = self.slices[current].clone();
         self.slices = self
             .slices
             .iter()
@@ -1753,8 +1784,13 @@ impl ImageDocument {
                 }
             })
             .collect();
-        // ImageConverter.java 181 restores the original display range via
-        // IJ.setMinAndMax(imp, min, max).
+        // ImageConverter.java 181 restores the source range via
+        // IJ.setMinAndMax(imp, min, max), subject to processor rounding.
+        self.display_range = range_after_float_conversion(
+            &source_plane,
+            &self.slices[current],
+            self.display_range,
+        );
         Ok(())
     }
 
