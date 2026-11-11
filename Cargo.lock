@@ -1625,12 +1625,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ij-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "ij-core",
+]
+
+[[package]]
 name = "ij-session"
 version = "0.1.0"
 dependencies = [
  "ij-bridge",
  "ij-core",
  "ij-io",
+ "ij-plugin-api",
  "serde",
  "serde_json",
  "tempfile",

@@ -8,6 +8,7 @@ license.workspace = true
 ij-core = { path = "../ij-core" }
 ij-io = { path = "../ij-io" }
 ij-bridge = { path = "../ij-bridge" }
+ij-plugin-api = { path = "../ij-plugin-api" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

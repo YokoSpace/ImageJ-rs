@@ -10,6 +10,7 @@ use ij_core::{
     Roi, ThresholdLevels,
 };
 use ij_io::{ImageFileFormat, IoError, detect_image_format, load_image, save_jpeg, save_png, save_tiff};
+use ij_plugin_api::{PluginContext, RustImagePlugin};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -51,6 +52,8 @@ pub enum SessionError {
     StalePluginFilterResult { id: u32, reason: String },
     #[error("plugin filter output does not match the validated run ticket: {0}")]
     InvalidPluginFilterOutput(String),
+    #[error("Rust plugin failed: {0}")]
+    RustPlugin(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -482,6 +485,35 @@ pub struct Session {
 impl Session {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn run_rust_plugin<P: RustImagePlugin + ?Sized>(
+        &mut self,
+        plugin: &P,
+    ) -> Result<(), SessionError> {
+        let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+        let original = self.images.get(&id).ok_or(SessionError::NoActiveImage)?;
+        let mut context = PluginContext::from_document(original)
+            .map_err(SessionError::RustPlugin)?;
+        plugin
+            .supports(context.metadata())
+            .map_err(|reason| SessionError::RustPlugin(format!("{}: {reason}", plugin.name())))?;
+        plugin
+            .run(&mut context)
+            .map_err(|reason| SessionError::RustPlugin(format!("{}: {reason}", plugin.name())))?;
+        context.validate_output().map_err(SessionError::RustPlugin)?;
+
+        let (slices, rows) = context.into_output();
+        let pixels_changed = slices != original.slices;
+        if pixels_changed {
+            let doc = self.images.get_mut(&id).ok_or(SessionError::NoActiveImage)?;
+            doc.save_snapshot();
+            doc.slices = slices;
+            self.bump_image_revision(id);
+            self.dirty_images.insert(id);
+        }
+        self.results.rows.extend(rows);
+        Ok(())
     }
 
     /// Enables explicit Java `PlugInFilter` execution for this session.

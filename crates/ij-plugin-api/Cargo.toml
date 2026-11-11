@@ -1,0 +1,8 @@
+[package]
+name = "ij-plugin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ij-core = { path = "../ij-core" }
