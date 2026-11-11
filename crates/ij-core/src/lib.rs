@@ -2279,6 +2279,7 @@ impl ImageDocument {
         };
         if let Some(Roi::Line(line)) = &self.roi {
             let mut summary = self.measure_line(*line, config.contains(MeasurementFlags::LIMIT), limit);
+            summary.threshold_range = self.measurement_threshold_range(config);
             self.populate_shape_descriptors(&mut summary, config);
             return Ok(summary);
         }
@@ -2343,6 +2344,7 @@ impl ImageDocument {
         };
 
         let mut summary = self.finish_measurement(rx, ry, rw, rh, raw);
+        summary.threshold_range = self.measurement_threshold_range(config);
         if config.contains(MeasurementFlags::ELLIPSE)
             || config.contains(MeasurementFlags::SHAPE_DESCRIPTORS)
         {
@@ -2557,6 +2559,7 @@ impl ImageDocument {
             aspect_ratio: 0.0,
             roundness: 0.0,
             solidity: 0.0,
+            threshold_range: None,
             int_den: area * mean,
             raw_int_den: raw.sum,
             histogram: raw.histogram,
@@ -2706,6 +2709,34 @@ impl ImageDocument {
             Some(Roi::Line(_)) => unreachable!(),
         };
         summary.solidity = summary.pixel_count as f64 / convex_area;
+    }
+
+    fn measurement_threshold_range(&self, config: MeasurementConfig) -> Option<ThresholdLevels> {
+        if !config.contains(MeasurementFlags::LIMIT) {
+            return None;
+        }
+        let range = match self.plane() {
+            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => self.threshold.map_or(
+                ThresholdLevels { lower: 0.0, upper: 255.0 },
+                |levels| ThresholdLevels {
+                    lower: (levels.lower as i64).clamp(0, 255) as f64,
+                    upper: (levels.upper as i64).clamp(0, 255) as f64,
+                },
+            ),
+            PixelPlane::Gray16(_) => self.threshold.map_or(
+                ThresholdLevels { lower: 0.0, upper: 65535.0 },
+                |levels| ThresholdLevels {
+                    lower: (levels.lower as i64).clamp(0, 65535) as f64,
+                    upper: (levels.upper as i64).clamp(0, 65535) as f64,
+                },
+            ),
+            PixelPlane::Gray32(_) => self.threshold.unwrap_or(ThresholdLevels {
+                lower: -f32::MAX as f64,
+                upper: f32::MAX as f64,
+            }),
+            PixelPlane::ColorRgb(_) => return None,
+        };
+        Some(range)
     }
 
     /// `Analyzer.saveResults` uses `roi.getLength()` for selections and raw
@@ -3690,6 +3721,9 @@ pub struct MeasurementSummary {
     pub roundness: f64,
     #[serde(default)]
     pub solidity: f64,
+    /// Threshold bounds written as `MinThr`/`MaxThr` when LIMIT is selected.
+    #[serde(default)]
+    pub threshold_range: Option<ThresholdLevels>,
     pub int_den: f64,
     pub raw_int_den: f64,
     /// ROI histogram: 256 bins for 8-bit, RGB and 32-bit planes and the full
@@ -4039,6 +4073,12 @@ impl MeasurementSummary {
             }
             if let Some(frame) = self.stack_position.frame {
                 cells[28] = Some(f64::from(frame));
+            }
+        }
+        if config.contains(MeasurementFlags::LIMIT) {
+            if let Some(range) = self.threshold_range {
+                cells[36] = Some(range.lower);
+                cells[37] = Some(range.upper);
             }
         }
         if let Some(line) = self.line {

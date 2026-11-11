@@ -5,7 +5,7 @@ use ij_core::{
     PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition, ThresholdLevels, Wand, WandMode,
 };
 use ij_io::{load_tiff, save_tiff};
-use ij_session::{Command, Session};
+use ij_session::{Command, CommandOutcome, Session};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 fn repo_root() -> PathBuf {
@@ -999,8 +999,11 @@ fn parity_limit_flag_without_threshold_matches_java_oracle() {
     doc.set_rect_roi(2, 3, 10, 8).unwrap();
     let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
     // ByteStatistics.java 24-26: with no threshold the LIMIT flag leaves the
-    // 0..255 range intact, so the row equals the ordinary measurement.
-    assert_eq!(stats, doc.measure().unwrap());
+    // numeric statistics unchanged and reports 0..255 in MinThr/MaxThr.
+    assert_eq!(stats.threshold_range, Some(ThresholdLevels { lower: 0.0, upper: 255.0 }));
+    let mut ordinary = doc.measure().unwrap();
+    ordinary.threshold_range = stats.threshold_range;
+    assert_eq!(stats, ordinary);
     assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
 
     let oracle = bridge
@@ -1012,7 +1015,10 @@ fn parity_limit_flag_without_threshold_matches_java_oracle() {
     let mut doc = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
     doc.set_rect_roi(2, 3, 10, 8).unwrap();
     let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
-    assert_eq!(stats, doc.measure().unwrap());
+    assert_eq!(stats.threshold_range, Some(ThresholdLevels { lower: 0.0, upper: 65535.0 }));
+    let mut ordinary = doc.measure().unwrap();
+    ordinary.threshold_range = stats.threshold_range;
+    assert_eq!(stats, ordinary);
     assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
 
     let oracle = bridge
@@ -1024,7 +1030,12 @@ fn parity_limit_flag_without_threshold_matches_java_oracle() {
     let mut doc = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
     doc.set_rect_roi(2, 3, 10, 8).unwrap();
     let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
-    assert_eq!(stats, doc.measure().unwrap());
+    assert_eq!(stats.threshold_range, Some(ThresholdLevels {
+        lower: -f32::MAX as f64, upper: f32::MAX as f64,
+    }));
+    let mut ordinary = doc.measure().unwrap();
+    ordinary.threshold_range = stats.threshold_range;
+    assert_eq!(stats, ordinary);
     assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
 }
 
@@ -11755,4 +11766,127 @@ fn default_config_results_table_to_tsv_matches_to_tsv_basic() {
          1\t48\t88.000\t32\t144\t0.000\t0.000\n\
          2\t10\t96.000\t32\t160\t-26.565\t8.944\n"
     );
+}
+
+#[test]
+fn session_set_measurements_drives_java_compatible_results_tsv() {
+    for (index, options) in [
+        "area mean standard min centroid perimeter fit shape area_fraction decimal=2",
+        "mean standard median skewness kurtosis decimal=5",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "newImage('t','8-bit ramp',16,16,1); makeRectangle(2,3,8,6); \
+                 run('Set Measurements...', '{options}'); run('Measure');"
+            ),
+            &format!("session_measurements_{index}"),
+        );
+        let config = table_config(options);
+        let mut session = Session::new();
+        session
+            .dispatch(Command::SetMeasurements {
+                flags: config.flags,
+                precision: config.precision,
+            })
+            .unwrap();
+        let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+        doc.set_rect_roi(2, 3, 8, 6).unwrap();
+        session.insert_doc(doc);
+        session.dispatch(Command::Measure).unwrap();
+        assert_eq!(session.results.config, config);
+        let path = std::env::temp_dir().join(format!(
+            "m4b2_session_{}_{}.tsv",
+            std::process::id(), index
+        ));
+        session
+            .dispatch(Command::SaveResultsTsv { path: path.clone() })
+            .unwrap();
+        let actual = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+        assert_eq!(actual.trim_end(), expected, "{options}");
+        let recorded_options = options.replace(" decimal=", " redirect=None decimal=");
+        assert_eq!(
+            session.macro_recorder[0],
+            format!("run(\"Set Measurements...\", \"{recorded_options}\");")
+        );
+        assert_eq!(session.macro_recorder[1], "run(\"Measure\");");
+    }
+}
+
+#[test]
+fn session_set_measurements_limit_uses_active_threshold() {
+    let options = "area mean min area_fraction limit decimal=3";
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "newImage('t','8-bit ramp',16,16,1); makeRectangle(2,3,8,6); \
+             setThreshold(100,200); run('Set Measurements...', '{options}'); run('Measure');"
+        ),
+        "session_measurements_limit",
+    );
+    let config = table_config("area mean min area_fraction decimal=3");
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags | MeasurementFlags::LIMIT,
+            precision: config.precision,
+        })
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 100.0, upper: 200.0 });
+    session.insert_doc(doc);
+    session.dispatch(Command::Measure).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end(), expected);
+    assert_eq!(
+        session.macro_recorder[0],
+        "run(\"Set Measurements...\", \"area mean min area_fraction limit redirect=None decimal=3\");"
+    );
+}
+
+#[test]
+fn parity_results_table_limit_columns_without_threshold_match_java_oracle() {
+    let config = MeasurementConfig {
+        flags: MeasurementFlags::AREA | MeasurementFlags::LIMIT,
+        precision: 3,
+    };
+    for (index, (image_type, doc)) in [
+        ("8-bit ramp", ImageDocument::new_ramp_8bit("t", 16, 16).unwrap()),
+        ("16-bit ramp", ImageDocument::new_ramp_16bit("t", 16, 16).unwrap()),
+        ("32-bit ramp", ImageDocument::new_ramp_32bit("t", 16, 16).unwrap()),
+        ("RGB ramp", ImageDocument::new("t", 16, 16, PixelPlane::ColorRgb(rgb_ramp(16, 16))).unwrap()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "newImage('t','{image_type}',16,16,1); \
+                 run('Set Measurements...', 'area limit decimal=3'); run('Measure');"
+            ),
+            &format!("limit_no_threshold_{index}"),
+        );
+        let actual = rust_results_tsv(vec![doc.measure_with_config(config).unwrap()], config);
+        assert_eq!(actual, expected, "{image_type}");
+    }
+}
+
+#[test]
+fn session_set_measurements_is_global_and_clamps_decimal_places() {
+    let mut session = Session::new();
+    let flags = MeasurementFlags::AREA | MeasurementFlags::MEAN;
+    assert!(matches!(
+        session.dispatch(Command::SetMeasurements { flags, precision: 15 }),
+        Ok(CommandOutcome::Updated)
+    ));
+    assert_eq!(session.results.config.flags, flags);
+    assert_eq!(session.results.config.precision, 9);
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"Set Measurements...\", \"area mean redirect=None decimal=9\");"]
+    );
+    session.dispatch(Command::ClearResults).unwrap();
+    assert_eq!(session.results.config.precision, 9);
 }

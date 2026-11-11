@@ -5,8 +5,8 @@ pub use ij_bridge::plugin::{
     PluginBridge, PluginBridgeError, PluginFilterInputError, PluginFilterRequest, PluginFilterRun,
 };
 use ij_core::{
-    CoreError, DisplayRange, ImageDocument, MeasurementSummary, PixelPlane, ResultsTable,
-    ThresholdLevels,
+    CoreError, DisplayRange, ImageDocument, MeasurementConfig, MeasurementFlags,
+    MeasurementSummary, PixelPlane, ResultsTable, ThresholdLevels,
 };
 use ij_io::{IoError, load_tiff, save_tiff};
 use serde::{Deserialize, Serialize};
@@ -196,6 +196,8 @@ pub enum Command {
     ResetThreshold,
     InvertStack,
     Undo,
+    /// `Analyze > Set Measurements...` updates session measurement options.
+    SetMeasurements { flags: u32, precision: u8 },
     Measure,
     ClearResults,
     SaveResultsTsv {
@@ -234,6 +236,44 @@ pub enum CommandOutcome {
     /// image and its dirty state are unchanged.
     NothingToUndo,
     PluginFiltered(PluginFilterOutcome),
+}
+
+fn measurement_macro_options(config: MeasurementConfig) -> String {
+    // Analyzer.java 28-33: checkbox order in the Set Measurements dialog.
+    const CHECKBOXES: &[(u32, &str)] = &[
+        (MeasurementFlags::AREA, "area"),
+        (MeasurementFlags::MEAN, "mean"),
+        (MeasurementFlags::STD_DEV, "standard"),
+        (MeasurementFlags::MODE, "modal"),
+        (MeasurementFlags::MIN_MAX, "min"),
+        (MeasurementFlags::CENTROID, "centroid"),
+        (MeasurementFlags::CENTER_OF_MASS, "center"),
+        (MeasurementFlags::PERIMETER, "perimeter"),
+        (MeasurementFlags::RECT, "bounding"),
+        (MeasurementFlags::ELLIPSE, "fit"),
+        (MeasurementFlags::SHAPE_DESCRIPTORS, "shape"),
+        (MeasurementFlags::FERET, "feret's"),
+        (MeasurementFlags::INTEGRATED_DENSITY, "integrated"),
+        (MeasurementFlags::MEDIAN, "median"),
+        (MeasurementFlags::SKEWNESS, "skewness"),
+        (MeasurementFlags::KURTOSIS, "kurtosis"),
+        (MeasurementFlags::AREA_FRACTION, "area_fraction"),
+        (MeasurementFlags::STACK_POSITION, "stack"),
+        (MeasurementFlags::LIMIT, "limit"),
+        (MeasurementFlags::LABELS, "display"),
+        (MeasurementFlags::INVERT_Y, "invert"),
+        (MeasurementFlags::SCIENTIFIC_NOTATION, "scientific"),
+        (MeasurementFlags::ADD_TO_OVERLAY, "add"),
+        (MeasurementFlags::NAN_EMPTY_CELLS, "nan"),
+    ];
+    let mut options: Vec<&str> = CHECKBOXES
+        .iter()
+        .filter_map(|(flag, name)| config.contains(*flag).then_some(*name))
+        .collect();
+    options.push("redirect=None");
+    let mut result = options.join(" ");
+    result.push_str(&format!(" decimal={}", config.precision));
+    result
 }
 
 /// Reported result of a successful narrow `PlugInFilter` run. The processed
@@ -967,8 +1007,20 @@ impl Session {
                     Ok(CommandOutcome::NothingToUndo)
                 }
             }
+            Command::SetMeasurements { flags, precision } => {
+                let config = MeasurementConfig {
+                    flags,
+                    precision: precision.min(9),
+                };
+                self.results.config = config;
+                self.macro_recorder.push(format!(
+                    "run(\"Set Measurements...\", \"{}\");",
+                    measurement_macro_options(config)
+                ));
+                Ok(CommandOutcome::Updated)
+            }
             Command::Measure => {
-                let stats = self.active_doc()?.measure()?;
+                let stats = self.active_doc()?.measure_with_config(self.results.config)?;
                 self.results.push(stats.clone());
                 self.macro_recorder.push("run(\"Measure\");".into());
                 Ok(CommandOutcome::Measured(stats))
@@ -979,7 +1031,7 @@ impl Session {
                 Ok(CommandOutcome::ResultsCleared)
             }
             Command::SaveResultsTsv { path } => {
-                let tsv = self.results.to_tsv_basic();
+                let tsv = self.results.to_tsv();
                 fs::write(&path, tsv)?;
                 self.macro_recorder
                     .push(format!("saveAs(\"Results\", \"{}\");", path.display()));
