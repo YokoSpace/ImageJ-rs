@@ -11348,3 +11348,392 @@ fn session_convert_to_rgb_records_macro_and_clears_threshold() {
         "RGB Color must record exactly one macro line without a trailing newline"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M4b-1: ResultsTable dynamic columns and formatting
+// (ResultsTable.java 20-38, 190-218, 826-960; Analyzer.java 556-703).
+// ---------------------------------------------------------------------------
+
+/// Every `Set Measurements...` checkbox that `ResultsTable` can render from
+/// the modelled `MeasurementSummary` fields (Feret and LIMIT's MinThr/MaxThr
+/// columns are not modelled yet).
+const ALL_TABLE_MEASUREMENTS: &str = "area mean standard modal min centroid center perimeter \
+     bounding fit shape integrated median skewness kurtosis area_fraction stack";
+
+/// Parses the macro option string handed to `Set Measurements...` so the Rust
+/// and Java sides are configured from one source of truth.
+fn table_config(options: &str) -> MeasurementConfig {
+    let mut config = MeasurementConfig {
+        flags: 0,
+        precision: 3,
+    };
+    for token in options.split_whitespace() {
+        if let Some(decimals) = token.strip_prefix("decimal=") {
+            config.precision = decimals.parse().unwrap();
+            continue;
+        }
+        config.flags |= match token {
+            "area" => MeasurementFlags::AREA,
+            "mean" => MeasurementFlags::MEAN,
+            "standard" => MeasurementFlags::STD_DEV,
+            "modal" => MeasurementFlags::MODE,
+            "min" => MeasurementFlags::MIN_MAX,
+            "centroid" => MeasurementFlags::CENTROID,
+            "center" => MeasurementFlags::CENTER_OF_MASS,
+            "perimeter" => MeasurementFlags::PERIMETER,
+            "bounding" => MeasurementFlags::RECT,
+            "fit" => MeasurementFlags::ELLIPSE,
+            "shape" => MeasurementFlags::SHAPE_DESCRIPTORS,
+            "integrated" => MeasurementFlags::INTEGRATED_DENSITY,
+            "median" => MeasurementFlags::MEDIAN,
+            "skewness" => MeasurementFlags::SKEWNESS,
+            "kurtosis" => MeasurementFlags::KURTOSIS,
+            "area_fraction" => MeasurementFlags::AREA_FRACTION,
+            "stack" => MeasurementFlags::STACK_POSITION,
+            "scientific" => MeasurementFlags::SCIENTIFIC_NOTATION,
+            other => panic!("unknown Set Measurements option {other}"),
+        };
+    }
+    config
+}
+
+/// Runs `setup` in the Java oracle, saves the system Results table with
+/// `saveAs('Results', ...)` and returns that file's text without its trailing
+/// newline. Saving the table avoids relying on the per-measure stdout row,
+/// which headless ImageJ trims to the newest line.
+fn oracle_saved_results_tsv(setup: &str, tag: &str) -> String {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let path = std::env::temp_dir().join(format!("m4b1_{}_{tag}.tsv", std::process::id()));
+    let path_text = path.to_str().unwrap();
+    let output = bridge
+        .eval_macro(&format!(
+            "{setup} saveAs('Results', '{path_text}'); \
+             print('M4B1_TSV_BEGIN'); print(File.openAsString('{path_text}'));"
+        ))
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = output.stdout.replace("\r\n", "\n");
+    let (_, tsv) = stdout
+        .split_once("M4B1_TSV_BEGIN\n")
+        .unwrap_or_else(|| panic!("oracle did not print the saved table:\n{stdout}"));
+    tsv.trim_end_matches('\n').to_string()
+}
+
+fn rust_results_tsv(rows: Vec<MeasurementSummary>, config: MeasurementConfig) -> String {
+    let mut table = ResultsTable::new();
+    table.config = config;
+    for row in rows {
+        table.push(row);
+    }
+    table.to_tsv().trim_end_matches('\n').to_string()
+}
+
+#[derive(Clone, Copy)]
+enum TableRoi {
+    WholeImage,
+    Rect,
+    Oval,
+    Polygon,
+    Line,
+}
+
+impl TableRoi {
+    fn macro_text(self) -> &'static str {
+        match self {
+            TableRoi::WholeImage => "",
+            TableRoi::Rect => "makeRectangle(2,3,8,6);",
+            TableRoi::Oval => "makeOval(1,2,9,7);",
+            TableRoi::Polygon => "makePolygon(2,2,10,3,8,10,3,9);",
+            TableRoi::Line => "makeLine(2,3,10,7);",
+        }
+    }
+
+    fn apply(self, doc: &mut ImageDocument) {
+        match self {
+            TableRoi::WholeImage => {}
+            TableRoi::Rect => doc.set_rect_roi(2, 3, 8, 6).unwrap(),
+            TableRoi::Oval => doc.set_oval_roi(1, 2, 9, 7).unwrap(),
+            TableRoi::Polygon => doc.set_polygon_roi(&[(2, 2), (10, 3), (8, 10), (3, 9)]).unwrap(),
+            TableRoi::Line => doc.set_line_roi(2, 3, 10, 7),
+        }
+    }
+}
+
+#[test]
+fn parity_results_table_tsv_single_row_flag_combinations_match_java_oracle() {
+    let all = ALL_TABLE_MEASUREMENTS;
+    // (name, ROI, calibrated, options). decimal=2 and decimal=5 exercise the
+    // precision-dependent fixed columns and AUTO_FORMAT integers; decimal=0
+    // covers d2s's HALF_UP zero-decimal pattern and scientific covers its
+    // notation switch.
+    let cases: Vec<(&str, TableRoi, bool, String)> = vec![
+        ("all rect d2", TableRoi::Rect, false, format!("{all} decimal=2")),
+        ("all oval d5", TableRoi::Oval, false, format!("{all} decimal=5")),
+        ("all polygon d3", TableRoi::Polygon, false, format!("{all} decimal=3")),
+        ("all whole image d2", TableRoi::WholeImage, false, format!("{all} decimal=2")),
+        (
+            "stats only d5",
+            TableRoi::Rect,
+            false,
+            "mean standard median skewness kurtosis decimal=5".to_string(),
+        ),
+        (
+            "shape descriptors d2",
+            TableRoi::Polygon,
+            false,
+            "area perimeter fit shape decimal=2".to_string(),
+        ),
+        (
+            "calibrated bounding d2",
+            TableRoi::Rect,
+            true,
+            "area mean min centroid bounding integrated decimal=2".to_string(),
+        ),
+        (
+            "calibrated all d5",
+            TableRoi::Oval,
+            true,
+            format!("{all} decimal=5"),
+        ),
+        (
+            "default flags d3",
+            TableRoi::Rect,
+            false,
+            "area mean min decimal=3".to_string(),
+        ),
+        (
+            "half up d0",
+            TableRoi::Rect,
+            false,
+            "area mean centroid center decimal=0".to_string(),
+        ),
+        (
+            "scientific d3",
+            TableRoi::Rect,
+            false,
+            "area mean standard skewness scientific decimal=3".to_string(),
+        ),
+        (
+            "shape descriptors scientific d2",
+            TableRoi::Rect,
+            false,
+            "area perimeter fit shape scientific decimal=2".to_string(),
+        ),
+    ];
+    for (index, (name, roi, calibrated, options)) in cases.into_iter().enumerate() {
+        let cal_macro = if calibrated {
+            "setVoxelSize(0.5,0.25,1,'mm');"
+        } else {
+            ""
+        };
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "newImage('t','8-bit ramp',16,16,1); {cal_macro} {} \
+                 run('Set Measurements...', '{options}'); run('Measure');",
+                roi.macro_text()
+            ),
+            &format!("single{index}"),
+        );
+        let config = table_config(&options);
+        let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+        if calibrated {
+            doc.calibration.pixel_width = 0.5;
+            doc.calibration.pixel_height = 0.25;
+        }
+        roi.apply(&mut doc);
+        let actual = rust_results_tsv(vec![doc.measure_with_config(config).unwrap()], config);
+        assert_eq!(actual, expected, "{name}: {options}");
+    }
+}
+
+#[test]
+fn parity_results_table_tsv_line_rows_match_java_oracle() {
+    // A straight line writes Length (dynamic column) and Angle (index 17).
+    // When none of Area/Mean/StdDev/Mode/Min/Max/Centroid/Median is selected
+    // Analyzer.measureLength writes only those two cells (Analyzer.java
+    // 468-476), so Perim. and the bounding box stay out of the table.
+    for (index, options) in [
+        "area mean min decimal=3",
+        "area mean min decimal=5",
+        "area mean perimeter fit shape decimal=2",
+        "mean standard median decimal=2",
+        "perimeter bounding decimal=3",
+        "fit shape decimal=4",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "newImage('t','8-bit ramp',16,16,1); makeLine(2,3,10,7); \
+                 run('Set Measurements...', '{options}'); run('Measure');"
+            ),
+            &format!("line{index}"),
+        );
+        let config = table_config(options);
+        let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+        TableRoi::Line.apply(&mut doc);
+        let actual = rust_results_tsv(vec![doc.measure_with_config(config).unwrap()], config);
+        assert_eq!(actual, expected, "{options}");
+    }
+}
+
+#[test]
+fn parity_results_table_tsv_stack_position_columns_match_java_oracle() {
+    // (dimensions, position, macro setup) for Ch/Slice/Frame (Analyzer.java
+    // 660-686): plain stacks only report Slice, hyperstacks report each
+    // dimension larger than one.
+    let options = "area mean stack decimal=2";
+    let config = table_config(options);
+    let plane = ramp8_plane(8, 8);
+    let cases: [(&str, (i32, i32, i32), (i32, i32, i32), usize); 3] = [
+        (
+            "plain stack",
+            (1, 5, 1),
+            (1, 3, 1),
+            5,
+        ),
+        (
+            "hyperstack",
+            (2, 3, 2),
+            (2, 2, 2),
+            12,
+        ),
+        (
+            "no frame",
+            (2, 3, 1),
+            (1, 3, 1),
+            6,
+        ),
+    ];
+    for (index, (name, (c, z, t), (pc, pz, pt), count)) in cases.into_iter().enumerate() {
+        let setup = if name == "plain stack" {
+            format!("newImage('t','8-bit ramp',8,8,{count}); setSlice({pz});")
+        } else {
+            format!(
+                "newImage('t','8-bit ramp',8,8,{count}); Stack.setDimensions({c},{z},{t}); \
+                 Stack.setPosition({pc},{pz},{pt});"
+            )
+        };
+        let expected = oracle_saved_results_tsv(
+            &format!("{setup} run('Set Measurements...', '{options}'); run('Measure');"),
+            &format!("stack{index}"),
+        );
+        let mut doc = ImageDocument::new_stack("t", 8, 8, vec![plane.clone(); count]).unwrap();
+        if name == "plain stack" {
+            doc.set_slice(pz).unwrap();
+        } else {
+            doc.set_dimensions(c as u32, z as u32, t as u32).unwrap();
+            doc.set_position(pc, pz, pt);
+        }
+        let actual = rust_results_tsv(vec![doc.measure_with_config(config).unwrap()], config);
+        assert_eq!(actual, expected, "{name}");
+    }
+}
+
+/// Three rectangular particles in raster-scan order (Analyze Particles visits
+/// the first pixel of each blob from the top-left). The first particle is a
+/// constant 200 so its Mean is integral until the second row turns the column
+/// into a fixed-decimal column; a few off-level pixels make the other columns
+/// fractional.
+fn particle_table_doc() -> (ImageDocument, &'static str, [(i32, i32, i32, i32); 3]) {
+    let blobs = [(20, 1, 3, 7), (2, 2, 4, 3), (10, 4, 6, 5)];
+    let extras = [(2, 2, 230u8), (10, 4, 201), (11, 5, 255)];
+    let mut pixels = vec![0u8; 40 * 24];
+    let mut macro_text = String::from("newImage('t','8-bit black',40,24,1); setColor(200);");
+    for &(x, y, w, h) in &blobs {
+        for yy in y..y + h {
+            for xx in x..x + w {
+                pixels[(yy * 40 + xx) as usize] = 200;
+            }
+        }
+        macro_text.push_str(&format!(" fillRect({x},{y},{w},{h});"));
+    }
+    for &(x, y, value) in &extras {
+        pixels[(y * 40 + x) as usize] = value;
+        macro_text.push_str(&format!(" setPixel({x},{y},{value});"));
+    }
+    let mut doc = ImageDocument::new("t", 40, 24, PixelPlane::Gray8(pixels)).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 200.0,
+        upper: 255.0,
+    });
+    // Leak the macro so the helper can hand out a 'static prelude shared by
+    // every multi-row case.
+    (doc, Box::leak(macro_text.into_boxed_str()), blobs)
+}
+
+#[test]
+fn parity_results_table_tsv_multi_row_columns_match_java_oracle() {
+    // Multi-row tables are where ResultsTable.addValue's first-24-rows rule
+    // matters: once the second row makes Mean fractional, the first row is
+    // retroactively saved as "200.000" instead of "200". Analyze Particles
+    // writes all particle rows to the system table; a repeated "Measure"
+    // would keep only the newest row in headless mode.
+    let cases = [
+        "area mean min decimal=3",
+        "area mean min decimal=2",
+        "area mean standard modal min centroid center integrated median \
+         skewness kurtosis area_fraction stack decimal=2",
+        "mean standard median skewness kurtosis integrated decimal=5",
+    ];
+    for (index, options) in cases.into_iter().enumerate() {
+        let (doc, setup, blobs) = particle_table_doc();
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "{setup} setThreshold(200,255); run('Set Measurements...', '{options}'); \
+                 run('Analyze Particles...', 'size=0-Infinity display clear');"
+            ),
+            &format!("multi{index}"),
+        );
+        let config = table_config(options);
+        let rows = blobs
+            .iter()
+            .map(|&(x, y, w, h)| {
+                let mut blob_doc = doc.clone();
+                blob_doc.set_rect_roi(x, y, w, h).unwrap();
+                blob_doc.measure_with_config(config).unwrap()
+            })
+            .collect();
+        assert_eq!(rust_results_tsv(rows, config), expected, "{options}");
+    }
+}
+
+#[test]
+fn default_config_results_table_to_tsv_matches_to_tsv_basic() {
+    // The default Set Measurements state must keep the historical table
+    // byte-for-byte so the Slice 1 verification is unaffected.
+    let mut area_doc = ImageDocument::new_ramp_8bit("mixed_area.tif", 16, 16).unwrap();
+    area_doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    let mut line_doc = ImageDocument::new_ramp_8bit("mixed_line.tif", 16, 16).unwrap();
+    line_doc.set_line_roi(2, 3, 10, 7);
+    let area_row = area_doc.measure().unwrap();
+    let line_row = line_doc.measure().unwrap();
+
+    let empty = ResultsTable::new();
+    assert_eq!(empty.config, MeasurementConfig::default());
+    assert_eq!(empty.to_tsv(), empty.to_tsv_basic());
+
+    for rows in [
+        vec![area_row.clone()],
+        vec![line_row.clone()],
+        vec![area_row.clone(), line_row.clone()],
+        vec![line_row.clone(), area_row.clone(), area_row.clone()],
+    ] {
+        let mut table = ResultsTable::new();
+        for row in rows {
+            table.push(row);
+        }
+        assert_eq!(table.to_tsv(), table.to_tsv_basic());
+    }
+
+    let mut table = ResultsTable::new();
+    table.push(area_row);
+    table.push(line_row);
+    assert_eq!(
+        table.to_tsv(),
+        " \tArea\tMean\tMin\tMax\tAngle\tLength\n\
+         1\t48\t88.000\t32\t144\t0.000\t0.000\n\
+         2\t10\t96.000\t32\t160\t-26.565\t8.944\n"
+    );
+}

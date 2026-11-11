@@ -3706,11 +3706,82 @@ pub struct MeasurementSummary {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ResultsTable {
     pub rows: Vec<MeasurementSummary>,
+    /// `Analyze > Set Measurements...` state applied to this table. Defaults
+    /// to ImageJ's startup flags so `to_tsv()` stays byte-compatible with
+    /// `to_tsv_basic()` (Analyzer.java line 40).
+    #[serde(default)]
+    pub config: MeasurementConfig,
 }
+
+/// `ResultsTable.defaultHeadings` (ResultsTable.java 42-45) plus the
+/// dynamically allocated `Length` column at index 38. `Angle` reserves index
+/// 17, so it precedes `Length` in every table that has both.
+const RESULT_HEADINGS: [&str; 39] = [
+    "Area",
+    "Mean",
+    "StdDev",
+    "Mode",
+    "Min",
+    "Max",
+    "X",
+    "Y",
+    "XM",
+    "YM",
+    "Perim.",
+    "BX",
+    "BY",
+    "Width",
+    "Height",
+    "Major",
+    "Minor",
+    "Angle",
+    "Circ.",
+    "Feret",
+    "IntDen",
+    "Median",
+    "Skew",
+    "Kurt",
+    "%Area",
+    "RawIntDen",
+    "Ch",
+    "Slice",
+    "Frame",
+    "FeretX",
+    "FeretY",
+    "FeretAngle",
+    "MinFeret",
+    "AR",
+    "Round",
+    "Solidity",
+    "MinThr",
+    "MaxThr",
+    "Length",
+];
+
+const COLUMN_ANGLE: usize = 17;
+const COLUMN_CIRCULARITY: usize = 18;
+const COLUMN_ASPECT_RATIO: usize = 33;
+const COLUMN_ROUNDNESS: usize = 34;
+const COLUMN_SOLIDITY: usize = 35;
+const COLUMN_LENGTH: usize = 38;
+
+/// Flags for which `Analyzer.measureLength` takes the full `saveResults` path.
+/// When none is selected, only `Length` and `Angle` are written
+/// (Analyzer.java 464-474).
+const LINE_STAT_FLAGS: u32 = MeasurementFlags::AREA
+    | MeasurementFlags::MEAN
+    | MeasurementFlags::STD_DEV
+    | MeasurementFlags::MODE
+    | MeasurementFlags::MIN_MAX
+    | MeasurementFlags::CENTROID
+    | MeasurementFlags::MEDIAN;
 
 impl ResultsTable {
     pub fn new() -> Self {
-        Self { rows: Vec::new() }
+        Self {
+            rows: Vec::new(),
+            config: MeasurementConfig::default(),
+        }
     }
 
     pub fn push(&mut self, row: MeasurementSummary) {
@@ -3719,6 +3790,95 @@ impl ResultsTable {
 
     pub fn clear(&mut self) {
         self.rows.clear();
+    }
+
+    /// Emits the selected columns in `ResultsTable.defaultHeadings` order with
+    /// ImageJ's per-column formatting rules (ResultsTable.java 198-218,
+    /// 644-667, 700-733 and 807-964; Analyzer.java 544-703).
+    pub fn to_tsv(&self) -> String {
+        let precision = i32::from(self.config.precision.min(9));
+        // Analyzer.java 62 and 86 pass a negative precision to
+        // ResultsTable.setPrecision when Scientific Notation is enabled.
+        let table_precision = if self.config.contains(MeasurementFlags::SCIENTIFIC_NOTATION) {
+            -precision
+        } else {
+            precision
+        };
+
+        let mut present = [false; RESULT_HEADINGS.len()];
+        let mut fixed_places: [Option<i32>; RESULT_HEADINGS.len()] =
+            [None; RESULT_HEADINGS.len()];
+
+        if self.rows.is_empty() {
+            // An empty table still has default headings in Rust's slice-1
+            // output, so derive the header from the flags.
+            for column in flag_columns(self.config) {
+                present[column] = true;
+            }
+        }
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            let cells = row.table_cells(self.config);
+            for (column, value) in cells.iter().enumerate() {
+                let Some(value) = value else { continue };
+                present[column] = true;
+                // addValue only fixes a column's decimal places while the
+                // counter is below 25 (ResultsTable.java 214-217).
+                if row_index < 24 && !value.is_nan() && !is_java_int(*value) {
+                    fixed_places[column] = Some(table_precision);
+                }
+            }
+            // Shape descriptor columns get the positive precision on the
+            // first row regardless of their value (Analyzer.java 590-595).
+            // A first line row that measured only Length/Angle never reaches
+            // that branch (Analyzer.java 464-474).
+            if row_index == 0
+                && self.config.contains(MeasurementFlags::SHAPE_DESCRIPTORS)
+                && !(row.line.is_some() && !row.has_line_stat_columns(self.config))
+            {
+                for column in [
+                    COLUMN_CIRCULARITY,
+                    COLUMN_ASPECT_RATIO,
+                    COLUMN_ROUNDNESS,
+                    COLUMN_SOLIDITY,
+                ] {
+                    fixed_places[column] = Some(precision);
+                }
+            }
+        }
+
+        let mut out = String::from(" \t");
+        let mut first = true;
+        for (column, included) in present.iter().enumerate() {
+            if !*included {
+                continue;
+            }
+            if !first {
+                out.push('\t');
+            }
+            first = false;
+            out.push_str(RESULT_HEADINGS[column]);
+        }
+        out.push('\n');
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            let cells = row.table_cells(self.config);
+            out.push_str(&(row_index + 1).to_string());
+            for (column, included) in present.iter().enumerate() {
+                if !*included {
+                    continue;
+                }
+                out.push('\t');
+                let value = cells[column].unwrap_or(0.0);
+                out.push_str(&format_results_cell(
+                    value,
+                    fixed_places[column],
+                    table_precision,
+                ));
+            }
+            out.push('\n');
+        }
+        out
     }
 
     pub fn to_tsv_basic(&self) -> String {
@@ -3774,6 +3934,224 @@ impl MeasurementSummary {
             .line
             .map_or((0.0, 0.0), |line| (line.angle, line.length));
         [self.area, self.mean, self.min, self.max, angle, length]
+    }
+
+    fn has_line_stat_columns(&self, config: MeasurementConfig) -> bool {
+        config.flags & LINE_STAT_FLAGS != 0
+    }
+
+    /// Cells this row actually writes, indexed by `ResultsTable`'s default
+    /// headings. Unwritten cells stay `None` and render as the zero that
+    /// `ResultsTable.addValue` would leave in an all-zero column
+    /// (ResultsTable.java 205-213, 720-731).
+    fn table_cells(&self, config: MeasurementConfig) -> [Option<f64>; 39] {
+        let mut cells = [None; 39];
+        if self.line.is_some() && !self.has_line_stat_columns(config) {
+            // Analyzer.measureLength's early return writes only these two cells
+            // (Analyzer.java 464-474).
+            if let Some(line) = self.line {
+                cells[COLUMN_ANGLE] = Some(line.angle);
+                cells[COLUMN_LENGTH] = Some(line.length);
+            }
+            return cells;
+        }
+
+        if config.contains(MeasurementFlags::AREA) {
+            cells[0] = Some(self.area);
+        }
+        if config.contains(MeasurementFlags::MEAN) {
+            cells[1] = Some(self.mean);
+        }
+        if config.contains(MeasurementFlags::STD_DEV) {
+            cells[2] = Some(self.std_dev);
+        }
+        if config.contains(MeasurementFlags::MODE) {
+            cells[3] = Some(self.mode);
+        }
+        if config.contains(MeasurementFlags::MIN_MAX) {
+            cells[4] = Some(self.min);
+            cells[5] = Some(self.max);
+        }
+        if config.contains(MeasurementFlags::CENTROID) {
+            cells[6] = Some(self.x_centroid);
+            cells[7] = Some(self.y_centroid);
+        }
+        if config.contains(MeasurementFlags::CENTER_OF_MASS) {
+            cells[8] = Some(self.x_center_of_mass);
+            cells[9] = Some(self.y_center_of_mass);
+        }
+        if config.contains(MeasurementFlags::PERIMETER) {
+            cells[10] = Some(self.perimeter);
+        }
+        if config.contains(MeasurementFlags::RECT) {
+            cells[11] = Some(self.roi_x);
+            cells[12] = Some(self.roi_y);
+            cells[13] = Some(self.roi_width);
+            cells[14] = Some(self.roi_height);
+        }
+        if config.contains(MeasurementFlags::ELLIPSE) {
+            cells[15] = Some(self.major);
+            cells[16] = Some(self.minor);
+            cells[COLUMN_ANGLE] = Some(self.ellipse_angle);
+        }
+        if config.contains(MeasurementFlags::SHAPE_DESCRIPTORS) {
+            cells[COLUMN_CIRCULARITY] = Some(self.circularity);
+            cells[COLUMN_ASPECT_RATIO] = Some(self.aspect_ratio);
+            cells[COLUMN_ROUNDNESS] = Some(self.roundness);
+            cells[COLUMN_SOLIDITY] = Some(self.solidity);
+        }
+        if config.contains(MeasurementFlags::INTEGRATED_DENSITY) {
+            cells[20] = Some(self.int_den);
+            cells[25] = Some(self.raw_int_den);
+        }
+        if config.contains(MeasurementFlags::MEDIAN) {
+            cells[21] = Some(self.median);
+        }
+        if config.contains(MeasurementFlags::SKEWNESS) {
+            cells[22] = Some(self.skewness);
+        }
+        if config.contains(MeasurementFlags::KURTOSIS) {
+            cells[23] = Some(self.kurtosis);
+        }
+        if config.contains(MeasurementFlags::AREA_FRACTION) {
+            cells[24] = Some(self.area_fraction);
+        }
+        if config.contains(MeasurementFlags::STACK_POSITION) {
+            // Ch/Slice/Frame are default headings 26-28 and only appear for
+            // dimensions larger than one (Analyzer.java 660-686).
+            if let Some(channel) = self.stack_position.channel {
+                cells[26] = Some(f64::from(channel));
+            }
+            if let Some(slice) = self.stack_position.slice {
+                cells[27] = Some(f64::from(slice));
+            }
+            if let Some(frame) = self.stack_position.frame {
+                cells[28] = Some(f64::from(frame));
+            }
+        }
+        if let Some(line) = self.line {
+            // saveResults appends these after the statistics cells; the line
+            // angle overwrites the ellipse angle at index 17
+            // (Analyzer.java 687-697).
+            cells[COLUMN_ANGLE] = Some(line.angle);
+            cells[COLUMN_LENGTH] = Some(line.length);
+        }
+        cells
+    }
+}
+
+fn flag_columns(config: MeasurementConfig) -> Vec<usize> {
+    let mut columns = Vec::new();
+    let mut add = |flag: u32, column: usize| {
+        if config.contains(flag) {
+            columns.push(column);
+        }
+    };
+    add(MeasurementFlags::AREA, 0);
+    add(MeasurementFlags::MEAN, 1);
+    add(MeasurementFlags::STD_DEV, 2);
+    add(MeasurementFlags::MODE, 3);
+    add(MeasurementFlags::MIN_MAX, 4);
+    add(MeasurementFlags::MIN_MAX, 5);
+    add(MeasurementFlags::CENTROID, 6);
+    add(MeasurementFlags::CENTROID, 7);
+    add(MeasurementFlags::CENTER_OF_MASS, 8);
+    add(MeasurementFlags::CENTER_OF_MASS, 9);
+    add(MeasurementFlags::PERIMETER, 10);
+    add(MeasurementFlags::RECT, 11);
+    add(MeasurementFlags::RECT, 12);
+    add(MeasurementFlags::RECT, 13);
+    add(MeasurementFlags::RECT, 14);
+    add(MeasurementFlags::ELLIPSE, 15);
+    add(MeasurementFlags::ELLIPSE, 16);
+    add(MeasurementFlags::ELLIPSE, COLUMN_ANGLE);
+    add(MeasurementFlags::SHAPE_DESCRIPTORS, COLUMN_CIRCULARITY);
+    add(MeasurementFlags::INTEGRATED_DENSITY, 20);
+    add(MeasurementFlags::MEDIAN, 21);
+    add(MeasurementFlags::SKEWNESS, 22);
+    add(MeasurementFlags::KURTOSIS, 23);
+    add(MeasurementFlags::AREA_FRACTION, 24);
+    add(MeasurementFlags::INTEGRATED_DENSITY, 25);
+    add(MeasurementFlags::SHAPE_DESCRIPTORS, COLUMN_ASPECT_RATIO);
+    add(MeasurementFlags::SHAPE_DESCRIPTORS, COLUMN_ROUNDNESS);
+    add(MeasurementFlags::SHAPE_DESCRIPTORS, COLUMN_SOLIDITY);
+    columns
+}
+
+/// Java's `(int)value` cast, including saturation at the int range, which is
+/// what ResultsTable.addValue compares against the original double.
+fn is_java_int(value: f64) -> bool {
+    let cast = if value.is_nan() {
+        0
+    } else if value >= f64::from(i32::MAX) {
+        i32::MAX
+    } else if value <= f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        value as i32
+    };
+    f64::from(cast) == value
+}
+
+fn format_results_cell(value: f64, fixed_places: Option<i32>, table_precision: i32) -> String {
+    let places = match fixed_places {
+        Some(places) => places,
+        // ResultsTable.n(): integers use d2s(n, 0) while the precision is
+        // non-negative; everything else uses the table precision
+        // (ResultsTable.java 832-839).
+        None => {
+            if table_precision >= 0 && is_java_int(value) {
+                0
+            } else {
+                table_precision
+            }
+        }
+    };
+    format_results_d2s(value, places)
+}
+
+/// Port of `ResultsTable.d2s` (ResultsTable.java 917-964), including the
+/// `DecimalFormat` patterns: the zero-decimal pattern is HALF_UP, while the
+/// fixed and scientific patterns keep `DecimalFormat`'s default HALF_EVEN.
+fn format_results_d2s(value: f64, mut places: i32) -> String {
+    if value.is_nan() {
+        return "NaN".to_string();
+    }
+    if value.is_infinite() {
+        return if value > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    if value == f32::MAX as f64 {
+        return "3.4e38".to_string();
+    }
+
+    let magnitude = value.abs();
+    if (magnitude != 0.0 && magnitude < 1.0 / 10f64.powi(places))
+        || magnitude > 999_999_999_999.0
+        || places < 0
+    {
+        if places < 0 {
+            places = (-places).min(9);
+        } else {
+            places = 3;
+        }
+        return format!("{:.*e}", places as usize, value).replace('e', "E");
+    }
+    if places < 0 {
+        places = 0;
+    }
+    if places > 9 {
+        places = 9;
+    }
+    if places == 0 {
+        // DecimalFormat("0") is the only pattern with HALF_UP
+        // (ResultsTable.java 961).
+        format!("{:.0}", value.round())
+    } else {
+        format!("{:.*}", places as usize, value)
     }
 }
 
@@ -3839,6 +4217,31 @@ fn format_ij_num_fixed(val: f64, places: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn results_table_d2s_matches_java_decimal_format_rounding() {
+        // Expected strings from ImageJ 1.54u's ResultsTable.d2s
+        // (ResultsTable.java 917-964). "0" is the only pattern set to
+        // HALF_UP; the fixed and scientific patterns use HALF_EVEN.
+        for (value, places, expected) in [
+            (2.5, 0, "3"),
+            (-2.5, 0, "-3"),
+            (0.125, 2, "0.12"),
+            (0.375, 2, "0.38"),
+            (0.005, 2, "5.000E-3"),
+            (1.005, 2, "1.00"),
+            (0.000_999_999_9, 3, "1.000E-3"),
+            (1e-12, 3, "1.000E-12"),
+            (999_999_999_999.0, 0, "999999999999"),
+            (1e12, 0, "1.000E12"),
+            (f64::NAN, 3, "NaN"),
+            (f64::INFINITY, 3, "Infinity"),
+            (f64::NEG_INFINITY, 3, "-Infinity"),
+            (f32::MAX as f64, 3, "3.4e38"),
+        ] {
+            assert_eq!(format_results_d2s(value, places), expected);
+        }
+    }
 
     #[test]
     fn ramp_16x16_rect_measurement_matches_imagej_154u_oracle() {
