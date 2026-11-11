@@ -29,10 +29,12 @@ pub struct NamedRoi {
     pub slice: u32,
 }
 
-// PlugInFilter.NO_CHANGES and PlugInFilter.NO_UNDO
-// (original_imagej/ij/plugin/filter/PlugInFilter.java lines 58-60).
+// PlugInFilter.NO_CHANGES, NO_UNDO, DOES_STACKS and NO_UNDO_RESET
+// (original_imagej/ij/plugin/filter/PlugInFilter.java lines 31-79).
 const PLUGIN_NO_CHANGES: i32 = 128;
 const PLUGIN_NO_UNDO: i32 = 256;
+const PLUGIN_DOES_STACKS: i32 = 32;
+const PLUGIN_NO_UNDO_RESET: i32 = 524_288;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -675,8 +677,12 @@ impl Session {
             .get_mut(&ticket.target)
             .ok_or(SessionError::NoActiveImage)?;
         doc.slices = image.slices;
-        let (snapshot, mark_dirty) =
-            plugin_undo_policy(filter_flags, ticket.pre_slices, doc.snapshot.take());
+        let (snapshot, mark_dirty) = plugin_undo_policy(
+            filter_flags,
+            ticket.pre_slices,
+            ticket.expected.slices.len(),
+            doc.snapshot.take(),
+        );
         doc.snapshot = snapshot;
         if mark_dirty {
             doc.snapshot_display_range = None;
@@ -1881,33 +1887,38 @@ fn validate_plugin_filter_output(
             expected.width, expected.height, image.width, image.height
         )));
     }
-    let single_plane = image.slices.len() == 1
-        && image.n_channels == 1
-        && image.n_slices == 1
-        && image.n_frames == 1
-        && image.current_slice == 1
-        && image.position == [1, 1, 1];
-    if !single_plane {
+    if image.slices.len() != expected.slices.len()
+        || image.n_channels != expected.n_channels
+        || image.n_slices != expected.n_slices
+        || image.n_frames != expected.n_frames
+        || image.current_slice != expected.current_slice
+        || image.position != expected.position
+    {
         return Err(SessionError::InvalidPluginFilterOutput(
-            "output is not a single-plane image".to_string(),
+            "output plane count, C/Z/T dimensions or stack position differ from the ticket"
+                .to_string(),
         ));
     }
     let expected_len = image.width as usize * image.height as usize;
-    match image.plane() {
-        PixelPlane::Gray8(pixels) if pixels.len() == expected_len => {}
-        PixelPlane::Gray8(pixels) => {
-            return Err(SessionError::InvalidPluginFilterOutput(format!(
-                "pixel buffer length {} does not match {}x{}",
-                pixels.len(),
-                image.width,
-                image.height
-            )));
-        }
-        other => {
-            return Err(SessionError::InvalidPluginFilterOutput(format!(
-                "expected an 8-bit grayscale output plane, got {other:?}"
-            )));
-        }
+    let plane_matches_ticket = |plane: &PixelPlane, expected_plane: &PixelPlane| {
+        matches!(
+            (plane, expected_plane),
+            (PixelPlane::Gray8(_), PixelPlane::Gray8(_))
+                | (PixelPlane::Gray16(_), PixelPlane::Gray16(_))
+                | (PixelPlane::Gray32(_), PixelPlane::Gray32(_))
+                | (PixelPlane::ColorRgb(_), PixelPlane::ColorRgb(_))
+        ) && plane.len() == expected_len
+    };
+    if !image
+        .slices
+        .iter()
+        .zip(expected.slices.iter())
+        .all(|(plane, expected_plane)| plane_matches_ticket(plane, expected_plane))
+    {
+        return Err(SessionError::InvalidPluginFilterOutput(format!(
+            "output planes must keep the ticket's pixel type and {}x{} dimensions",
+            image.width, image.height
+        )));
     }
     if image.calibration != expected.calibration
         || image.display_range != expected.display_range
@@ -1922,20 +1933,29 @@ fn validate_plugin_filter_output(
     Ok(())
 }
 
-/// Undo and dirty-state policy for a successful single-image `PlugInFilter`
-/// run, matching `PlugInFilterRunner` (original_imagej lines 107-121 and
-/// 169-172).
+/// Undo and dirty-state policy for a successful `PlugInFilter` run, matching
+/// `PlugInFilterRunner` (original_imagej lines 107-121 for the single-image
+/// branch and 169-172 for the complete-stack branch).
 ///
 /// `NO_CHANGES` leaves both the existing Undo state and the changes flag
-/// untouched. Otherwise the runner either snapshots the processor before
-/// `run(ip)` or, with `NO_UNDO`, calls `Undo.reset()`.
+/// untouched. Otherwise a single-image run either snapshots the processor
+/// before `run(ip)` or, with `NO_UNDO`, calls `Undo.reset()`. A run that
+/// covers a whole stack (DOES_STACKS) never snapshots: the stack branch calls
+/// `Undo.reset()` before processing unless NO_UNDO_RESET was requested, and it
+/// does so even for NO_CHANGES filters because that branch has no snapshot to
+/// set up.
 fn plugin_undo_policy(
     filter_flags: i32,
     pre_filter_slices: Vec<PixelPlane>,
+    pre_filter_stack_size: usize,
     previous_snapshot: Option<Vec<PixelPlane>>,
 ) -> (Option<Vec<PixelPlane>>, bool) {
-    if filter_flags & PLUGIN_NO_CHANGES != 0 {
+    let full_stack_processed =
+        pre_filter_stack_size > 1 && (filter_flags & PLUGIN_DOES_STACKS) != 0;
+    if filter_flags & PLUGIN_NO_CHANGES != 0 && !full_stack_processed {
         (previous_snapshot, false)
+    } else if full_stack_processed && (filter_flags & PLUGIN_NO_UNDO_RESET) == 0 {
+        (None, true)
     } else if filter_flags & PLUGIN_NO_UNDO != 0 {
         (None, true)
     } else {
@@ -1958,27 +1978,64 @@ mod tests {
 
         // Default single-image filter: snapshot before run(ip), mark dirty.
         assert_eq!(
-            plugin_undo_policy(0, pre.clone(), Some(previous.clone())),
+            plugin_undo_policy(0, pre.clone(), 1, Some(previous.clone())),
             (Some(pre.clone()), true)
         );
         // NO_CHANGES leaves Undo and the changes flag alone.
         assert_eq!(
-            plugin_undo_policy(PLUGIN_NO_CHANGES, pre.clone(), Some(previous.clone())),
+            plugin_undo_policy(PLUGIN_NO_CHANGES, pre.clone(), 1, Some(previous.clone())),
             (Some(previous.clone()), false)
         );
         // NO_UNDO clears Undo but still changes the image.
         assert_eq!(
-            plugin_undo_policy(PLUGIN_NO_UNDO, pre.clone(), Some(previous.clone())),
+            plugin_undo_policy(PLUGIN_NO_UNDO, pre.clone(), 1, Some(previous.clone())),
             (None, true)
         );
         // PlugInFilterRunner's outer NO_CHANGES check wins when both are set.
         assert_eq!(
             plugin_undo_policy(
                 PLUGIN_NO_CHANGES | PLUGIN_NO_UNDO,
-                pre,
+                pre.clone(),
+                1,
                 Some(previous.clone())
             ),
             (Some(previous), false)
+        );
+
+        // Complete-stack runs (DOES_STACKS on a multi-plane image) reset Undo
+        // before processing (PlugInFilterRunner.java 169-171), including for
+        // NO_CHANGES filters; NO_UNDO_RESET keeps the previous Undo state.
+        let stack_pre = vec![
+            PixelPlane::Gray8(vec![1, 2, 3, 4]),
+            PixelPlane::Gray8(vec![5, 6, 7, 8]),
+        ];
+        assert_eq!(
+            plugin_undo_policy(PLUGIN_DOES_STACKS, stack_pre.clone(), 2, Some(pre.clone())),
+            (None, true)
+        );
+        assert_eq!(
+            plugin_undo_policy(
+                PLUGIN_DOES_STACKS | PLUGIN_NO_UNDO_RESET,
+                stack_pre.clone(),
+                2,
+                Some(pre.clone())
+            ),
+            (Some(stack_pre.clone()), true)
+        );
+        assert_eq!(
+            plugin_undo_policy(PLUGIN_NO_CHANGES | PLUGIN_DOES_STACKS, stack_pre, 2, Some(pre)),
+            (None, true)
+        );
+
+        // Without DOES_STACKS a stack run behaves like the single image above
+        // (only the current slice changes, but Undo covers the whole image).
+        let stack_single = vec![
+            PixelPlane::Gray8(vec![1, 2, 3, 4]),
+            PixelPlane::Gray8(vec![5, 6, 7, 8]),
+        ];
+        assert_eq!(
+            plugin_undo_policy(0, stack_single.clone(), 2, None),
+            (Some(stack_single), true)
         );
     }
 

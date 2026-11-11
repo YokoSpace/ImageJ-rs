@@ -296,23 +296,38 @@ fn malformed_or_wrong_identity_output_is_rejected_atomically() {
 #[test]
 fn prepare_uses_the_bridge_preflight_validator_before_any_child_can_start() {
     let mut cases: Vec<(&str, ImageDocument)> = Vec::new();
+    // Pre-P3.10 this preflight rejected 16-bit and plain stacks too. Those
+    // now pass pre-flight (the bit-depth and DOES_STACKS decisions live in
+    // the Java host's setup() flag check), so the transfer-shaped rejections
+    // below are the ones that must still block before any child can start.
     cases.push((
-        "16-bit",
-        ImageDocument::new("sixteen", 16, 12, PixelPlane::Gray16(vec![0; 16 * 12]))
-            .expect("16-bit"),
+        "8-bit indexed color",
+        ImageDocument::new(
+            "indexed",
+            16,
+            12,
+            PixelPlane::Color256 {
+                pixels: vec![0; 16 * 12],
+                lut: Box::new(ij_core::Lut256::default()),
+            },
+        )
+        .expect("8-bit indexed color"),
     ));
     cases.push((
-        "stack",
-        ImageDocument::new_stack(
-            "stack",
+        "hyperstack",
+        ImageDocument::new_hyperstack(
+            "hyper",
             8,
             8,
             vec![
                 PixelPlane::Gray8(vec![0; 64]),
                 PixelPlane::Gray8(vec![0; 64]),
             ],
+            2,
+            1,
+            1,
         )
-        .expect("stack"),
+        .expect("hyperstack"),
     ));
 
     let mut oval = ImageDocument::new_ramp_8bit("oval", 16, 12).expect("oval");

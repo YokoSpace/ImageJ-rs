@@ -71,6 +71,11 @@ fn run_reference_filter(image: &ImageDocument, class_name: &str, arg: &str) -> I
             rect.x, rect.y, rect.width, rect.height
         ));
     }
+    if image.slices.len() > 1 {
+        // A filter without DOES_STACKS processes only the current slice.
+        cmd.arg("--current-slice")
+            .arg(image.current_slice.to_string());
+    }
 
     let child = cmd.output().expect("run reference filter");
     assert!(
@@ -278,23 +283,23 @@ fn session_filter_error_leaves_image_undo_dirty_results_and_macro_unchanged() {
 fn session_filter_unsupported_inputs_leave_state_unchanged() {
     let mut cases: Vec<(&str, ImageDocument)> = Vec::new();
 
+    // A C=2 hyperstack cannot be expressed as one of the plain ImageJ
+    // Z-stacks the host transfers.
     cases.push((
-        "16-bit",
-        ImageDocument::new("sixteen", 32, 24, PixelPlane::Gray16(vec![0; 32 * 24]))
-            .expect("16-bit"),
-    ));
-    cases.push((
-        "stack",
-        ImageDocument::new_stack(
-            "stack",
+        "hyperstack",
+        ImageDocument::new_hyperstack(
+            "hyper",
             32,
             24,
             vec![
                 PixelPlane::Gray8(vec![0; 32 * 24]),
                 PixelPlane::Gray8(vec![0; 32 * 24]),
             ],
+            2,
+            1,
+            1,
         )
-        .expect("stack"),
+        .expect("hyperstack"),
     ));
 
     let mut oval = ImageDocument::new_ramp_8bit("oval", 32, 24).expect("oval");
@@ -355,6 +360,222 @@ fn session_filter_unsupported_inputs_leave_state_unchanged() {
             _ => panic!("{label}: expected a pre-execution rejection, got {result:?}"),
         }
         assert_unchanged(&session, id, &before, label);
+    }
+}
+
+#[test]
+fn session_16bit_filter_matches_reference_and_preserves_state() {
+    let (mut session, id) = session_with_ramp("sixteen", 32, 24);
+    session.dispatch(Command::ConvertTo16Bit).unwrap();
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 4,
+            y: 3,
+            width: 10,
+            height: 8,
+        })
+        .unwrap();
+    session.set_dirty(id, false);
+
+    let before = session.get_image(id).unwrap().clone();
+    match &before.plane() {
+        // Converter zero-extends the 8-bit ramp (TypeConverter.java
+        // 149-160), so the values stay 0..255 while the plane is 16-bit.
+        PixelPlane::Gray16(pixels) => {
+            assert_eq!(pixels.len(), 32 * 24);
+            assert!(pixels.iter().all(|&v| v <= 255));
+        }
+        other => panic!("expected a 16-bit image, got {other:?}"),
+    }
+
+    let outcome = session
+        .dispatch(run_filter_command("fixtures.ShortInvertFilter"))
+        .expect("a DOES_16 filter must run on a 16-bit image");
+    let reference = run_reference_filter(&before, "fixtures.ShortInvertFilter", "");
+    let after = session.get_image(id).unwrap();
+
+    match (after.plane(), reference.plane()) {
+        (PixelPlane::Gray16(processed), PixelPlane::Gray16(oracle)) => {
+            assert_eq!(processed, oracle, "16-bit pixels differ from the reference");
+        }
+        other => panic!("expected 16-bit planes, got {other:?}"),
+    }
+    assert_eq!(after.display_range, before.display_range);
+    assert_eq!(after.roi, before.roi);
+    assert_eq!(after.width, before.width);
+    assert_eq!(after.height, before.height);
+    // Single images are still snapshotted for Undo before run(ip).
+    assert_eq!(after.snapshot.as_deref(), Some(before.slices.as_slice()));
+    assert!(session.is_dirty(id));
+
+    match outcome {
+        CommandOutcome::PluginFiltered(result) => {
+            assert_eq!(result.filter_flags, 4 | 64);
+            assert_eq!(result.run_invocations, 1);
+        }
+        other => panic!("expected PluginFiltered outcome, got {other:?}"),
+    }
+
+    // Undo restores the pre-filter 16-bit plane.
+    session.dispatch(Command::Undo).unwrap();
+    assert_eq!(
+        session.get_image(id).unwrap().plane(),
+        before.plane(),
+        "Undo did not restore the pre-filter 16-bit pixels"
+    );
+}
+
+#[test]
+fn session_depth_mismatch_rejection_is_transactional() {
+    // An 8-bit-only filter offered a 16-bit image must be refused by the
+    // setup-flag preflight exactly like PlugInFilterRunner.checkImagePlus,
+    // with no state mutation.
+    let (mut session, id) = session_with_ramp("sixteen", 32, 24);
+    session.dispatch(Command::ConvertTo16Bit).unwrap();
+    session.set_dirty(id, false);
+    let before = transaction_state(&session, id);
+
+    match session.dispatch(run_filter_command("fixtures.RectInvertFilter")) {
+        Err(SessionError::Plugin(PluginBridgeError::FilterRejected { message })) => {
+            assert!(
+                message.contains("8-bit grayscale"),
+                "rejection should name the required image type: {message}"
+            );
+        }
+        other => panic!("expected FilterRejected for a depth mismatch, got {other:?}"),
+    }
+    assert_unchanged(&session, id, &before, "depth mismatch");
+}
+
+#[test]
+fn session_stack_does_stacks_processes_all_slices_and_clears_undo() {
+    let planes: Vec<PixelPlane> = (0..3)
+        .map(|k| {
+            let pixels: Vec<u8> = (0..32usize * 24)
+                .map(|i| ((i as u16 + k * 91) % 256) as u8)
+                .collect();
+            PixelPlane::Gray8(pixels)
+        })
+        .collect();
+    let mut doc = ImageDocument::new_stack("stack", 32, 24, planes).expect("stack");
+    doc.set_rect_roi(4, 3, 10, 8).expect("rect ROI");
+    // Undo exists before the run; PlugInFilterRunner's stack branch clears
+    // it (PlugInFilterRunner.java 169-171). Seed an undo snapshot first so
+    // the reset is observable.
+    doc.snapshot_dimensions = Some((32, 24));
+    let before = doc.clone();
+    let mut session = Session::new().with_plugin_bridge(plugin_bridge());
+    doc.snapshot = Some(before.slices.clone());
+    let id = session.insert_doc(doc);
+    session.set_dirty(id, false);
+
+    let outcome = session
+        .dispatch(run_filter_command("fixtures.StackInvertFilter"))
+        .expect("a DOES_STACKS filter must run on a stack");
+
+    let reference = run_reference_filter(&before, "fixtures.StackInvertFilter", "");
+    let after = session.get_image(id).unwrap();
+    for slice in 0..3 {
+        let processed = match &after.slices[slice] {
+            PixelPlane::Gray8(pixels) => pixels,
+            other => panic!("expected 8-bit planes, got {other:?}"),
+        };
+        let oracle = match &reference.slices[slice] {
+            PixelPlane::Gray8(pixels) => pixels,
+            other => panic!("expected 8-bit planes, got {other:?}"),
+        };
+        assert_eq!(processed, oracle, "slice {} differs from the reference", slice + 1);
+        let original = match &before.slices[slice] {
+            PixelPlane::Gray8(pixels) => pixels,
+            other => panic!("expected 8-bit planes, got {other:?}"),
+        };
+        assert_ne!(original, processed, "slice {} was not processed", slice + 1);
+    }
+    // The complete-stack run resets Undo rather than snapshotting.
+    assert!(
+        after.snapshot.is_none(),
+        "Undo must be reset after processing a complete stack"
+    );
+    assert!(session.is_dirty(id));
+
+    match outcome {
+        CommandOutcome::PluginFiltered(result) => {
+            assert_eq!(result.filter_flags, 1 | 32 | 64);
+            assert_eq!(result.run_invocations, 3);
+        }
+        other => panic!("expected PluginFiltered outcome, got {other:?}"),
+    }
+    assert_eq!(after.current_slice, before.current_slice);
+    assert_eq!(after.position, before.position);
+}
+
+#[test]
+fn session_stack_without_does_stacks_processes_only_the_current_slice() {
+    let planes: Vec<PixelPlane> = (0..3)
+        .map(|k| {
+            let pixels: Vec<u8> = (0..32usize * 24)
+                .map(|i| ((i as u16 + k * 91) % 256) as u8)
+                .collect();
+            PixelPlane::Gray8(pixels)
+        })
+        .collect();
+    let doc = ImageDocument::new_stack("stack", 32, 24, planes).expect("stack");
+    let before = doc.clone();
+    let mut session = Session::new().with_plugin_bridge(plugin_bridge());
+    let id = session.insert_doc(doc);
+    session.set_dirty(id, false);
+    session.dispatch(Command::SetSlice { index: 2 }).unwrap();
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 4,
+            y: 3,
+            width: 10,
+            height: 8,
+        })
+        .unwrap();
+    let with_position = session.get_image(id).unwrap().clone();
+    assert_eq!(with_position.current_slice, 2);
+
+    let outcome = session
+        .dispatch(run_filter_command("fixtures.RectInvertFilter"))
+        .expect("a non-DOES_STACKS filter runs on the current slice");
+    let reference = run_reference_filter(&with_position, "fixtures.RectInvertFilter", "");
+    let after = session.get_image(id).unwrap();
+
+    for slice in 0..3 {
+        let processed = match &after.slices[slice] {
+            PixelPlane::Gray8(pixels) => pixels,
+            other => panic!("expected 8-bit planes, got {other:?}"),
+        };
+        let oracle = match &reference.slices[slice] {
+            PixelPlane::Gray8(pixels) => pixels,
+            other => panic!("expected 8-bit planes, got {other:?}"),
+        };
+        assert_eq!(processed, oracle, "slice {} differs from the reference", slice + 1);
+        if slice == 1 {
+            let original = match &before.slices[slice] {
+                PixelPlane::Gray8(pixels) => pixels,
+                other => panic!("expected 8-bit planes, got {other:?}"),
+            };
+            assert_ne!(processed, original, "the current slice was not processed");
+        } else {
+            let original = match &before.slices[slice] {
+                PixelPlane::Gray8(pixels) => pixels,
+                other => panic!("expected 8-bit planes, got {other:?}"),
+            };
+            assert_eq!(processed, original, "slice {} must be untouched", slice + 1);
+        }
+    }
+    // A current-slice run on a stack still behaves like a single-image run:
+    // the full pre-run planes are saved for Undo.
+    assert_eq!(after.snapshot.as_deref(), Some(with_position.slices.as_slice()));
+    assert_eq!(after.current_slice, 2, "the current slice must be preserved");
+
+    match outcome {
+        CommandOutcome::PluginFiltered(result) => {
+            assert_eq!(result.run_invocations, 1);
+        }
+        other => panic!("expected PluginFiltered outcome, got {other:?}"),
     }
 }
 

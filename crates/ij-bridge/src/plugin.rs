@@ -99,10 +99,10 @@ pub enum PluginBridgeError {
 /// document is never silently downgraded by the TIFF transfer.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PluginFilterInputError {
-    #[error("only 8-bit grayscale images are supported; `{title}` is {detail}")]
+    #[error("image type is not supported; `{title}` is {detail}")]
     UnsupportedImageType { title: String, detail: String },
     #[error(
-        "image stacks are not supported; `{title}` has {slices} slice(s) with C/Z/T={n_channels}/{n_slices}/{n_frames}"
+        "image stacks must be plain single-channel Z-stacks; `{title}` has {slices} plane(s) with C/Z/T={n_channels}/{n_slices}/{n_frames}"
     )]
     UnsupportedStack {
         title: String,
@@ -111,9 +111,18 @@ pub enum PluginFilterInputError {
         n_slices: u32,
         n_frames: u32,
     },
+    #[error(
+        "current slice {current_slice}/position {position:?} is inconsistent with the {slices}-plane stack of `{title}`"
+    )]
+    UnsupportedStackPosition {
+        title: String,
+        current_slice: u32,
+        position: [u32; 3],
+        slices: usize,
+    },
     #[error("only in-bounds rectangular ROIs are supported; {detail}")]
     UnsupportedRoi { detail: String },
-    #[error("only default 8-bit metadata is supported; {detail}")]
+    #[error("only the transferable default metadata is supported; {detail}")]
     UnsupportedMetadata { detail: String },
 }
 
@@ -369,9 +378,12 @@ fn validate_inspection_class_name(name: &str) -> Result<&str, String> {
 /// Request for the narrow PlugInFilter path.
 ///
 /// The image is transferred through a temporary TIFF and the returned image is
-/// read back from a second TIFF. Supported inputs are single-plane 8-bit
-/// grayscale images, an optional in-bounds rectangular ROI, and default
-/// calibration/display-range metadata.
+/// read back from a second TIFF. Supported inputs are 8-bit/16-bit/32-bit
+/// grayscale and RGB images (single-plane or plain single-channel Z-stacks),
+/// an optional in-bounds rectangular ROI, and transferable default
+/// calibration/display-range metadata. Whether the plugin's `setup()` flags
+/// cover the image type is checked by the Java host, mirroring
+/// `PlugInFilterRunner.checkImagePlus`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginFilterRequest {
     pub plugin_classpath: Vec<PathBuf>,
@@ -1202,6 +1214,10 @@ impl PluginBridge {
                 rect.x, rect.y, rect.width, rect.height
             ));
         }
+        // The TIFF does not carry the current slice (FileSaver never writes
+        // it), so ImagePlus's position is transferred explicitly. A filter
+        // without DOES_STACKS processes exactly this slice.
+        cmd.arg("--current-slice").arg(request.image.current_slice.to_string());
         cmd.arg("--input-image").arg(&input_path);
         cmd.arg("--output-image").arg(&output_path);
         cmd.arg("--run-id").arg(&run_id);
@@ -1303,14 +1319,19 @@ impl PluginBridge {
         }
 
         let mut image = load_tiff(&output_path)?;
-        if !matches!(image.plane(), PixelPlane::Gray8(_))
-            || image.slices.len() != 1
-            || image.width != request.image.width
-            || image.height != request.image.height
-        {
+        let expected_kind = plane_kind(&request.image.slices[0]);
+        let shapes_match = image.slices.len() == request.image.slices.len()
+            && image.width == request.image.width
+            && image.height == request.image.height
+            && image.slices.iter().all(|plane| plane_kind(plane) == expected_kind);
+        if !shapes_match {
             return Err(PluginBridgeError::FilterRejected {
-                message: "filter output was not a single 8-bit plane with the input dimensions"
-                    .to_string(),
+                message: format!(
+                    "filter output was not the same pixel type and stack shape as the input \
+                     ({} planes of the input's type at {}x{})",
+                    expected_kind_label(expected_kind),
+                    request.image.width, request.image.height
+                ),
             });
         }
         if image.calibration != request.image.calibration
@@ -1322,9 +1343,21 @@ impl PluginBridge {
             });
         }
 
+        // Document state the Java run does not own is restored from the
+        // request: TIFF does not carry title/selection/position, and the
+        // current slice of the loaded stack is always 1.
         image.title = request.image.title.clone();
         image.roi = request.image.roi.clone();
+        image.n_channels = request.image.n_channels;
+        image.n_slices = request.image.n_slices;
+        image.n_frames = request.image.n_frames;
+        image.current_slice = request.image.current_slice;
+        image.position = request.image.position;
+        image.slice_labels = request.image.slice_labels.clone();
+        image.threshold = request.image.threshold.clone();
         image.snapshot = None;
+        image.snapshot_dimensions = None;
+        image.snapshot_display_range = None;
 
         Ok(PluginFilterRun {
             image,
@@ -1340,33 +1373,74 @@ impl PluginBridge {
     }
 }
 
+/// Pixel format classification shared by the preflight and output checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterPlaneKind {
+    Gray8,
+    Gray16,
+    Gray32,
+    Rgb,
+    Color256,
+}
+
+pub fn plane_kind(plane: &PixelPlane) -> FilterPlaneKind {
+    match plane {
+        PixelPlane::Gray8(_) => FilterPlaneKind::Gray8,
+        PixelPlane::Color256 { .. } => FilterPlaneKind::Color256,
+        PixelPlane::Gray16(_) => FilterPlaneKind::Gray16,
+        PixelPlane::Gray32(_) => FilterPlaneKind::Gray32,
+        PixelPlane::ColorRgb(_) => FilterPlaneKind::Rgb,
+    }
+}
+
 /// Single preflight validator for the narrow `PlugInFilter` subset.
 ///
 /// Both the bridge (immediately before TIFF transfer) and callers that only
 /// want to know whether an image is compatible (the session and its UI) must
-/// use this function so compatibility decisions cannot drift. In particular,
-/// ROI bounds are computed in `i64` so `x + width` cannot overflow `i32`.
+/// use this function so compatibility decisions cannot drift. The image type
+/// itself (8/16/32-bit gray, RGB) is only checked for transferability here;
+/// whether the plugin's `setup()` flags cover the image type is the Java
+/// host's preflight, exactly like `PlugInFilterRunner.checkImagePlus`
+/// (PlugInFilterRunner.java 379-427). In particular, ROI bounds are computed
+/// in `i64` so `x + width` cannot overflow `i32`.
 pub fn validate_filter_request(doc: &ImageDocument) -> Result<(), PluginFilterInputError> {
-    let stack_like = doc.slices.len() != 1
-        || doc.n_channels != 1
-        || doc.n_slices != 1
-        || doc.n_frames != 1
-        || doc.current_slice != 1
-        || doc.position != [1, 1, 1];
-    if stack_like {
+    // Only a plain single-channel Z-stack (or a single plane) can be
+    // transferred: the multi-page TIFF opens as a 1 x N x 1 ImagePlus stack
+    // (FileOpener.setCalibration, FileOpener.java 468-482). C or T
+    // hyperstack dimensions cannot round-trip through it.
+    let planes = doc.slices.len();
+    if doc.n_channels != 1 || doc.n_frames != 1 || doc.n_slices as usize != planes {
         return Err(PluginFilterInputError::UnsupportedStack {
             title: doc.title.clone(),
-            slices: doc.slices.len(),
+            slices: planes,
             n_channels: doc.n_channels,
             n_slices: doc.n_slices,
             n_frames: doc.n_frames,
         });
     }
+    if doc.current_slice < 1
+        || doc.current_slice as usize > planes
+        || doc.position != [1, doc.current_slice, 1]
+    {
+        return Err(PluginFilterInputError::UnsupportedStackPosition {
+            title: doc.title.clone(),
+            current_slice: doc.current_slice,
+            position: doc.position,
+            slices: planes,
+        });
+    }
 
-    if !matches!(doc.plane(), PixelPlane::Gray8(_)) {
+    let first_kind = plane_kind(&doc.slices[0]);
+    if first_kind == FilterPlaneKind::Color256 {
         return Err(PluginFilterInputError::UnsupportedImageType {
             title: doc.title.clone(),
-            detail: pixel_plane_description(doc.plane()).to_string(),
+            detail: pixel_plane_description(&doc.slices[0]).to_string(),
+        });
+    }
+    if doc.slices.iter().any(|plane| plane_kind(plane) != first_kind) {
+        return Err(PluginFilterInputError::UnsupportedImageType {
+            title: doc.title.clone(),
+            detail: "the stack mixes different pixel types".to_string(),
         });
     }
 
@@ -1381,17 +1455,46 @@ pub fn validate_filter_request(doc: &ImageDocument) -> Result<(), PluginFilterIn
             ),
         });
     }
-    let default_range = DisplayRange {
-        min: 0.0,
-        max: 255.0,
-    };
-    if doc.display_range != default_range {
-        return Err(PluginFilterInputError::UnsupportedMetadata {
-            detail: format!(
-                "display range {}..{} is not the 8-bit default 0..255",
-                doc.display_range.min, doc.display_range.max
-            ),
-        });
+    match first_kind {
+        // FileSaver cannot store a non-default display range for RGB images
+        // (FileSaver.java 775-784), and the 8-bit LUT/display contract keeps
+        // its previous 0..255 requirement.
+        FilterPlaneKind::Gray8 | FilterPlaneKind::Rgb => {
+            let default_range = DisplayRange {
+                min: 0.0,
+                max: 255.0,
+            };
+            if doc.display_range != default_range {
+                return Err(PluginFilterInputError::UnsupportedMetadata {
+                    detail: format!(
+                        "display range {}..{} is not the default 0..255 supported for 8-bit and RGB images",
+                        doc.display_range.min, doc.display_range.max
+                    ),
+                });
+            }
+        }
+        // 16/32-bit display ranges are written into the ImageDescription
+        // (FileSaver.java 775-784), but FileOpener applies them as floats
+        // (FileOpener.java 459-463), so only f32-representable bounds can
+        // round-trip exactly.
+        FilterPlaneKind::Gray16 | FilterPlaneKind::Gray32 => {
+            let range = doc.display_range;
+            if !range.min.is_finite()
+                || !range.max.is_finite()
+                || f64::from(range.min as f32) != range.min
+                || f64::from(range.max as f32) != range.max
+            {
+                return Err(PluginFilterInputError::UnsupportedMetadata {
+                    detail: format!(
+                        "display range {}..{} is not finite and f32-representable; ImageJ \
+                         stores 16/32-bit display ranges as floats and the round trip would \
+                         silently change them",
+                        range.min, range.max
+                    ),
+                });
+            }
+        }
+        FilterPlaneKind::Color256 => unreachable!("rejected above"),
     }
     if let Some(levels) = &doc.threshold {
         return Err(PluginFilterInputError::UnsupportedMetadata {
@@ -1455,5 +1558,15 @@ fn pixel_plane_description(plane: &PixelPlane) -> &'static str {
         PixelPlane::Gray16(_) => "16-bit grayscale",
         PixelPlane::Gray32(_) => "32-bit float grayscale",
         PixelPlane::ColorRgb(_) => "24-bit RGB color",
+    }
+}
+
+fn expected_kind_label(kind: FilterPlaneKind) -> &'static str {
+    match kind {
+        FilterPlaneKind::Gray8 => "8-bit grayscale",
+        FilterPlaneKind::Gray16 => "16-bit grayscale",
+        FilterPlaneKind::Gray32 => "32-bit float grayscale",
+        FilterPlaneKind::Rgb => "RGB color",
+        FilterPlaneKind::Color256 => "8-bit indexed color (LUT)",
     }
 }

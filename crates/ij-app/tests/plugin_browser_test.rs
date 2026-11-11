@@ -498,17 +498,37 @@ fn prefill_uses_current_document_preflight_and_refuses_incompatible_images() {
     let probe = index_of(&app, "Probe Filter");
     inspect(&mut app, probe);
 
-    // 16-bit is outside the narrow PlugInFilter subset.
+    // Since P3.10 the image preflight accepts transferable 16-bit images;
+    // the plugin's own depth support is checked by its setup() flags in the
+    // Java host, so prefill must not be blocked for the image type.
     let gray16 =
         ImageDocument::new("sixteen-bit", 16, 16, PixelPlane::Gray16(vec![0; 16 * 16])).unwrap();
     let id16 = app.session.insert_doc(gray16);
     app.set_active_window(id16).unwrap();
+    assert!(
+        app.plugin_prefill_block_reason(probe).is_none(),
+        "16-bit prefill must be allowed"
+    );
+    app.prefill_plugin_filter_from_catalog(probe)
+        .expect("16-bit prefill only fills the dialog");
+    assert!(app.dialogs.show_plugin_filter);
+    app.dismiss_plugin_filter_dialog();
+
+    // A document outside the transferable subset is still blocked up front.
+    let mut bad_range = ImageDocument::new_ramp_8bit("bad-range", 16, 16).unwrap();
+    bad_range.display_range = ij_core::DisplayRange {
+        min: 5.0,
+        max: 200.0,
+    };
+    let id_bad = app.session.insert_doc(bad_range);
+    app.set_active_window(id_bad).unwrap();
     let reason = app
         .plugin_prefill_block_reason(probe)
-        .expect("16-bit must be blocked");
+        .expect("a non-transferable image must be blocked");
     assert!(reason.contains("not compatible"), "reason was {reason}");
     assert!(app.prefill_plugin_filter_from_catalog(probe).is_err());
     assert!(!app.dialogs.show_plugin_filter);
+    app.session.close_image(id_bad);
 
     // Switching to a compatible 8-bit image unblocks prefill.
     let id8 = app.open_ramp_8bit("eight-bit", 20, 20).unwrap();
@@ -517,6 +537,7 @@ fn prefill_uses_current_document_preflight_and_refuses_incompatible_images() {
     app.prefill_plugin_filter_from_catalog(probe)
         .expect("8-bit prefill");
     assert_eq!(app.dialogs.plugin_filter_target_id, Some(id8));
+    let _ = id16;
 }
 
 #[test]

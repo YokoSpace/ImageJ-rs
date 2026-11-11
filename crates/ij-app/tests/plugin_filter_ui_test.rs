@@ -399,15 +399,19 @@ fn test_failure_handling_and_state_preservation() {
 fn test_unsupported_document_inputs_rejected_without_modifications() {
     let mut app = ImageJApp::new().with_plugin_bridge(plugin_bridge());
 
-    // 1. Multi-slice stack
-    let stack_doc = ImageDocument::new_stack(
-        "stack",
+    // 1. Hyperstack (a plain Z-stack is transferable since P3.10; a
+    //    C/T hyperstack dimension is not).
+    let stack_doc = ImageDocument::new_hyperstack(
+        "hyper",
         16,
         16,
         vec![
             PixelPlane::Gray8(vec![0; 256]),
             PixelPlane::Gray8(vec![0; 256]),
         ],
+        2,
+        1,
+        1,
     )
     .unwrap();
     let id_stack = app.session.insert_doc(stack_doc);
@@ -427,7 +431,9 @@ fn test_unsupported_document_inputs_rejected_without_modifications() {
     ));
     assert_eq!(capture_snapshot(&app, id_stack), before_stack);
 
-    // 2. 16-bit grayscale
+    // 2. 16-bit grayscale offered to an 8-bit-only filter: since P3.10 the
+    //    image itself transfers, so the rejection now comes from the Java
+    //    host's setup() flag preflight, transactionally unchanged.
     let gray16_doc = ImageDocument::new("g16", 16, 16, PixelPlane::Gray16(vec![0; 256])).unwrap();
     let id_16 = app.session.insert_doc(gray16_doc);
     let before_16 = capture_snapshot(&app, id_16);
@@ -438,12 +444,15 @@ fn test_unsupported_document_inputs_rejected_without_modifications() {
         vec![fixture_jar_path()],
         String::new(),
     );
-    assert!(matches!(
-        res_16,
-        Err(SessionError::Plugin(
-            PluginBridgeError::UnsupportedFilterInput(_)
-        ))
-    ));
+    match res_16 {
+        Err(SessionError::Plugin(PluginBridgeError::FilterRejected { message })) => {
+            assert!(
+                message.contains("8-bit grayscale"),
+                "rejection should name the required image type: {message}"
+            );
+        }
+        other => panic!("expected FilterRejected for the depth mismatch, got {other:?}"),
+    }
     assert_eq!(capture_snapshot(&app, id_16), before_16);
 
     // 3. Oval ROI

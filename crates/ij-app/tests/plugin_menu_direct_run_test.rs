@@ -11,8 +11,9 @@ use ij_app::app::{
 use ij_app::dialogs::PluginCatalogPhase;
 use ij_bridge::PluginBridge;
 use ij_bridge::PluginCatalog;
+use ij_bridge::plugin::PluginBridgeError;
 use ij_bridge::plugin_discovery::PluginKind;
-use ij_core::{ImageDocument, PixelPlane};
+use ij_core::{DisplayRange, ImageDocument, PixelPlane};
 use ij_session::{ImageId, PluginFilterOutcome, SessionError};
 use std::fs;
 use std::io::Write;
@@ -481,7 +482,7 @@ fn invert_filter_runs_from_catalog_and_inverts_pixels() {
 }
 
 #[test]
-fn gray16_blocks_catalog_run_with_a_concrete_reason() {
+fn gray16_runs_are_refused_by_the_setup_flag_preflight_not_the_image_preflight() {
     let tmp = build_plugins_dir();
     let plugins_dir = tmp.path().join("plugins");
     let mut app = ImageJApp::new().with_plugin_bridge(plugin_bridge());
@@ -495,14 +496,26 @@ fn gray16_blocks_catalog_run_with_a_concrete_reason() {
     let id16 = app.session.insert_doc(gray16);
     app.set_active_window(id16).unwrap();
 
-    let reason = app
-        .plugin_prefill_block_reason(invert)
-        .expect("16-bit must be blocked");
-    assert!(reason.contains("not compatible"), "reason was {reason}");
-    let error = app
-        .run_catalog_plugin_immediately(invert)
-        .expect_err("16-bit one-click run must be rejected");
-    assert!(error.contains("not compatible"), "error was {error}");
+    // Since P3.10 the image preflight accepts 16-bit images; whether the
+    // plugin supports that depth is decided by its setup() flags in the
+    // Java host, exactly like PlugInFilterRunner.checkImagePlus.
+    assert!(
+        app.plugin_prefill_block_reason(invert).is_none(),
+        "16-bit prefill must be allowed; the depth check is a setup-flag preflight"
+    );
+    app.run_catalog_plugin_immediately(invert)
+        .expect("one-click run starts; the depth check happens in the host");
+    assert!(app.is_plugin_filter_running());
+
+    match wait_for_filter(&mut app, Duration::from_secs(20)) {
+        Err(SessionError::Plugin(PluginBridgeError::FilterRejected { message })) => {
+            assert!(
+                message.contains("8-bit grayscale"),
+                "rejection should name the required image type: {message}"
+            );
+        }
+        other => panic!("expected FilterRejected for the depth mismatch, got {other:?}"),
+    }
     assert!(!app.is_plugin_filter_running());
     assert!(!app.dialogs.show_plugin_filter);
     assert_eq!(app.dialogs.plugin_filter_target_id, None);
@@ -599,11 +612,28 @@ fn plugin_menu_entries_show_enabled_state_and_concrete_disabled_reasons() {
             .is_some_and(|reason| reason.contains("verified PlugInFilter"))
     );
 
-    // The same row becomes disabled with the active image's preflight reason.
+    // Since P3.10 a 16-bit image is transferable, so the row stays enabled;
+    // the plugin's own depth support is checked at run time by the host.
     let gray16 =
         ImageDocument::new("menu-sixteen-bit", 8, 8, PixelPlane::Gray16(vec![0; 8 * 8])).unwrap();
     let id16 = app.session.insert_doc(gray16);
     app.set_active_window(id16).unwrap();
+    let entries = app.plugin_menu_entries();
+    let invert_entry = entries
+        .iter()
+        .find(|entry| entry.label == "Invert 8-bit")
+        .expect("invert row");
+    assert!(invert_entry.enabled);
+
+    // The same row becomes disabled with the active image's preflight reason
+    // when the document itself is outside the transferable subset.
+    let mut bad_range = ImageDocument::new_ramp_8bit("menu-bad-range", 8, 8).unwrap();
+    bad_range.display_range = DisplayRange {
+        min: 5.0,
+        max: 200.0,
+    };
+    let id_bad = app.session.insert_doc(bad_range);
+    app.set_active_window(id_bad).unwrap();
     let entries = app.plugin_menu_entries();
     let invert_entry = entries
         .iter()
@@ -616,6 +646,7 @@ fn plugin_menu_entries_show_enabled_state_and_concrete_disabled_reasons() {
             .as_deref()
             .is_some_and(|reason| reason.contains("not compatible"))
     );
+    app.session.close_image(id_bad);
 
     // Restoring the 8-bit image re-enables the row and keeps the source path.
     app.set_active_window(id8).unwrap();

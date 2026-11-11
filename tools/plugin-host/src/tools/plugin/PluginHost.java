@@ -26,14 +26,18 @@ import java.util.List;
  * - exception_thrown
  * - unsupported_plugin_type (no-image filter, ExtendedPlugInFilter, ambiguous
  *   PlugIn+PlugInFilter, or a non-plugin class)
- * - unsupported_filter (image/stack/ROI/metadata/flags outside the supported
- *   subset; no output image is written)
- * - not_processed (the runner returned without calling run(ip), e.g. DONE;
- *   no output image is written and no pixel processing is claimed)
+ * - unsupported_filter (image depth/stack/ROI/metadata/flags outside the
+ *   supported subset; no output image is written)
+ * - not_processed (the runner returned without calling run(ip), e.g. DONE or
+ *   a failed image capability check; no output image is written and no pixel
+ *   processing is claimed)
  * - io_error (the host could not read the input or publish the output)
  *
- * GUI, stack/hyperstack, non-8-bit, non-rectangular-ROI, dialog/preview and
- * extended-filter compatibility are explicitly not claimed.
+ * GUI, hyperstacks, dialogs/preview (GenericDialog, ExtendedPlugInFilter),
+ * CONVERT_TO_FLOAT and non-rectangular-ROI compatibility are explicitly not
+ * claimed. Plain Z-stacks are processed by the unmodified ImageJ runner:
+ * every slice with DOES_STACKS, otherwise only the current slice transferred
+ * with --current-slice.
  *
  * Lifecycle & Sandboxing notice:
  * The plugin host provides process lifecycle management and JVM isolation for legacy ImageJ plugins,
@@ -54,6 +58,7 @@ public class PluginHost {
         String inputImage = null;
         String outputImage = null;
         String roiSpec = null;
+        String currentSliceSpec = null;
         boolean inspect = false;
 
         for (int i = 0; i < args.length; i++) {
@@ -77,6 +82,8 @@ public class PluginHost {
                 outputImage = args[++i];
             } else if ("--roi".equals(args[i]) && i + 1 < args.length) {
                 roiSpec = args[++i];
+            } else if ("--current-slice".equals(args[i]) && i + 1 < args.length) {
+                currentSliceSpec = args[++i];
             }
         }
 
@@ -193,7 +200,8 @@ public class PluginHost {
                 }
                 try {
                     FilterRunnerSupport.Result filterResult = FilterRunnerSupport.run(
-                        clazz, commandName, pluginArg, inputImage, outputImage, roiSpec);
+                        clazz, commandName, pluginArg, inputImage, outputImage, roiSpec,
+                        currentSliceSpec);
                     interceptedOut.flush();
                     interceptedErr.flush();
                     String outStr = capturedOutStream.toString(StandardCharsets.UTF_8);

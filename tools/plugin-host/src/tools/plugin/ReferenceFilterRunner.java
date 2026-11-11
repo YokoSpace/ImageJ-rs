@@ -25,6 +25,7 @@ public class ReferenceFilterRunner {
         String inputImage = null;
         String outputImage = null;
         String roiSpec = null;
+        String currentSliceSpec = null;
 
         for (int i = 0; i < args.length; i++) {
             if ("--class".equals(args[i]) && i + 1 < args.length) {
@@ -37,12 +38,15 @@ public class ReferenceFilterRunner {
                 outputImage = args[++i];
             } else if ("--roi".equals(args[i]) && i + 1 < args.length) {
                 roiSpec = args[++i];
+            } else if ("--current-slice".equals(args[i]) && i + 1 < args.length) {
+                currentSliceSpec = args[++i];
             }
         }
 
         if (className == null || inputImage == null || outputImage == null) {
             System.err.println("usage: ReferenceFilterRunner --class C --arg A "
-                    + "--input-image IN --output-image OUT [--roi x,y,w,h]");
+                    + "--input-image IN --output-image OUT [--roi x,y,w,h] "
+                    + "[--current-slice N]");
             System.exit(2);
         }
 
@@ -62,6 +66,11 @@ public class ReferenceFilterRunner {
                     Integer.parseInt(parts[1].trim()),
                     Integer.parseInt(parts[2].trim()),
                     Integer.parseInt(parts[3].trim())));
+        }
+        if (currentSliceSpec != null) {
+            // A filter without DOES_STACKS processes only the current slice,
+            // so the oracle must pin the same slice as the narrow host.
+            imp.setSlice(Integer.parseInt(currentSliceSpec.trim()));
         }
 
         try {

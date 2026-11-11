@@ -20,9 +20,11 @@ import java.util.Arrays;
 /**
  * The deliberately narrow image-processing subset of the plugin host.
  *
- * Supported: one 8-bit grayscale plane with the default grayscale LUT, an
- * optional in-bounds rectangular ROI, default spatial calibration and display
- * range, and a filter whose setup() flags stay inside the supported mask.
+ * Supported: 8-bit grayscale, 16-bit grayscale, 32-bit float and RGB images,
+ * optionally as a plain single-channel Z-stack, with an optional in-bounds
+ * rectangular ROI, default spatial calibration, and display range metadata
+ * that survives the TIFF round trip unchanged. PlugInFilterRunner itself
+ * decides between the whole stack (DOES_STACKS) and the single current slice.
  * Everything else is rejected before an output file is published. The actual
  * processing call is the unmodified ImageJ 1.54u PlugInFilterRunner.
  */
@@ -62,7 +64,8 @@ final class FilterRunnerSupport {
             String arg,
             String inputImagePath,
             String outputImagePath,
-            String roiSpec) throws Exception {
+            String roiSpec,
+            String currentSliceSpec) throws Exception {
 
         if (inputImagePath == null) {
             throw new UnsupportedFilterException(
@@ -82,10 +85,13 @@ final class FilterRunnerSupport {
 
         validateInputImage(imp);
         configureRoi(imp, roiSpec);
+        configureCurrentSlice(imp, currentSliceSpec);
 
         Roi inputRoi = copyRoi(imp.getRoi());
         int width = imp.getWidth();
         int height = imp.getHeight();
+        int type = imp.getType();
+        int stackSize = imp.getStackSize();
         double displayMin = imp.getDisplayRangeMin();
         double displayMax = imp.getDisplayRangeMax();
         byte[] inputLut = lutBytes(imp);
@@ -101,7 +107,9 @@ final class FilterRunnerSupport {
         try {
             // The unmodified ImageJ 1.54u runner calls setup(), checks the
             // flags/image type, installs the ROI on the processor, and calls
-            // run(ip). The wrapper only observes setup()'s flags and run calls.
+            // run(ip) for the current slice or for every slice of a stack
+            // when DOES_STACKS is set. The wrapper only observes setup()'s
+            // flags and run calls.
             new PlugInFilterRunner(filter, command == null ? "" : command, arg == null ? "" : arg);
         } finally {
             WindowManager.setTempCurrentImage(null);
@@ -127,32 +135,72 @@ final class FilterRunnerSupport {
         }
 
         validateOutputImage(
-                imp, width, height, displayMin, displayMax, inputRoi, inputLut);
+                imp, type, width, height, stackSize, displayMin, displayMax, inputRoi, inputLut);
 
         publishOutputImage(imp, outputImagePath);
         return result;
+    }
+
+    /**
+     * Pins the one-based current slice. A TIFF does not carry ImageJ's
+     * current-slice state, so the Rust side transfers it explicitly. A filter
+     * without DOES_STACKS then processes exactly this slice, like the
+     * interactive Path>Filter behavior.
+     */
+    private static void configureCurrentSlice(ImagePlus imp, String currentSliceSpec) {
+        int currentSlice = 1;
+        if (currentSliceSpec != null) {
+            try {
+                currentSlice = Integer.parseInt(currentSliceSpec.trim());
+            } catch (NumberFormatException e) {
+                throw new UnsupportedFilterException(
+                        "invalid --current-slice '" + currentSliceSpec + "'; expected an integer");
+            }
+        }
+        int stackSize = imp.getStackSize();
+        if (currentSlice < 1 || currentSlice > stackSize) {
+            throw new UnsupportedFilterException(
+                    "unsupported --current-slice '" + currentSliceSpec + "': the stack has "
+                    + stackSize + " slice(s)");
+        }
+        if (currentSlice != imp.getCurrentSlice()) {
+            imp.setSlice(currentSlice);
+        }
     }
 
     private static void validateInputImage(ImagePlus imp) {
         if (imp.getProcessor() == null) {
             throw new UnsupportedFilterException("input image has no processor");
         }
-        if (imp.getType() != ImagePlus.GRAY8) {
+        int type = imp.getType();
+        if (type != ImagePlus.GRAY8
+                && type != ImagePlus.GRAY16
+                && type != ImagePlus.GRAY32
+                && type != ImagePlus.COLOR_RGB) {
             throw new UnsupportedFilterException(
-                    "the narrow PlugInFilter host supports only 8-bit grayscale images; got "
-                    + typeName(imp.getType()));
+                    "the narrow PlugInFilter host supports 8-bit/16-bit/32-bit grayscale and "
+                    + "RGB images; got " + typeName(type));
         }
-        if (imp.getStackSize() != 1
+        // Only plain single-channel Z-stacks can be transferred; a C or T
+        // hyperstack dimension could not round-trip through the runner's
+        // plain-stack path.
+        if (imp.isHyperStack()
                 || imp.getNChannels() != 1
-                || imp.getNSlices() != 1
                 || imp.getNFrames() != 1
-                || imp.isHyperStack()) {
+                || imp.getNSlices() != imp.getStackSize()) {
             throw new UnsupportedFilterException(
-                    "the narrow PlugInFilter host does not support stacks/hyperstacks; got "
+                    "the narrow PlugInFilter host does not support hyperstacks; got "
                     + imp.getNChannels() + "x" + imp.getNSlices() + "x" + imp.getNFrames());
         }
         requireSupportedMetadata(imp, "input");
-        if (!isDefaultGrayLut(imp)) {
+        // FileSaver stores the display range of 16/32-bit images in the
+        // ImageDescription (FileSaver.java 775-784); it must round-trip.
+        if (!Double.isFinite(imp.getDisplayRangeMin()) || !Double.isFinite(imp.getDisplayRangeMax())) {
+            throw new UnsupportedFilterException(
+                    "input image has a non-finite display range (" + imp.getDisplayRangeMin()
+                    + ".." + imp.getDisplayRangeMax() + ")");
+        }
+        if (type == ImagePlus.GRAY8 && !isDefaultGrayLut(imp)) {
             throw new UnsupportedFilterException(
                     "input image has a non-default 8-bit LUT that this spike cannot preserve");
         }
@@ -191,12 +239,6 @@ final class FilterRunnerSupport {
         if (imp.getOverlay() != null) {
             throw new UnsupportedFilterException(
                     stage + " image has an overlay that this spike cannot preserve");
-        }
-        if (imp.getDisplayRangeMin() != 0.0 || imp.getDisplayRangeMax() != 255.0) {
-            throw new UnsupportedFilterException(
-                    stage + " image has a non-default display range ("
-                    + imp.getDisplayRangeMin() + ".." + imp.getDisplayRangeMax()
-                    + "); this spike only supports 0..255");
         }
     }
 
@@ -281,25 +323,29 @@ final class FilterRunnerSupport {
 
     private static void validateOutputImage(
             ImagePlus imp,
+            int expectedType,
             int expectedWidth,
             int expectedHeight,
+            int expectedStackSize,
             double expectedDisplayMin,
             double expectedDisplayMax,
             Roi inputRoi,
             byte[] inputLut) {
-        if (imp.getType() != ImagePlus.GRAY8) {
+        if (imp.getType() != expectedType) {
             throw new UnsupportedFilterException(
                     "filter changed the image type to " + typeName(imp.getType())
-                    + "; the narrow host cannot return it");
+                    + " (expected " + typeName(expectedType)
+                    + "); the narrow host cannot return it");
         }
         if (imp.getWidth() != expectedWidth || imp.getHeight() != expectedHeight) {
             throw new UnsupportedFilterException(
                     "filter changed the image dimensions to "
                     + imp.getWidth() + "x" + imp.getHeight());
         }
-        if (imp.getStackSize() != 1) {
+        if (imp.getStackSize() != expectedStackSize) {
             throw new UnsupportedFilterException(
-                    "filter produced a stack; the narrow host cannot return it");
+                    "filter changed the stack size to " + imp.getStackSize()
+                    + " (expected " + expectedStackSize + "); the narrow host cannot return it");
         }
         if (imp.getDisplayRangeMin() != expectedDisplayMin
                 || imp.getDisplayRangeMax() != expectedDisplayMax) {
@@ -309,7 +355,7 @@ final class FilterRunnerSupport {
                     + "; this spike cannot preserve it");
         }
         requireSupportedMetadata(imp, "output");
-        if (!Arrays.equals(inputLut, lutBytes(imp))) {
+        if (expectedType == ImagePlus.GRAY8 && !Arrays.equals(inputLut, lutBytes(imp))) {
             throw new UnsupportedFilterException(
                     "filter changed the image LUT; this spike cannot preserve it");
         }
