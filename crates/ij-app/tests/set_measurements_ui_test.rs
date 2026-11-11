@@ -239,6 +239,12 @@ fn enabling_stddev_and_median_adds_their_results_columns() {
     let tsv = app.session.results.to_tsv();
     let header = tsv.lines().next().expect("results header");
     assert_eq!(header, " \tArea\tMean\tStdDev\tMin\tMax\tMedian");
+    let grid = app.results_grid_cells();
+    assert_eq!(
+        grid[0].iter().map(String::as_str).collect::<Vec<_>>(),
+        [" ", "Area", "Mean", "StdDev", "Min", "Max", "Median"]
+    );
+    assert_eq!(grid[1].len(), grid[0].len());
 }
 
 #[test]

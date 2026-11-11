@@ -516,7 +516,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 - **先に書くテスト**: 複数のフラグ組み合わせと `decimal=2`, `decimal=5` でオラクルの `saveAs("Results", ...)` の TSV と完全一致。
 
 #### M4c `Set Measurements...` ダイアログと GUI 配線 🟢
-- **編集してよいファイル**: `crates/ij-app/src/action.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/tests/menu_coverage_test.rs`, `crates/ij-app/tests/set_measurements_ui_test.rs`（新規）
+- **編集してよいファイル**: `crates/ij-app/src/action.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/src/app/image_window.rs`, `crates/ij-app/tests/menu_coverage_test.rs`, `crates/ij-app/tests/set_measurements_ui_test.rs`（新規）
 - **仕様**:
   - `Analyze > Set Measurements...` でチェックボックス群と `Decimal places (0-9)` の `DragValue` を持つウィンドウを開く。
   - Results テーブルウィンドウ（`app` 内）の列表示も、現在の `ResultsTable` の有効列ヘッダと値を動的に並べるように更新する。

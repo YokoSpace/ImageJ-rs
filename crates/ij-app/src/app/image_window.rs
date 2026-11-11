@@ -249,7 +249,7 @@ impl ImageJApp {
     pub fn results_grid_cells(&self) -> Vec<Vec<String>> {
         self.session
             .results
-            .to_tsv_basic()
+            .to_tsv()
             .lines()
             .map(|line| line.split('\t').map(str::to_string).collect())
             .collect()
