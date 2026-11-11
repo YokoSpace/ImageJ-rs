@@ -29,7 +29,7 @@ impl Default for ParticleAnalysisOptions {
             exclude_on_edges: false,
             include_holes: false,
             pixel_units: false,
-            black_background: true,
+            black_background: false,
         }
     }
 }
@@ -142,7 +142,17 @@ impl ImageDocument {
                 let mut measured = self.clone();
                 measured.roi = Some(roi.clone());
                 let measurement = measured.measure_with_mask(config, Some(&mask))?;
-                let perimeter = measured.roi_perimeter();
+                // ParticleAnalyzer.java 925-934 filters before attaching the
+                // ImagePlus to the traced ROI, so this perimeter is in pixels.
+                // The Results `Perim.` column remains calibrated.
+                let perimeter = crate::polygon_perimeter(
+                    match &roi {
+                        Roi::Polygon(poly) => poly,
+                        _ => unreachable!(),
+                    },
+                    1.0,
+                    1.0,
+                );
                 let circularity = if perimeter == 0.0 {
                     0.0
                 } else {

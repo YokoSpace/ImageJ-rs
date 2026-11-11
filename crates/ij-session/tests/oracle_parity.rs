@@ -183,6 +183,61 @@ fn parity_analyze_particles_summary_matches_java_table() {
 }
 
 #[test]
+fn parity_analyze_particles_unthresholded_binary_uses_white_background_default() {
+    let mut pixels = vec![255_u8; 20 * 20];
+    pixels[2 * 20 + 2] = 0;
+    pixels[10 * 20 + 10] = 0;
+    let doc = ImageDocument::new("binary-white-background", 20, 20, PixelPlane::Gray8(pixels)).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "setOption(\"BlackBackground\",false); run(\"Analyze Particles...\",\"size=0-Infinity circularity=0.00-1.00 show=Nothing display clear\"); print(\"COUNT=\"+nResults); for(i=0;i<nResults;i++) print(\"MEAN=\"+getResult(\"Mean\",i));"
+    ).unwrap();
+    let count = java.stdout.lines().find_map(|line| line.strip_prefix("COUNT="))
+        .unwrap().parse::<usize>().unwrap();
+    let means: Vec<f64> = java.stdout.lines().filter_map(|line| line.strip_prefix("MEAN="))
+        .map(|value| value.parse::<f64>().unwrap()).collect();
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions::default(), clear_results: true,
+        add_to_manager: false, summarize: false,
+    }).unwrap();
+    assert_eq!(session.results.rows.len(), count);
+    assert_eq!(session.results.rows.iter().map(|row| row.mean).collect::<Vec<_>>(), means);
+}
+
+#[test]
+fn parity_analyze_particles_circularity_filter_is_uncalibrated() {
+    let mut pixels = vec![0_u8; 20 * 20];
+    for y in 2..6 { for x in 8..12 {
+        if x == 8 || x == 11 || y == 2 || y == 5 { pixels[y * 20 + x] = 255; }
+    } }
+    let doc = ImageDocument::new("ring", 20, 20, PixelPlane::Gray8(pixels)).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc,
+        "setThreshold(255,255); run(\"Set Scale...\",\"distance=2 known=1 unit=um\"); run(\"Set Measurements...\",\"area mean perimeter shape redirect=None decimal=6\"); run(\"Analyze Particles...\",\"size=0-Infinity circularity=0.70-0.90 show=Nothing display clear\"); print(\"COUNT=\"+nResults); if(nResults>0) print(\"AREA=\"+getResult(\"Area\",0));"
+    ).unwrap();
+    let count = java.stdout.lines().find_map(|line| line.strip_prefix("COUNT="))
+        .unwrap().parse::<usize>().unwrap();
+    let area = java.stdout.lines().find_map(|line| line.strip_prefix("AREA="))
+        .unwrap().parse::<f64>().unwrap();
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+    session.dispatch(Command::SetScale { distance: 2.0, known: 1.0, aspect: 1.0, unit: "um".into() }).unwrap();
+    session.dispatch(Command::SetMeasurements {
+        flags: MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::PERIMETER | MeasurementFlags::SHAPE_DESCRIPTORS,
+        precision: 6,
+    }).unwrap();
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions { min_circularity: 0.7, max_circularity: 0.9, ..Default::default() },
+        clear_results: true, add_to_manager: false, summarize: false,
+    }).unwrap();
+    assert_eq!(session.results.rows.len(), count);
+    assert_eq!(session.results.rows[0].area, area);
+}
+
+#[test]
 fn parity_roi_manager_add_select_measure_and_delete() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let doc = ImageDocument::new_ramp_8bit("roi-manager", 4, 4).unwrap();
