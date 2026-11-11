@@ -4,6 +4,7 @@ pub mod edit;
 pub mod filters;
 pub mod histogram;
 pub mod math;
+pub mod particles;
 pub mod threshold_palette;
 pub mod wand;
 
@@ -14,6 +15,7 @@ pub use contrast::{
 };
 pub use filters::{AutoThresholdMethod, RankFilterKind};
 pub use histogram::{display_histogram, DisplayHistogram};
+pub use particles::{AnalyzedParticle, ParticleAnalysisOptions};
 pub use threshold_palette::{
     adjust_max_threshold, adjust_min_threshold, format_threshold_label, plot_threshold_bins,
     scale_down, scale_up, scale_up_and_set, threshold_to_sliders, ThresholdSliders,
@@ -2966,6 +2968,14 @@ impl ImageDocument {
         &self,
         config: MeasurementConfig,
     ) -> Result<MeasurementSummary, CoreError> {
+        self.measure_with_mask(config, None)
+    }
+
+    pub(crate) fn measure_with_mask(
+        &self,
+        config: MeasurementConfig,
+        mask_override: Option<&RoiMask>,
+    ) -> Result<MeasurementSummary, CoreError> {
         if let Some(Roi::Point(_)) = &self.roi {
             return self
                 .measure_rows_with_config(config)?
@@ -3032,11 +3042,12 @@ impl ImageDocument {
                 .unwrap_or((0, 0, 0, 0)),
             None => (0, 0, self.width, self.height),
         };
-        let mask = if rw == 0 || rh == 0 {
+        let mask = if rw == 0 || rh == 0 || mask_override.is_some() {
             None
         } else {
             self.roi_mask()?
         };
+        let mask = mask_override.or(mask.as_ref());
 
         let raw = match self.plane() {
             PixelPlane::Gray8(pixels) => self.measure_byte_like(
@@ -3045,7 +3056,7 @@ impl ImageDocument {
                 ry,
                 rw,
                 rh,
-                mask.as_ref(),
+                mask,
                 self.threshold,
                 limit,
             ),
@@ -3055,7 +3066,7 @@ impl ImageDocument {
                 ry,
                 rw,
                 rh,
-                mask.as_ref(),
+                mask,
                 self.threshold,
                 limit,
             ),
@@ -3065,7 +3076,7 @@ impl ImageDocument {
                 ry,
                 rw,
                 rh,
-                mask.as_ref(),
+                mask,
                 self.threshold,
                 limit,
             ),
@@ -3075,11 +3086,11 @@ impl ImageDocument {
                 ry,
                 rw,
                 rh,
-                mask.as_ref(),
+                mask,
                 self.threshold,
                 limit,
             ),
-            PixelPlane::ColorRgb(pixels) => self.measure_rgb(pixels, rx, ry, rw, rh, mask.as_ref()),
+            PixelPlane::ColorRgb(pixels) => self.measure_rgb(pixels, rx, ry, rw, rh, mask),
         };
 
         let mut summary = self.finish_measurement(rx, ry, rw, rh, raw);
@@ -3088,7 +3099,7 @@ impl ImageDocument {
             || config.contains(MeasurementFlags::SHAPE_DESCRIPTORS)
         {
             let (major, minor, angle, centroid) =
-                self.fit_ellipse(rx, ry, rw, rh, mask.as_ref(), limit);
+                self.fit_ellipse(rx, ry, rw, rh, mask, limit);
             summary.major = major;
             summary.minor = minor;
             summary.ellipse_angle = angle;

@@ -3,7 +3,7 @@ use ij_core::{
     default_duplicate_title, display_histogram, format_ij_num, CoreError, DisplayHistogram,
     DisplayRange, ImageDocument, LineRoi, Lut256, MeasurementConfig, MeasurementFlags,
     MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
-    ThresholdLevels, Wand, WandMode,
+    ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions,
 };
 use ij_io::{load_image, load_tiff, save_jpeg, save_png, save_tiff};
 use ij_session::{Command, CommandOutcome, Session};
@@ -15,6 +15,101 @@ fn repo_root() -> PathBuf {
         .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf()
+}
+
+#[test]
+fn parity_analyze_particles_holes_edges_and_size_match_java_oracle() {
+    let mut pixels = vec![0_u8; 20 * 20];
+    for y in 2..5 { for x in 2..5 { pixels[y * 20 + x] = 255; } }
+    for y in 2..6 { for x in 8..12 {
+        if x == 8 || x == 11 || y == 2 || y == 5 { pixels[y * 20 + x] = 255; }
+    } }
+    for y in 10..13 { for x in 0..3 { pixels[y * 20 + x] = 255; } }
+    for y in 12..14 { for x in 15..17 { pixels[y * 20 + x] = 255; } }
+    let source = ImageDocument::new("particles", 20, 20, PixelPlane::Gray8(pixels.clone())).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let input_path = directory.path().join("particles.tif");
+    save_tiff(&input_path, &source).unwrap();
+    let flags = MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::CENTROID
+        | MeasurementFlags::PERIMETER | MeasurementFlags::SHAPE_DESCRIPTORS;
+    for (macro_options, options) in [
+        ("size=0-Infinity circularity=0.00-1.00 show=Nothing display clear add", ParticleAnalysisOptions::default()),
+        ("size=0-Infinity circularity=0.00-1.00 show=Nothing display clear exclude add", ParticleAnalysisOptions { exclude_on_edges: true, ..Default::default() }),
+        ("size=0-Infinity circularity=0.00-1.00 show=Nothing display clear include add", ParticleAnalysisOptions { include_holes: true, ..Default::default() }),
+        ("size=10-100 circularity=0.00-1.00 show=Nothing display clear add", ParticleAnalysisOptions { min_size: 10.0, max_size: 100.0, ..Default::default() }),
+    ] {
+        let macro_text = format!(
+            "open(\"{}\"); setOption(\"BlackBackground\",true); setThreshold(255,255); \
+             run(\"Set Measurements...\",\"area mean centroid perimeter shape redirect=None decimal=3\"); \
+             run(\"Analyze Particles...\",\"{macro_options}\"); \
+             print(\"COUNT=\"+nResults); print(\"ROIS=\"+roiManager(\"count\")); \
+             for(i=0;i<nResults;i++) print(\"ROW=\"+getResult(\"Area\",i)+\",\"+getResult(\"Mean\",i)+\",\"+getResult(\"X\",i)+\",\"+getResult(\"Y\",i)+\",\"+getResult(\"Perim.\",i)+\",\"+getResult(\"Circ.\",i)); \
+             for(i=0;i<roiManager(\"count\");i++) {{ roiManager(\"Select\",i); getSelectionBounds(x,y,w,h); print(\"BOUNDS=\"+x+\",\"+y+\",\"+w+\",\"+h); }}",
+            input_path.display()
+        );
+        let java = bridge.eval_macro(&macro_text).unwrap();
+        let oracle_rows: Vec<Vec<f64>> = java.stdout.lines().filter_map(|line| line.strip_prefix("ROW="))
+            .map(|line| line.split(',').map(|part| part.parse::<f64>().unwrap()).collect()).collect();
+        let oracle_count = java.stdout.lines().find_map(|line| line.strip_prefix("COUNT="))
+            .unwrap().parse::<usize>().unwrap();
+        let oracle_rois = java.stdout.lines().find_map(|line| line.strip_prefix("ROIS="))
+            .unwrap().parse::<usize>().unwrap();
+        let oracle_bounds: Vec<Vec<i32>> = java.stdout.lines().filter_map(|line| line.strip_prefix("BOUNDS="))
+            .map(|line| line.split(',').map(|part| part.parse::<i32>().unwrap()).collect()).collect();
+        assert_eq!(oracle_rows.len(), oracle_count);
+        assert_eq!(oracle_bounds.len(), oracle_rois);
+        let mut session = Session::new();
+        session.insert_doc(source.clone());
+        session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+        session.dispatch(Command::SetMeasurements { flags, precision: 3 }).unwrap();
+        session.dispatch(Command::AnalyzeParticles { options, clear_results: true, add_to_manager: true }).unwrap();
+        assert_eq!(session.results.rows.len(), oracle_rows.len(), "{macro_options}");
+        for (rust, java) in session.results.rows.iter().zip(&oracle_rows) {
+            for (actual, expected) in [rust.area, rust.mean, rust.x_centroid, rust.y_centroid,
+                rust.perimeter, rust.circularity].into_iter().zip(java) {
+                assert!((actual - expected).abs() < 1e-4, "{macro_options}: {actual} != {expected}");
+            }
+        }
+        assert_eq!(session.roi_manager.len(), oracle_rois);
+        for (entry, expected) in session.roi_manager.iter().zip(oracle_bounds) {
+            let (x, y, w, h) = entry.roi.bounds();
+            assert_eq!([x, y, w, h], expected.as_slice());
+        }
+        assert_eq!(session.active_doc().unwrap().plane(), &PixelPlane::Gray8(pixels.clone()));
+    }
+}
+
+#[test]
+fn parity_analyze_particles_calibrated_size_matches_java_oracle() {
+    let mut pixels = vec![0_u8; 20 * 20];
+    for y in 2..5 { for x in 2..5 { pixels[y * 20 + x] = 255; } }
+    for y in 8..12 { for x in 8..12 { pixels[y * 20 + x] = 255; } }
+    let source = ImageDocument::new("scaled-particles", 20, 20, PixelPlane::Gray8(pixels)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("input.tif");
+    save_tiff(&input, &source).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.eval_macro(&format!(
+        "open(\"{}\"); setOption(\"BlackBackground\",true); \
+         setThreshold(255,255); run(\"Set Scale...\",\"distance=2 known=1 unit=um\"); \
+         run(\"Set Measurements...\",\"area mean redirect=None decimal=3\"); \
+         run(\"Analyze Particles...\",\"size=3-5 circularity=0.00-1.00 show=Nothing display clear\"); \
+         print(\"COUNT=\"+nResults); print(\"AREA=\"+getResult(\"Area\",0));",
+        input.display(),
+    )).unwrap();
+    let java_value = |prefix: &str| java.stdout.lines().find_map(|line| line.strip_prefix(prefix)).unwrap().parse::<f64>().unwrap();
+    let mut session = Session::new();
+    session.insert_doc(source);
+    session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+    session.dispatch(Command::SetScale { distance: 2.0, known: 1.0, aspect: 1.0, unit: "um".into() }).unwrap();
+    session.dispatch(Command::SetMeasurements { flags: MeasurementFlags::AREA | MeasurementFlags::MEAN, precision: 3 }).unwrap();
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions { min_size: 3.0, max_size: 5.0, ..Default::default() },
+        clear_results: true, add_to_manager: false,
+    }).unwrap();
+    assert_eq!(session.results.rows.len() as f64, java_value("COUNT="));
+    assert_eq!(session.results.rows[0].area, java_value("AREA="));
 }
 
 #[test]

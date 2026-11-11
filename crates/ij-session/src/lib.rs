@@ -7,7 +7,7 @@ pub use ij_bridge::plugin::{
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
     MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
-    AngleRoi, PointRoi, Roi, ThresholdLevels,
+    AngleRoi, PointRoi, Roi, ThresholdLevels, ParticleAnalysisOptions,
 };
 use ij_io::{ImageFileFormat, IoError, detect_image_format, load_image, save_jpeg, save_png, save_tiff};
 use ij_plugin_api::{PluginContext, RustImagePlugin};
@@ -336,6 +336,11 @@ pub enum Command {
     Undo,
     /// `Analyze > Set Measurements...` updates session measurement options.
     SetMeasurements { flags: u32, precision: u8 },
+    AnalyzeParticles {
+        options: ParticleAnalysisOptions,
+        clear_results: bool,
+        add_to_manager: bool,
+    },
     /// `Analyze > Set Scale...` (ScaleDialog.java 80-108). The dialog fields
     /// become `Calibration.pixelWidth = known/distance`,
     /// `pixelHeight = pixelWidth*aspect` and `unit`; a non-positive distance or
@@ -1794,6 +1799,38 @@ impl Session {
                     "run(\"Set Measurements...\", \"{}\");",
                     measurement_macro_options(config)
                 ));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::AnalyzeParticles { options, clear_results, add_to_manager } => {
+                let image_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let particles = self.active_doc()?.analyze_particles(options, self.results.config)?;
+                if clear_results {
+                    self.results.clear();
+                }
+                for particle in particles {
+                    if add_to_manager {
+                        let doc = self.active_doc()?;
+                        self.roi_manager.push(NamedRoi {
+                            name: roi_manager_label(doc, &particle.roi),
+                            roi: particle.roi,
+                            source_image: image_id,
+                            slice: doc.current_slice,
+                        });
+                    }
+                    self.results.push(particle.measurement);
+                }
+                let max_size = if options.max_size.is_infinite() { "Infinity".into() }
+                    else { ij_core::format_ij_num(options.max_size) };
+                let mut macro_options = format!(
+                    "size={}-{} circularity={:.2}-{:.2} show=Nothing display",
+                    ij_core::format_ij_num(options.min_size), max_size,
+                    options.min_circularity, options.max_circularity,
+                );
+                if clear_results { macro_options.push_str(" clear"); }
+                if options.exclude_on_edges { macro_options.push_str(" exclude"); }
+                if options.include_holes { macro_options.push_str(" include"); }
+                if add_to_manager { macro_options.push_str(" add"); }
+                self.macro_recorder.push(format!("run(\"Analyze Particles...\", \"{macro_options}\");"));
                 Ok(CommandOutcome::Updated)
             }
             Command::SetScale {
