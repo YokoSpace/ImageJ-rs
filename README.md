@@ -23,25 +23,26 @@ To open a TIFF at startup:
 cargo run --release -p ij-app -- /path/to/image.tif
 ```
 
-You can also use **File → Open** in the app. For a quick tour without an image file, choose **File → New → Image... (8-bit Ramp)**, draw a rectangle, and select **Analyze → Measure** to see the Results window. The TIFF reader currently supports uncompressed files in its implemented formats; compressed TIFFs are not supported. The app is still being developed, so save a copy of valuable images before editing them.
+You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick tour without an image file, choose **File → New → Image... (8-bit Ramp)**, draw a rectangle, and select **Analyze → Measure** to see the Results window. The TIFF reader handles PackBits, Deflate, and LZW compression for its supported image types. The app is still being developed, so save a copy of valuable images before editing them.
 
 ## What works today
 
 - A desktop toolbar, separate image windows, zoom, a Results window, and ImageJ-style status and image information.
 - 8-bit grayscale and indexed color, 16-bit grayscale, 32-bit float, and RGB image data; multi-slice stacks and C/Z/T dimensions in the data model and TIFF round trips.
-- Rectangle, oval, line, polygon, freehand, and Wand selections. Rectangle, oval, and line ROIs can also be moved or resized interactively.
+- Rectangle, oval, line, polygon, freehand, Wand, point, angle, segmented line, and freehand line selections. The ROI Manager can store, select, delete, and measure selections.
 - Display range, Brightness & Contrast, threshold controls with live histogram previews, selected filters, measurements, TIFF I/O, and macro recording for supported commands.
-- Crop, Duplicate, 8-bit/16-bit/32-bit/RGB type conversion, Set Measurements, Histogram, and Plot Profile commands, with stack-wide processing for the supported filters.
+- Crop, Duplicate, 8-bit/16-bit/32-bit/RGB type conversion, Set Measurements, Set Scale, Histogram, Plot Profile, and 14 Process → Math operations. Supported filters and math operations can process stacks.
+- TIFF, PNG, and JPEG opening and saving, plus Results table export. PNG and TIFF preserve pixels on supported lossless round trips; JPEG uses lossy compression.
 - Hyperstack C/Z/T navigation, slice animation, and the ImageJ-style native macOS menu bar (the in-window menu is used on other platforms).
-- A Java compatibility path for a **limited subset** of classic ImageJ plug-ins, described below.
+- A Java compatibility path for a **limited subset** of classic ImageJ plug-ins and an API for Rust image plug-ins, described below.
 
-The app is still being expanded. Items marked **unsupported** remain on the roadmap; current gaps include common Edit drawing and clipboard commands, binary and math processing, Set Scale, Analyze Particles, ROI Manager, additional toolbar tools, and compressed or non-TIFF image formats. See the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for the completed fidelity work and the [issue tracker](https://github.com/YokoSpace/ImageJ-rs/issues) for follow-up work.
+The app is still being expanded. Current gaps include Edit drawing and clipboard commands, binary processing, Image Calculator, Analyze Particles, and the Text and Color Picker tools. See the [Phase 3 roadmap](docs/roadmap_phase3_practical_workflows.md) for the remaining workflow and the [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) for earlier UI work.
 
 ## Classic ImageJ plug-ins
 
-The **Plugins → Installed Plugins** window can scan a classic ImageJ plug-ins directory and inspect entries. After a catalog has been scanned and inspected, it is cached and compatible entries also appear directly in the **Plugins** menu for one-click execution. The current execution path supports a narrow subset of plain `PlugInFilter` classes through a separate Java process. Filter input must be a single 8-bit grayscale image with default metadata and either no ROI or an in-bounds rectangular ROI. Other image types, stacks, and plug-ins needing unsupported UI or host features are rejected rather than silently converted.
+The **Plugins → Installed Plugins** window can scan a classic ImageJ plug-ins directory and inspect entries. After a catalog has been scanned and inspected, it is cached and compatible entries also appear directly in the **Plugins** menu for one-click execution. A separate Java process runs supported plain `PlugInFilter` classes on 8-bit, 16-bit, 32-bit, and RGB images. It handles single slices and ordinary stacks, including filters that declare `DOES_STACKS`. One standard `GenericDialog` with numeric, string, choice, and checkbox fields can be shown in egui. Indexed-color images, hyperstacks, non-rectangular ROIs, advanced filter flags, and more complex dialogs remain outside this compatibility path.
 
-Plug-ins do **not** run in a security sandbox. Run only code you trust. Broader Java plug-in compatibility and a Rust plug-in API remain future work.
+Plug-ins do **not** run in a security sandbox. Run only code you trust. The [`ij-plugin-api` crate](crates/ij-plugin-api/) also provides a typed Rust image plug-in interface with transactional document updates.
 
 ## Verify the implementation
 
@@ -64,10 +65,11 @@ cargo run -p ij-cli -- doctor
 | Path | Purpose |
 | --- | --- |
 | [`crates/ij-core/`](crates/ij-core/) | Pure image, ROI, measurement, and processing logic |
-| [`crates/ij-io/`](crates/ij-io/) | TIFF reading and writing |
+| [`crates/ij-io/`](crates/ij-io/) | TIFF, PNG, and JPEG reading and writing |
 | [`crates/ij-session/`](crates/ij-session/) | Documents, commands, results, and macro recording |
 | [`crates/ij-app/`](crates/ij-app/) | Desktop application |
 | [`crates/ij-bridge/`](crates/ij-bridge/) | Java oracle and plug-in process bridges |
+| [`crates/ij-plugin-api/`](crates/ij-plugin-api/) | Typed Rust image plug-in interface |
 | [`original_imagej/`](original_imagej/) | Read-only ImageJ reference source |
 | [`tools/`](tools/) | Oracle, plug-in host, and verification scripts |
 
