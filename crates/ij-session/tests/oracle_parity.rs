@@ -9661,6 +9661,28 @@ fn parity_convert_to_16bit_gray32_matches_java_oracle() {
     }
 }
 
+#[test]
+fn parity_convert_to_16bit_gray32_zero_range_resets_from_pixels() {
+    // FloatProcessor.setMinAndMax(0,0) calls resetMinAndMax
+    // (FloatProcessor.java 123-125) before TypeConverter reads the range.
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new(
+        "float_zero_range.tif",
+        4,
+        1,
+        PixelPlane::Gray32(vec![-2.0, 0.0, 1.0, 3.0]),
+    )
+    .unwrap();
+    let oracle = bridge
+        .run_macro_on_image(&doc, "setMinAndMax(0,0); run(\"16-bit\");")
+        .unwrap();
+    let oracle_doc = oracle.output_image.expect("oracle must return saved TIFF");
+    doc.display_range = DisplayRange { min: 0.0, max: 0.0 };
+    doc.convert_to_16bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
 /// TypeConverter.convertToShort (TypeConverter.java 149-160) sends RGB through
 /// convertRGBToByte (equal 1/3 weights, TypeConverter.java 95-117) and then
 /// convertByteToShort, so the result is the 0..=255 gray level as a u16.
@@ -9758,6 +9780,31 @@ fn parity_convert_to_16bit_gray32_stack_matches_java_oracle() {
     assert_eq!(doc.display_range, oracle_doc.display_range);
     // The TIFF format does not persist the current slice.
     assert_eq!(doc.current_slice, 2);
+}
+
+#[test]
+fn parity_convert_to_16bit_gray32_stack_zero_range_uses_current_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new_stack(
+        "float_stack_zero_range.tif",
+        2,
+        1,
+        vec![
+            PixelPlane::Gray32(vec![100.0, 200.0]),
+            PixelPlane::Gray32(vec![-2.0, 3.0]),
+        ],
+    )
+    .unwrap();
+    let oracle = bridge
+        .run_macro_on_image(&doc, "setSlice(2); setMinAndMax(0,0); run(\"16-bit\");")
+        .unwrap();
+    let oracle_doc = oracle.output_image.expect("oracle must return saved TIFF");
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    doc.display_range = DisplayRange { min: 0.0, max: 0.0 };
+    doc.convert_to_16bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
 }
 
 /// ImageConverter.convertToGray16 throws IllegalArgumentException for

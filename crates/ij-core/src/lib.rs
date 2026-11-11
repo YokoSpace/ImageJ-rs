@@ -636,6 +636,28 @@ fn gray16_display_range(pixels: &[u16]) -> DisplayRange {
     }
 }
 
+fn float_processor_range(pixels: &[f32]) -> DisplayRange {
+    // FloatProcessor.findMinAndMax skips leading NaNs, then compares every
+    // remaining value (FloatProcessor.java 92-114).
+    let first = pixels
+        .iter()
+        .copied()
+        .find(|value| !value.is_nan())
+        .unwrap_or(f32::NAN);
+    let (mut min, mut max) = (first, first);
+    for &value in pixels {
+        if value < min {
+            min = value;
+        } else if value > max {
+            max = value;
+        }
+    }
+    DisplayRange {
+        min: f64::from(min),
+        max: f64::from(max),
+    }
+}
+
 /// FloatProcessor.create8BitImage (FloatProcessor.java 190-208).
 fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
     let mut value = f64::from(pixel) - min;
@@ -1504,9 +1526,15 @@ impl ImageDocument {
             }
             PixelPlane::Gray32(pixels) => {
                 // FloatProcessor.setMinAndMax stores the bounds as float
-                // (FloatProcessor.java 123-133).
-                let min = f64::from(self.display_range.min as f32);
-                let max = f64::from(self.display_range.max as f32);
+                // (FloatProcessor.java 123-133). Zero/zero resets them from
+                // the pixels before TypeConverter reads the range.
+                let range = if self.display_range.min == 0.0 && self.display_range.max == 0.0 {
+                    float_processor_range(&pixels)
+                } else {
+                    self.display_range
+                };
+                let min = f64::from(range.min as f32);
+                let max = f64::from(range.max as f32);
                 let scale = if (max - min) == 0.0 {
                     1.0
                 } else {
@@ -1566,8 +1594,16 @@ impl ImageDocument {
         // StackConverter.java 167 only scales a GRAY32 stack; GRAY8 stacks
         // keep their 0..=255 values (convertByteToShort ignores the scale).
         let source_is_32 = matches!(self.slices[current], PixelPlane::Gray32(_));
-        let min = f64::from(self.display_range.min as f32);
-        let max = f64::from(self.display_range.max as f32);
+        let range = if source_is_32 && self.display_range.min == 0.0 && self.display_range.max == 0.0 {
+            let PixelPlane::Gray32(pixels) = &self.slices[current] else {
+                unreachable!("source_is_32 requires a Gray32 plane")
+            };
+            float_processor_range(pixels)
+        } else {
+            self.display_range
+        };
+        let min = f64::from(range.min as f32);
+        let max = f64::from(range.max as f32);
         let scale = if (max - min) == 0.0 {
             1.0
         } else {
