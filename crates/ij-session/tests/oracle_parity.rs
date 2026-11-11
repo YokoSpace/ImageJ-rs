@@ -113,6 +113,25 @@ fn parity_analyze_particles_calibrated_size_matches_java_oracle() {
 }
 
 #[test]
+fn parity_analyze_particles_full_byte_threshold_runs_once_like_java() {
+    let doc = ImageDocument::new("full-range", 4, 4, PixelPlane::Gray8(vec![0; 16])).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(
+        &doc,
+        "setThreshold(0,255); run(\"Analyze Particles...\",\"size=0-Infinity circularity=0.00-1.00 show=Nothing display clear\"); print(\"COUNT=\"+nResults); print(\"AREA=\"+getResult(\"Area\",0));",
+    ).unwrap();
+    let value = |prefix: &str| java.stdout.lines().find_map(|line| line.strip_prefix(prefix)).unwrap().parse::<f64>().unwrap();
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::SetThreshold { lower: 0.0, upper: 255.0 }).unwrap();
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions::default(), clear_results: true, add_to_manager: false,
+    }).unwrap();
+    assert_eq!(session.results.rows.len() as f64, value("COUNT="));
+    assert_eq!(session.results.rows[0].area, value("AREA="));
+}
+
+#[test]
 fn parity_roi_manager_add_select_measure_and_delete() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let doc = ImageDocument::new_ramp_8bit("roi-manager", 4, 4).unwrap();

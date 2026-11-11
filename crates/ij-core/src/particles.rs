@@ -80,6 +80,12 @@ impl ImageDocument {
                 }
             }
         };
+        let full_byte_range = levels.lower == 0.0
+            && levels.upper == 255.0
+            && matches!(
+                self.plane(),
+                PixelPlane::Gray8(_) | PixelPlane::Color256 { .. }
+            );
         let mut work = self.clone();
         let source_roi = self.roi.as_ref().filter(|roi| roi.is_area());
         let (left, top, width, height) = source_roi
@@ -166,6 +172,11 @@ impl ImageDocument {
                             erase(work.plane_mut(), self.width, xx, yy, levels);
                         }
                     }
+                }
+                // ParticleAnalyzer.java 612-618 sets `done` after the first
+                // 8-bit particle when the threshold covers every byte value.
+                if full_byte_range {
+                    return Ok(found);
                 }
             }
         }
