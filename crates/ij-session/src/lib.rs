@@ -6,7 +6,7 @@ pub use ij_bridge::plugin::{
 };
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
-    MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ResultsTable,
+    MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
     ThresholdLevels,
 };
 use ij_io::{IoError, load_tiff, save_tiff};
@@ -136,6 +136,16 @@ pub enum Command {
     NavigateSlice {
         index: i32,
     },
+    /// Interactive hyperstack navigation from the C/Z/T sliders. This
+    /// mirrors `ImagePlus.setPosition(c, z, t)` and, like ImageJ, is never recorded:
+    /// only the explicit macro command `setPosition(c, z, t)` is recorded
+    /// (original_imagej/ij/plugin/frame/Recorder.java 603-604,
+    /// original_imagej/ij/gui/StackWindow.java 294-306).
+    NavigatePosition {
+        channel: i32,
+        slice: i32,
+        frame: i32,
+    },
     Invert,
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
@@ -212,6 +222,9 @@ pub enum Command {
     SetMeasurements { flags: u32, precision: u8 },
     Measure,
     Histogram,
+    /// `Analyze > Plot Profile` (`K`). The document is unchanged; only the
+    /// profile data is returned and `run("Plot Profile");` is recorded.
+    PlotProfile,
     ClearResults,
     SaveResultsTsv {
         path: PathBuf,
@@ -238,6 +251,7 @@ pub enum CommandOutcome {
     Updated,
     Measured(MeasurementSummary),
     HistogramComputed(HistogramSummary),
+    ProfileComputed(ProfileData),
     ResultsCleared,
     /// New `minThreshold`/`maxThreshold` state; pixels are unchanged.
     Thresholded(ThresholdLevels),
@@ -794,6 +808,17 @@ impl Session {
                 doc.set_slice(index)?;
                 Ok(CommandOutcome::Updated)
             }
+            Command::NavigatePosition {
+                channel,
+                slice,
+                frame,
+            } => {
+                let doc = self.active_doc_mut()?;
+                // ImagePlus.setPosition is the interactive hyperstack display path;
+                // discards the processor snapshot but records no macro.
+                doc.set_position(channel, slice, frame);
+                Ok(CommandOutcome::Updated)
+            }
             Command::Invert => {
                 let doc = self.active_doc_mut()?;
                 let is_stack = doc.stack_size() > 1;
@@ -1186,6 +1211,14 @@ impl Session {
                 };
                 self.macro_recorder.push("run(\"Histogram\");".into());
                 Ok(CommandOutcome::HistogramComputed(summary))
+            }
+            Command::PlotProfile => {
+                // ProfilePlot only reads the processor; the image, ROI and
+                // dirty state are unchanged.
+                let profile = self.active_doc()?.plot_profile()?;
+                self.macro_recorder
+                    .push("run(\"Plot Profile\");".into());
+                Ok(CommandOutcome::ProfileComputed(profile))
             }
             Command::ClearResults => {
                 self.results.clear();

@@ -815,6 +815,38 @@ impl ImageJApp {
         }
     }
 
+    pub fn navigate_position_active(
+        &mut self,
+        channel: i32,
+        slice: i32,
+        frame: i32,
+    ) -> Result<(), SessionError> {
+        // Hyperstack slider navigation must not be recorded (StackWindow.java 294-306).
+        match self.session.dispatch(Command::NavigatePosition {
+            channel,
+            slice,
+            frame,
+        }) {
+            Ok(_) => {
+                if let Some(doc) = self.session.active_doc().ok() {
+                    let (c, z, t) = doc.get_position();
+                    self.status_message = format!("c:{c} z:{z} t:{t}");
+                }
+                if let Some((id, x, y)) = self.last_status_pixel {
+                    if self.active_image_id() == Some(id) {
+                        self.update_status_for_pixel(id, x, y);
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Navigate position failed: {e}");
+                self.dialogs.last_error = Some(format!("Navigate position failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn invert_stack_active(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("Invert Stack") {
             return Err(err);

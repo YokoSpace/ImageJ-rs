@@ -1043,7 +1043,7 @@ pub fn default_duplicate_title(existing_titles: &[&str], source_title: &str) -> 
         }
     }
     // WindowManager.java 369-373: only a short trailing -digit token is
-    // replaced; "blobs-10" and "blobs-0" therefore keep their suffix.
+    // replaced; a suffix starting with "0" is kept.
     if let Some(last_dash) = name.rfind('-') {
         let suffix = &name.as_bytes()[last_dash + 1..];
         if name.len() - last_dash < 4
@@ -1062,6 +1062,18 @@ pub fn default_duplicate_title(existing_titles: &[&str], source_title: &str) -> 
         }
     }
     source_title.to_string()
+}
+
+/// Data behind `Analyze > Plot Profile` (`ij.gui.ProfilePlot`). `x_inc` is
+/// the distance between samples on the x axis and `units` is the pluralized
+/// spatial unit from `Calibration.getUnits()` (ProfilePlot.java 66-68).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProfileData {
+    pub x_inc: f64,
+    pub units: String,
+    pub values: Vec<f64>,
+    pub min: f64,
+    pub max: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2547,6 +2559,147 @@ impl ImageDocument {
         }
         self.populate_shape_descriptors(&mut summary, config);
         Ok(summary)
+    }
+
+    /// Port of `ij.gui.ProfilePlot` for the current slice and selection.
+    ///
+    /// A rectangular selection produces the column-average profile
+    /// (`ProfilePlot.getColumnAverageProfile`, ProfilePlot.java 210-225); a
+    /// straight line produces the sampled line profile
+    /// (`getStraightLineProfile`, ProfilePlot.java 184-203). ImageJ's
+    /// `PlotWindow.interpolate` defaults to true (PlotWindow.java 50), so the
+    /// line is sampled bilinearly. Any other selection is rejected with the
+    /// message the constructor prints (ProfilePlot.java 59-62).
+    pub fn plot_profile(&self) -> Result<ProfileData, CoreError> {
+        let mut x_inc = self.calibration.pixel_width;
+        let values = match self.roi.as_ref() {
+            Some(Roi::Rect(rect)) => self.column_average_profile(rect),
+            Some(Roi::Line(line)) => {
+                let values = self.straight_line_profile(*line);
+                // ProfilePlot.java 190-203: only a non-square pixel keeps the
+                // pixel-space increment; otherwise xInc stays pixelWidth.
+                if self.calibration.pixel_width != self.calibration.pixel_height {
+                    let dx = f64::from(line.x2) - f64::from(line.x1);
+                    let dy = f64::from(line.y2) - f64::from(line.y1);
+                    let pixel_length = (dx * dx + dy * dy).sqrt();
+                    let calibrated_dx = self.calibration.pixel_width * dx;
+                    let calibrated_dy = self.calibration.pixel_height * dy;
+                    let calibrated_length =
+                        (calibrated_dx * calibrated_dx + calibrated_dy * calibrated_dy).sqrt();
+                    x_inc = calibrated_length * 1.0 / pixel_length;
+                }
+                values
+            }
+            _ => {
+                return Err(CoreError::InvalidOperation(
+                    "Line or rectangular selection required.",
+                ))
+            }
+        };
+        // ProfilePlot.findMinAndMax (ProfilePlot.java 323-338). The `else if`
+        // is deliberate: a value below the running minimum is not checked
+        // against the maximum, so this must not be a plain min/max.
+        let mut min = values[0];
+        let mut max = values[0];
+        for &value in &values[1..] {
+            if value < min {
+                min = value;
+            } else if value > max {
+                max = value;
+            }
+        }
+        Ok(ProfileData {
+            x_inc,
+            units: profile_units(&self.calibration.unit),
+            values,
+            min,
+            max,
+        })
+    }
+
+    /// `ProfilePlot.getColumnAverageProfile` (ProfilePlot.java 210-225).
+    fn column_average_profile(&self, rect: &RectRoi) -> Vec<f64> {
+        let width = rect.width.max(0) as usize;
+        let mut profile = vec![0.0; width];
+        let mut counts = vec![0usize; width];
+        for y in rect.y..rect.y.saturating_add(rect.height) {
+            let line = self.get_line_uninterpolated(
+                f64::from(rect.x),
+                f64::from(y),
+                f64::from(rect.x.saturating_add(rect.width - 1)),
+                f64::from(y),
+            );
+            for (index, &value) in line.iter().enumerate() {
+                // getPixelValue returns NaN outside the image and the
+                // averaging loop skips those samples (ProfilePlot.java
+                // 216-221).
+                if !value.is_nan() {
+                    profile[index] += value;
+                    counts[index] += 1;
+                }
+            }
+        }
+        for (value, &count) in profile.iter_mut().zip(counts.iter()) {
+            // 0/0 is NaN in Java too; a fully clipped column keeps NaN.
+            *value /= count as f64;
+        }
+        profile
+    }
+
+    /// `ProfilePlot.getStraightLineProfile` (ProfilePlot.java 184-203) with
+    /// `PlotWindow.interpolate` true, i.e. `ImageProcessor.getLine`'s
+    /// bilinear branch (ImageProcessor.java 1125-1130).
+    fn straight_line_profile(&self, line: LineRoi) -> Vec<f64> {
+        let x1 = f64::from(line.x1);
+        let y1 = f64::from(line.y1);
+        let dx = f64::from(line.x2) - x1;
+        let dy = f64::from(line.y2) - y1;
+        // ImageProcessor.getLine: n = (int)Math.round(sqrt(dx*dx+dy*dy)).
+        let n = ((dx * dx + dy * dy).sqrt() + 0.5).floor() as usize;
+        let xinc = if n > 0 { dx / n as f64 } else { 0.0 };
+        let yinc = if n > 0 { dy / n as f64 } else { 0.0 };
+        let mut values = Vec::with_capacity(n + 1);
+        let mut rx = x1;
+        let mut ry = y1;
+        for _ in 0..=n {
+            values.push(self.interpolated_value(rx, ry));
+            rx += xinc;
+            ry += yinc;
+        }
+        values
+    }
+
+    /// `ImageProcessor.getLine` with `interpolate == false`
+    /// (ImageProcessor.java 1131-1137). Out-of-image samples are NaN because
+    /// `getPixelValue` returns NaN there (ByteProcessor.java 313-319).
+    fn get_line_uninterpolated(&self, x1: f64, y1: f64, x2: f64, y2: f64) -> Vec<f64> {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let n = ((dx * dx + dy * dy).sqrt() + 0.5).floor() as usize;
+        let xinc = if n > 0 { dx / n as f64 } else { 0.0 };
+        let yinc = if n > 0 { dy / n as f64 } else { 0.0 };
+        let mut values = Vec::with_capacity(n + 1);
+        let mut rx = x1;
+        let mut ry = y1;
+        for _ in 0..=n {
+            // (int)Math.round(v) is floor(v+0.5), which differs from
+            // f64::round for negative halves.
+            values.push(self.pixel_value_or_nan(
+                (rx + 0.5).floor() as i32,
+                (ry + 0.5).floor() as i32,
+            ));
+            rx += xinc;
+            ry += yinc;
+        }
+        values
+    }
+
+    fn pixel_value_or_nan(&self, x: i32, y: i32) -> f64 {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            f64::NAN
+        } else {
+            self.pixel_value(x, y)
+        }
     }
 
     /// Port of `Analyzer.measureLength` for a 1-pixel-wide straight line.
@@ -4393,6 +4546,17 @@ fn format_results_d2s(value: f64, mut places: i32) -> String {
         format!("{:.0}", value.round())
     } else {
         format!("{:.*}", places as usize, value)
+    }
+}
+
+/// `Calibration.getUnits()` (Calibration.java 159-175): only "pixel",
+/// "micron" and "inch" have a distinct plural form.
+fn profile_units(unit: &str) -> String {
+    match unit {
+        "pixel" => "pixels".to_string(),
+        "micron" => "microns".to_string(),
+        "inch" => "inches".to_string(),
+        other => other.to_string(),
     }
 }
 

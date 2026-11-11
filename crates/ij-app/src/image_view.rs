@@ -16,6 +16,49 @@ pub struct ImageView {
     pub polygon_points: Vec<(i32, i32)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackAxis {
+    Channel,
+    Slice,
+    Frame,
+    FlatSlice,
+}
+
+/// Computes the visible stack sliders according to ImageJ StackWindow logic
+/// (original_imagej/ij/gui/StackWindow.java lines 58-114).
+///
+/// Ordinary 1D stacks display a single flat slice slider.
+/// Multi-dimensional hyperstacks display separate sliders for each axis with size > 1.
+pub fn visible_stack_axes(doc: &ImageDocument) -> Vec<StackAxis> {
+    if doc.stack_size() <= 1 {
+        return Vec::new();
+    }
+    let is_hyper = doc.is_hyperstack()
+        || ((doc.get_n_channels() > 1) as u8
+            + (doc.get_n_slices() > 1) as u8
+            + (doc.get_n_frames() > 1) as u8
+            >= 2);
+    if is_hyper {
+        let mut axes = Vec::new();
+        if doc.get_n_channels() > 1 {
+            axes.push(StackAxis::Channel);
+        }
+        if doc.get_n_slices() > 1 {
+            axes.push(StackAxis::Slice);
+        }
+        if doc.get_n_frames() > 1 {
+            axes.push(StackAxis::Frame);
+        }
+        if axes.is_empty() {
+            vec![StackAxis::FlatSlice]
+        } else {
+            axes
+        }
+    } else {
+        vec![StackAxis::FlatSlice]
+    }
+}
+
 impl ImageView {
     pub fn new(width: u32, height: u32) -> Self {
         Self {
@@ -66,12 +109,34 @@ impl ImageView {
         (px * z + self.pan.0, py * z + self.pan.1)
     }
 
-    /// Creates subtitle string matching original ImageWindow.java lines 309-379.
+    /// Creates subtitle string matching original ImageWindow.java lines 309-379
+    /// and StackWindow.java lines 259-288.
     pub fn create_subtitle(doc: &ImageDocument) -> String {
         let mut s = String::new();
         let stack_size = doc.stack_size();
         if stack_size > 1 {
-            s.push_str(&format!("{}/{}", doc.current_slice, stack_size));
+            let is_hyper = doc.is_hyperstack()
+                || ((doc.get_n_channels() > 1) as u8
+                    + (doc.get_n_slices() > 1) as u8
+                    + (doc.get_n_frames() > 1) as u8
+                    >= 2);
+            if is_hyper {
+                // StackWindow.java lines 259-288: "c:C/nC z:Z/nZ t:T/nT"
+                let mut parts = Vec::new();
+                if doc.get_n_channels() > 1 {
+                    parts.push(format!("c:{}/{}", doc.get_channel(), doc.get_n_channels()));
+                }
+                if doc.get_n_slices() > 1 {
+                    parts.push(format!("z:{}/{}", doc.get_slice(), doc.get_n_slices()));
+                }
+                if doc.get_n_frames() > 1 {
+                    parts.push(format!("t:{}/{}", doc.get_frame(), doc.get_n_frames()));
+                }
+                s.push_str(&parts.join(" "));
+            } else {
+                s.push_str(&format!("{}/{}", doc.current_slice, stack_size));
+            }
+
             if let Some(label) = doc
                 .slice_labels
                 .get((doc.current_slice - 1) as usize)
@@ -79,7 +144,9 @@ impl ImageView {
                 .and_then(|label| short_slice_label(label, 60))
             {
                 if !label.is_empty() {
-                    s.push_str(&format!(" ({label})"));
+                    if !(is_hyper && label.starts_with("ch:")) {
+                        s.push_str(&format!(" ({label})"));
+                    }
                 }
             }
             s.push_str("; ");

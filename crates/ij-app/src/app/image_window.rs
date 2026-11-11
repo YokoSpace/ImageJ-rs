@@ -1,4 +1,5 @@
 use super::*;
+use crate::image_view::{visible_stack_axes, StackAxis};
 use crate::roi_edit::{RoiHit, drag_handle, hit_test, move_by};
 use crate::tool::{
     freehand_is_valid, freehand_push, polygon_closes_at_start, polygon_preview_segments,
@@ -323,7 +324,7 @@ impl ImageJApp {
 
     /// Renders an image window with canvas, pixel display, zoom, pan, ROI tools, and slice slider.
     pub fn render_image_canvas_content(&mut self, ui: &mut egui::Ui, image_id: ImageId) {
-        let (doc_w, doc_h, subtitle, stack_size, current_slice) = {
+        let (doc_w, doc_h, subtitle, stack_axes, current_pos, dim_sizes) = {
             let Some(doc) = self.session.get_image(image_id) else {
                 ui.label("Image not found");
                 return;
@@ -332,8 +333,19 @@ impl ImageJApp {
                 doc.width,
                 doc.height,
                 ImageView::create_subtitle(doc),
-                doc.stack_size(),
-                doc.current_slice,
+                visible_stack_axes(doc),
+                (
+                    doc.get_channel(),
+                    doc.get_slice(),
+                    doc.get_frame(),
+                    doc.current_slice,
+                ),
+                (
+                    doc.get_n_channels(),
+                    doc.get_n_slices(),
+                    doc.get_n_frames(),
+                    doc.stack_size(),
+                ),
             )
         };
 
@@ -362,19 +374,55 @@ impl ImageJApp {
 
         ui.separator();
 
-        // Stack slice slider if stack has more than 1 slice
+        // Stack sliders (ImageJ StackWindow.java lines 58-114)
         let mut new_slice = None;
-        if stack_size > 1 {
-            let mut slice_idx = current_slice as i32;
-            ui.horizontal(|ui| {
-                ui.label(format!("Slice {}/{}", current_slice, stack_size));
-                if ui
-                    .add(egui::Slider::new(&mut slice_idx, 1..=stack_size as i32))
-                    .changed()
-                {
-                    new_slice = Some(slice_idx);
+        let mut new_position = None;
+        for axis in &stack_axes {
+            match axis {
+                StackAxis::Channel => {
+                    let mut c_idx = current_pos.0 as i32;
+                    let max_c = dim_sizes.0 as i32;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("c {}/{}", c_idx, max_c));
+                        if ui.add(egui::Slider::new(&mut c_idx, 1..=max_c)).changed() {
+                            new_position =
+                                Some((c_idx, current_pos.1 as i32, current_pos.2 as i32));
+                        }
+                    });
                 }
-            });
+                StackAxis::Slice => {
+                    let mut z_idx = current_pos.1 as i32;
+                    let max_z = dim_sizes.1 as i32;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("z {}/{}", z_idx, max_z));
+                        if ui.add(egui::Slider::new(&mut z_idx, 1..=max_z)).changed() {
+                            new_position =
+                                Some((current_pos.0 as i32, z_idx, current_pos.2 as i32));
+                        }
+                    });
+                }
+                StackAxis::Frame => {
+                    let mut t_idx = current_pos.2 as i32;
+                    let max_t = dim_sizes.2 as i32;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("t {}/{}", t_idx, max_t));
+                        if ui.add(egui::Slider::new(&mut t_idx, 1..=max_t)).changed() {
+                            new_position =
+                                Some((current_pos.0 as i32, current_pos.1 as i32, t_idx));
+                        }
+                    });
+                }
+                StackAxis::FlatSlice => {
+                    let mut slice_idx = current_pos.3 as i32;
+                    let max_s = dim_sizes.3 as i32;
+                    ui.horizontal(|ui| {
+                        ui.label(format!("Slice {}/{}", slice_idx, max_s));
+                        if ui.add(egui::Slider::new(&mut slice_idx, 1..=max_s)).changed() {
+                            new_slice = Some(slice_idx);
+                        }
+                    });
+                }
+            }
         }
 
         // Per-image texture caching keyed by reliable Session revision
@@ -892,6 +940,11 @@ impl ImageJApp {
         if let Some(slice_idx) = new_slice {
             let _ = self.set_active_window(image_id);
             let _ = self.set_slice_active(slice_idx);
+        }
+
+        if let Some((c, z, t)) = new_position {
+            let _ = self.set_active_window(image_id);
+            let _ = self.navigate_position_active(c, z, t);
         }
 
         if let Some((ix, iy)) = hover_pixel {

@@ -12284,3 +12284,265 @@ fn session_set_measurements_is_global_and_clamps_decimal_places() {
     assert_eq!(session.results.config.precision, 9);
 }
 
+// M6a: Analyze > Plot Profile. ProfilePlot.java 53-112 (constructor),
+// 180-235 (getStraightLineProfile/getColumnAverageProfile) and
+// ImageProcessor.java 1116-1139 (getLine).
+fn oracle_profile(doc: &ImageDocument, roi_macro: &str) -> Vec<f64> {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let macro_text = format!(
+        "{roi_macro} p=getProfile(); print(\"PROFILE_LEN:\"+p.length); \
+         for(i=0;i<p.length;i++) print(d2s(p[i],9));"
+    );
+    let output = bridge.run_macro_on_image(doc, &macro_text).unwrap();
+    let mut lines = output.stdout.lines().filter(|line| !line.trim().is_empty());
+    let len = lines
+        .next()
+        .unwrap()
+        .strip_prefix("PROFILE_LEN:")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let values = lines
+        .map(|line| line.trim().parse::<f64>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), len);
+    values
+}
+
+// ProfilePlot.findMinAndMax (ProfilePlot.java 323-338) uses `else if`, so a
+// value below the running minimum is never considered for the maximum.
+fn java_profile_min_max(values: &[f64]) -> (f64, f64) {
+    let mut min = values[0];
+    let mut max = values[0];
+    for &value in &values[1..] {
+        if value < min {
+            min = value;
+        } else if value > max {
+            max = value;
+        }
+    }
+    (min, max)
+}
+
+fn assert_profile_min_max(actual: (f64, f64), expected: (f64, f64), label: &str) {
+    // The oracle prints nine decimals, so its min/max is a rounded copy of the
+    // same profile; compare with the profile tolerance.
+    assert!(
+        (actual.0 - expected.0).abs() <= 1e-4,
+        "{label} min: {} vs {}",
+        actual.0,
+        expected.0
+    );
+    assert!(
+        (actual.1 - expected.1).abs() <= 1e-4,
+        "{label} max: {} vs {}",
+        actual.1,
+        expected.1
+    );
+}
+
+fn assert_profile_values(actual: &[f64], expected: &[f64], label: &str) {
+    assert_eq!(actual.len(), expected.len(), "{label} length");
+    for (index, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+        if expected.is_nan() {
+            assert!(actual.is_nan(), "{label} index {index}: {actual} is not NaN");
+        } else {
+            assert!(
+                (actual - expected).abs() <= 1e-4,
+                "{label} index {index}: {actual} vs {expected}"
+            );
+        }
+    }
+}
+
+fn profile_test_documents() -> Vec<(&'static str, ImageDocument)> {
+    vec![
+        (
+            "8-bit",
+            ImageDocument::new(
+                "profile8",
+                8,
+                6,
+                PixelPlane::Gray8((0..48).map(|i| ((i * 7 + 5) % 256) as u8).collect()),
+            )
+            .unwrap(),
+        ),
+        (
+            "16-bit",
+            ImageDocument::new(
+                "profile16",
+                8,
+                6,
+                PixelPlane::Gray16((0..48).map(|i| ((i * 1009 + 37) % 65536) as u16).collect()),
+            )
+            .unwrap(),
+        ),
+        (
+            "32-bit",
+            ImageDocument::new(
+                "profile32",
+                8,
+                6,
+                PixelPlane::Gray32((0..48).map(|i| (i as f32) * 0.5 - 3.25).collect()),
+            )
+            .unwrap(),
+        ),
+    ]
+}
+
+#[test]
+fn parity_plot_profile_rect_column_averages_match_java_oracle() {
+    for (name, doc) in profile_test_documents() {
+        for (label, roi_macro, x, y, width, height) in [
+            ("in-bounds", "makeRectangle(1,1,5,4);", 1, 1, 5, 4),
+            // Out-of-bounds columns make ImageProcessor.getPixelValue return
+            // NaN and getColumnAverageProfile skip them (ProfilePlot.java
+            // 210-225); a column with no samples becomes 0/0 = NaN.
+            ("clipped", "makeRectangle(5,4,6,4);", 5, 4, 6, 4),
+        ] {
+            let mut doc = doc.clone();
+            doc.set_rect_roi(x, y, width, height).unwrap();
+            let expected = oracle_profile(&doc, roi_macro);
+            let actual = doc.plot_profile().unwrap();
+            assert_profile_values(&actual.values, &expected, &format!("{name} {label}"));
+            assert_profile_min_max(
+                (actual.min, actual.max),
+                java_profile_min_max(&expected),
+                &format!("{name} {label}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn parity_plot_profile_line_profiles_match_java_oracle() {
+    for (name, doc) in profile_test_documents() {
+        for (label, roi_macro, x1, y1, x2, y2) in [
+            ("horizontal", "makeLine(1,2,6,2);", 1, 2, 6, 2),
+            ("vertical", "makeLine(3,1,3,5);", 3, 1, 3, 5),
+            ("slanted", "makeLine(1,1,7,5);", 1, 1, 7, 5),
+            // Leaves the image: getInterpolatedValue returns 0.0 beyond the
+            // one-pixel edge band (ImageProcessor.java 2008-2013).
+            ("out-of-bounds", "makeLine(2,1,4,9);", 2, 1, 4, 9),
+        ] {
+            let mut doc = doc.clone();
+            doc.set_line_roi(x1, y1, x2, y2);
+            let expected = oracle_profile(&doc, roi_macro);
+            let actual = doc.plot_profile().unwrap();
+            assert_profile_values(&actual.values, &expected, &format!("{name} {label}"));
+            assert_profile_min_max(
+                (actual.min, actual.max),
+                java_profile_min_max(&expected),
+                &format!("{name} {label}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn plot_profile_reports_calibrated_x_increment_and_units() {
+    // ProfilePlot.java 66-68: xInc = cal.pixelWidth and units = cal.getUnits()
+    // before the ROI branch. Calibration.getUnits() pluralizes "pixel",
+    // "micron" and "inch" (Calibration.java 159-175).
+    let mut doc = ImageDocument::new("profile-units", 8, 6, PixelPlane::Gray8(vec![0; 48])).unwrap();
+    doc.set_rect_roi(1, 1, 5, 4).unwrap();
+    let profile = doc.plot_profile().unwrap();
+    assert_eq!(profile.x_inc, 1.0);
+    assert_eq!(profile.units, "pixels");
+
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    doc.calibration.unit = "mm".to_string();
+    let profile = doc.plot_profile().unwrap();
+    // getColumnAverageProfile does not change xInc (ProfilePlot.java 210-225).
+    assert_eq!(profile.x_inc, 0.5);
+    assert_eq!(profile.units, "mm");
+
+    doc.calibration.unit = "micron".to_string();
+    assert_eq!(doc.plot_profile().unwrap().units, "microns");
+
+    // Equal pixel sizes keep xInc = pixelWidth for lines too
+    // (getStraightLineProfile only recalibrates when they differ,
+    // ProfilePlot.java 190-203).
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.5;
+    doc.calibration.unit = "mm".to_string();
+    doc.set_line_roi(2, 3, 10, 9);
+    assert_eq!(doc.plot_profile().unwrap().x_inc, 0.5);
+
+    // pixelWidth != pixelHeight: xInc = calibratedLength / pixelLength.
+    // dx=8, dy=6, pixelLength=10; calibrated dx=4, dy=1.5.
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    let expected = (4.0_f64 * 4.0 + 1.5_f64 * 1.5).sqrt() / 10.0;
+    assert_eq!(doc.plot_profile().unwrap().x_inc, expected);
+}
+
+#[test]
+fn plot_profile_rejects_missing_or_unsupported_roi() {
+    let mut doc = ImageDocument::new("profile-errors", 8, 6, PixelPlane::Gray8(vec![0; 48])).unwrap();
+    assert_eq!(
+        doc.plot_profile(),
+        Err(CoreError::InvalidOperation(
+            "Line or rectangular selection required."
+        ))
+    );
+    doc.set_oval_roi(1, 1, 4, 4).unwrap();
+    assert_eq!(
+        doc.plot_profile(),
+        Err(CoreError::InvalidOperation(
+            "Line or rectangular selection required."
+        ))
+    );
+    doc.set_polygon_roi(&[(1, 1), (6, 1), (4, 5)]).unwrap();
+    assert_eq!(
+        doc.plot_profile(),
+        Err(CoreError::InvalidOperation(
+            "Line or rectangular selection required."
+        ))
+    );
+}
+
+#[test]
+fn session_plot_profile_preserves_document_and_records_macro() {
+    let mut session = Session::new();
+    let id = match session
+        .dispatch(Command::NewRamp8Bit {
+            title: "ramp".into(),
+            width: 16,
+            height: 16,
+        })
+        .unwrap()
+    {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 2,
+            y: 3,
+            width: 4,
+            height: 5,
+        })
+        .unwrap();
+    let before = session.active_doc().unwrap().clone();
+    session.set_dirty(id, false);
+
+    let outcome = session.dispatch(Command::PlotProfile).unwrap();
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Plot Profile\");")
+    );
+    match outcome {
+        CommandOutcome::ProfileComputed(profile) => {
+            assert_eq!(profile.values, vec![32.0, 48.0, 64.0, 80.0]);
+            assert_eq!(profile.min, 32.0);
+            assert_eq!(profile.max, 80.0);
+            assert_eq!(profile.x_inc, 1.0);
+            assert_eq!(profile.units, "pixels");
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+    assert_eq!(session.active_doc().unwrap(), &before);
+    assert!(!session.is_dirty(id));
+}
