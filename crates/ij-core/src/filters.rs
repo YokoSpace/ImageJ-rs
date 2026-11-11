@@ -385,7 +385,7 @@ impl ImageDocument {
     /// selections and resets it for non-area selections (lines 207-213);
     /// `Filters.run` then calls `ip.resetRoi()` for a line selection
     /// (Filters.java lines 32-33), so line ROIs filter the whole image.
-    fn filter_region(&self) -> Result<FilterRegion, CoreError> {
+    pub(crate) fn filter_region(&self) -> Result<FilterRegion, CoreError> {
         let (x, y, width, height) = match &self.roi {
             Some(roi) if roi.is_area() => roi
                 .clipped_bounds(self.width, self.height)

@@ -1,4 +1,5 @@
 pub mod binary;
+pub mod binary_morphology;
 pub mod contrast;
 pub mod edit;
 pub mod filters;

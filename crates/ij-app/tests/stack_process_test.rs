@@ -64,6 +64,18 @@ fn invoke(app: &mut ImageJApp, operation: &StackOperation) -> Result<(), Session
         StackOperation::Maximum { radius } => app.maximum_active(*radius),
         StackOperation::Despeckle => app.despeckle_active(),
         StackOperation::Math(operation) => app.math_active(*operation),
+        StackOperation::Binary(ij_core::binary_morphology::BinaryMorphology::Erode) => {
+            app.binary_erode_active()
+        }
+        StackOperation::Binary(ij_core::binary_morphology::BinaryMorphology::Dilate) => {
+            app.binary_dilate_active()
+        }
+        StackOperation::Binary(ij_core::binary_morphology::BinaryMorphology::Open) => {
+            app.binary_open_active()
+        }
+        StackOperation::Binary(ij_core::binary_morphology::BinaryMorphology::Close) => {
+            app.binary_close_active()
+        }
     }
 }
 
@@ -321,4 +333,66 @@ fn process_stack_dialog_renders_without_processing_until_answered() {
     );
     assert!(app.pending_stack_process.is_some());
     assert_eq!(app.session.get_image(id).unwrap().slices, original);
+}
+
+/// Erode on a binary stack follows the same prompt path as the other
+/// Process filters, keeps no undo, and erodes every slice.
+#[test]
+fn stack_binary_erode_prompts_yes_processes_whole_stack_without_undo() {
+    let plane = || {
+        let mut pixels = vec![255u8; 64];
+        for y in 1..4 {
+            for x in 1..4 {
+                pixels[y * 8 + x] = 0;
+            }
+        }
+        PixelPlane::Gray8(pixels)
+    };
+    let original = vec![plane(), plane()];
+    let mut app = ImageJApp::new();
+    let id = app
+        .session
+        .insert_doc(ImageDocument::new_stack("binary stack", 8, 8, original.clone()).unwrap());
+    app.set_active_window(id).unwrap();
+
+    app.binary_erode_active().unwrap();
+    assert!(app.pending_stack_process.is_some());
+    assert_eq!(app.status_message, "Process all 2 images?");
+    assert_eq!(app.session.get_image(id).unwrap().slices, original);
+
+    let outcome = app.resolve_stack_process(StackProcessChoice::All).unwrap();
+    assert_eq!(outcome, StackProcessOutcome::Applied);
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Erode\", \"stack\");")
+    );
+
+    // count=1 erode with the black-background default: '.'=0=background,
+    // '#'=255=foreground. getEdgePixel0 pads out-of-image neighbours with the
+    // background value (ByteProcessor.java 797), so the border ring turns
+    // black and every white pixel touching it or the rectangle is eroded.
+    let art = [
+        "........",
+        ".....##.",
+        ".....##.",
+        ".....##.",
+        ".....##.",
+        ".######.",
+        ".######.",
+        "........",
+    ];
+    let expected_pixels: Vec<u8> = art
+        .iter()
+        .flat_map(|row| row.bytes().map(|b| if b == b'.' { 0 } else { 255 }))
+        .collect();
+    let expected = PixelPlane::Gray8(expected_pixels);
+    assert_eq!(
+        app.session.get_image(id).unwrap().slices,
+        vec![expected.clone(), expected]
+    );
+    // Whole-stack runs drop the undo snapshot (PlugInFilterRunner.java 126).
+    assert_eq!(
+        app.session.dispatch(ij_session::Command::Undo).unwrap(),
+        ij_session::CommandOutcome::NothingToUndo
+    );
 }

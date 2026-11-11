@@ -16485,3 +16485,238 @@ fn clipboard_rejects_mismatched_planes_without_mutating_pixels() {
     assert!(session.dispatch(Command::Paste).is_err());
     assert_eq!(session.active_doc().unwrap().slices,before);
 }
+
+// ---- P3.4: `Process > Binary` Erode/Dilate/Open/Close (Binary.java) ----
+
+/// Binary 0/255 pattern with an isolated interior pixel, an isolated border
+/// pixel, a holed interior rectangle and a foreground rectangle touching the
+/// left image edge.
+fn binary_morphology_pattern() -> ImageDocument {
+    let width = 12u32;
+    let height = 10u32;
+    let mut pixels = vec![255u8; (width * height) as usize];
+    for y in 2..5 {
+        for x in 2..7 {
+            pixels[((y as u32) * width + x as u32) as usize] = 0;
+        }
+    }
+    pixels[(3 * width + 4) as usize] = 255;
+    for y in 6..10 {
+        for x in 0..3 {
+            pixels[((y as u32) * width + x as u32) as usize] = 0;
+        }
+    }
+    pixels[(7 * width + 9) as usize] = 0;
+    pixels[(9 * width + 11) as usize] = 0;
+    ImageDocument::new("binary-morphology", width, height, PixelPlane::Gray8(pixels)).unwrap()
+}
+
+/// Runs one Binary plugin operation through the real ImageJ 1.54u bridge and
+/// returns the processed image. iterations/count/black travel through the
+/// `Binary Options...` dialog (`Options...` command, IJ_Props.txt binary20),
+/// the only path that reads them: Binary.showDialog's non-options branch
+/// (Binary.java lines 80-88) never touches the macro options, so a direct
+/// `run("Erode", "iterations=...")` silently keeps the static defaults
+/// (1/1 and Prefs.blackBackground). The dialog's checkbox keys come from
+/// GenericDialog.getNextBoolean (key `black`, present = true); `do=` selects
+/// the `Do:` choice (item names Erode/Dilate/Open/Close, no `Close-` label
+/// needed on this path). `stack ` (trailing space, IJ.setupDialog line 1259)
+/// opts a stack image into whole-stack processing.
+fn oracle_binary_morphology(
+    doc: &ImageDocument,
+    operation: &str,
+    iterations: u32,
+    count: u32,
+    black_background: bool,
+    roi: Option<(i32, i32, i32, i32)>,
+) -> ImageDocument {
+    let mut options = format!("iterations={iterations} count={count}");
+    if black_background {
+        options.push_str(" black");
+    }
+    options.push_str(&format!(" do={operation}"));
+    let mut macro_text = String::new();
+    if let Some((x, y, w, h)) = roi {
+        macro_text.push_str(&format!("makeRectangle({x}, {y}, {w}, {h}); "));
+    }
+    macro_text.push_str(&format!(
+        "run(\"Options...\", \"{options}\");"
+    ));
+    oracle_run(doc, &macro_text)
+}
+
+/// Asserts the Rust core produces the same plane as the Java oracle.
+fn assert_binary_morphology_matches_oracle(
+    operation: &str,
+    iterations: u32,
+    count: u32,
+    black_background: bool,
+    roi: Option<(i32, i32, i32, i32)>,
+) {
+    let mut doc = binary_morphology_pattern();
+    if let Some((x, y, w, h)) = roi {
+        doc.set_rect_roi(x, y, w, h).unwrap();
+    }
+    let oracle =
+        oracle_binary_morphology(&doc, operation, iterations, count, black_background, roi);
+    let op = match operation {
+        "Erode" => ij_core::binary_morphology::BinaryMorphology::Erode,
+        "Dilate" => ij_core::binary_morphology::BinaryMorphology::Dilate,
+        "Open" => ij_core::binary_morphology::BinaryMorphology::Open,
+        "Close" => ij_core::binary_morphology::BinaryMorphology::Close,
+        other => panic!("unknown Binary operation {other:?}"),
+    };
+    let mut rust = doc.clone();
+    rust.binary_morphology(op, iterations, count, black_background)
+        .unwrap();
+    assert_planes_bitwise_equal(
+        &rust.plane(),
+        oracle.plane(),
+        &format!("{operation} x{iterations} count={count} bb={black_background}"),
+    );
+}
+
+#[test]
+fn parity_8bit_binary_erode_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Erode", 1, 1, true, None);
+}
+
+#[test]
+fn parity_8bit_binary_dilate_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Dilate", 1, 1, true, None);
+}
+
+#[test]
+fn parity_8bit_binary_open_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Open", 1, 1, true, None);
+}
+
+#[test]
+fn parity_8bit_binary_close_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Close", 1, 1, true, None);
+}
+
+#[test]
+fn parity_8bit_binary_white_background_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Erode", 1, 1, false, None);
+    assert_binary_morphology_matches_oracle("Dilate", 1, 1, false, None);
+}
+
+#[test]
+fn parity_8bit_binary_iterations_and_count_match_java_oracle() {
+    assert_binary_morphology_matches_oracle("Erode", 3, 2, true, None);
+    assert_binary_morphology_matches_oracle("Dilate", 3, 2, true, None);
+    assert_binary_morphology_matches_oracle("Close", 3, 2, true, None);
+    assert_binary_morphology_matches_oracle("Open", 1, 8, true, None);
+}
+
+#[test]
+fn parity_8bit_binary_interior_rect_roi_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Erode", 1, 1, true, Some((3, 2, 5, 3)));
+    assert_binary_morphology_matches_oracle("Dilate", 1, 1, true, Some((3, 2, 5, 3)));
+}
+
+#[test]
+fn parity_8bit_binary_edge_touching_roi_matches_java_oracle() {
+    assert_binary_morphology_matches_oracle("Erode", 1, 1, true, Some((0, 0, 12, 10)));
+    assert_binary_morphology_matches_oracle("Open", 2, 3, true, Some((0, 0, 12, 10)));
+}
+
+#[test]
+fn parity_8bit_binary_stack_matches_java_oracle() {
+    let mut doc = ImageDocument::new_stack(
+        "binary-stack",
+        12,
+        10,
+        (0..3)
+            .map(|_| binary_morphology_pattern().slices.remove(0))
+            .collect(),
+    )
+    .unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "run(\"Options...\", \"iterations=1 count=1 black stack do=Erode\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return the processed stack");
+    doc.binary_morphology_stack(ij_core::binary_morphology::BinaryMorphology::Erode, 1, 1, true)
+        .unwrap();
+    assert_eq!(doc.slices, oracle.slices);
+}
+
+#[test]
+fn session_binary_morphology_records_macro_and_keeps_undo() {
+    let doc = binary_morphology_pattern();
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    let before = session.get_image(id).unwrap().slices.clone();
+
+    session
+        .dispatch(Command::BinaryErode {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack: false,
+        })
+        .unwrap();
+    assert_eq!(session.macro_recorder.last().unwrap(), "run(\"Erode\");");
+    assert_ne!(session.get_image(id).unwrap().slices, before);
+    assert!(session.is_dirty(id));
+
+    session.dispatch(Command::Undo).unwrap();
+    assert_eq!(session.get_image(id).unwrap().slices, before);
+}
+
+
+#[test]
+fn session_binary_morphology_whole_stack_records_stack_option() {
+    let slice = || {
+        let mut pixels = vec![255u8; 36];
+        for y in 1..4 {
+            for x in 1..4 {
+                pixels[(y * 6 + x) as usize] = 0;
+            }
+        }
+        PixelPlane::Gray8(pixels)
+    };
+    let mut doc =
+        ImageDocument::new_stack("binary-stack", 6, 6, vec![slice(), slice()]).unwrap();
+    doc.current_slice = 1;
+    let mut session = Session::new();
+    session.insert_doc(doc);
+
+    session
+        .dispatch(Command::BinaryErode {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack: true,
+        })
+        .unwrap();
+    assert_eq!(
+        session.macro_recorder.last().unwrap(),
+        "run(\"Erode\", \"stack\");"
+    );
+    // Whole-stack binary runs keep no undo (PlugInFilterRunner.java 124-126):
+    // Undo's snapshot is cleared, so Undo reports NothingToUndo.
+    assert_eq!(
+        session.dispatch(Command::Undo).unwrap(),
+        CommandOutcome::NothingToUndo
+    );
+
+    session
+        .dispatch(Command::BinaryDilate {
+            iterations: 2,
+            count: 2,
+            black_background: true,
+            whole_stack: true,
+        })
+        .unwrap();
+    assert_eq!(
+        session.macro_recorder.last().unwrap(),
+        "run(\"Dilate\", \"iterations=2 count=2 black stack\");"
+    );
+}

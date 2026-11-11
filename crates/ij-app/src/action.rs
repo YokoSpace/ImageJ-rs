@@ -62,6 +62,12 @@ pub enum AppAction {
     /// `Process > Binary > Convert to Mask` and the Threshold palette's
     /// `Apply` button (ThresholdAdjuster.runThresholdCommand).
     ConvertToMask,
+    /// `Process > Binary > Erode` through `Close` (`ij.plugin.filter.Binary`,
+    /// IJ_Props.txt binary04-binary07; the Close item is labelled `Close-`).
+    BinaryErode,
+    BinaryDilate,
+    BinaryOpen,
+    BinaryClose,
     Measure,
     Histogram,
     PlotProfile,
@@ -231,11 +237,16 @@ const PROCESS_MATH: &[MenuNode] = &[
     item("Abs", None, AppAction::MathAbs),
     item("Set...", None, AppAction::MathSet),
 ];
-// IJ_Props.txt binary01/binary02 (Process > Binary). The morphology items
-// (Erode, Dilate, ...) are P3.4 and are added there.
+// IJ_Props.txt binary01-binary07 (Process > Binary; the morphology items'
+// labels match the original submenu, including the `Close-` label).
 const PROCESS_BINARY: &[MenuNode] = &[
     item("Make Binary", None, AppAction::MakeBinary),
     item("Convert to Mask", None, AppAction::ConvertToMask),
+    SEPARATOR,
+    item("Erode", None, AppAction::BinaryErode),
+    item("Dilate", None, AppAction::BinaryDilate),
+    item("Open", None, AppAction::BinaryOpen),
+    item("Close-", None, AppAction::BinaryClose),
 ];
 const PROCESS_MENU: &[MenuNode] = &[
     item("Smooth", None, AppAction::Smooth),
@@ -786,6 +797,18 @@ impl ImageJApp {
             }
             ConvertToMask => {
                 let _ = self.convert_to_mask_active(false);
+            }
+            BinaryErode => {
+                let _ = self.binary_erode_active();
+            }
+            BinaryDilate => {
+                let _ = self.binary_dilate_active();
+            }
+            BinaryOpen => {
+                let _ = self.binary_open_active();
+            }
+            BinaryClose => {
+                let _ = self.binary_close_active();
             }
             Measure => {
                 let _ = self.measure_active();

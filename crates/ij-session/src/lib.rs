@@ -346,6 +346,39 @@ pub enum Command {
         /// Stack-dialog options; see [`Command::MakeBinary`].
         stack_options: Option<ij_core::StackBinaryOptions>,
     },
+    /// The four `Process > Binary` morphology commands
+    /// (`ij.plugin.filter.Binary`): Erode, Dilate, Open and Close. Each runs
+    /// `iterations` single `ByteProcessor.filter(ERODE/DILATE)` passes
+    /// (Open erode-then-dilate, Close dilate-then-erode) and `count` is the
+    /// neighbour vote threshold. `black_background` mirrors
+    /// `Prefs.blackBackground`, whose 1.54u default is true
+    /// (Prefs.java 551-553 puts BLACK_BACKGROUND in defaultOptions).
+    BinaryErode {
+        iterations: u32,
+        count: u32,
+        black_background: bool,
+        // `IJ.setupDialog` adds DOES_STACKS for `stack ` macro options
+        // (IJ.java lines 1257-1267).
+        whole_stack: bool,
+    },
+    BinaryDilate {
+        iterations: u32,
+        count: u32,
+        black_background: bool,
+        whole_stack: bool,
+    },
+    BinaryOpen {
+        iterations: u32,
+        count: u32,
+        black_background: bool,
+        whole_stack: bool,
+    },
+    BinaryClose {
+        iterations: u32,
+        count: u32,
+        black_background: bool,
+        whole_stack: bool,
+    },
     /// `run("16-bit")` (Converter.java 38-39). Converts every slice to 16-bit
     /// grayscale with scaling enabled and records `run("16-bit");`.
     ConvertTo16Bit,
@@ -1759,6 +1792,54 @@ impl Session {
             Command::ConvertToMask { black_background, stack_options } => {
                 self.run_binary_conversion(black_background, stack_options, "Convert to Mask")
             }
+            Command::BinaryErode {
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            } => self.run_binary_morphology(
+                ij_core::binary_morphology::BinaryMorphology::Erode,
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            ),
+            Command::BinaryDilate {
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            } => self.run_binary_morphology(
+                ij_core::binary_morphology::BinaryMorphology::Dilate,
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            ),
+            Command::BinaryOpen {
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            } => self.run_binary_morphology(
+                ij_core::binary_morphology::BinaryMorphology::Open,
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            ),
+            Command::BinaryClose {
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            } => self.run_binary_morphology(
+                ij_core::binary_morphology::BinaryMorphology::Close,
+                iterations,
+                count,
+                black_background,
+                whole_stack,
+            ),
             Command::AutoThreshold {
                 method,
                 dark_background,
@@ -2339,6 +2420,65 @@ impl Session {
         self.mark_active_dirty();
         self.macro_recorder
             .push(format!("run(\"{macro_command}\");"));
+        Ok(CommandOutcome::Updated)
+    }
+
+    /// Shared body of the four `Process > Binary` morphology commands. The
+    /// recorder keeps the plain `run("<op>");` form while the parameters sit
+    /// at a fresh ImageJ's defaults (iterations=1, count=1, black background
+    /// checked, Binary.java lines 19-22 and Prefs.java 551-553) and records
+    /// the dialog-form option string otherwise.
+    fn run_binary_morphology(
+        &mut self,
+        operation: ij_core::binary_morphology::BinaryMorphology,
+        iterations: u32,
+        count: u32,
+        black_background: bool,
+        whole_stack: bool,
+    ) -> Result<CommandOutcome, SessionError> {
+        let op_name = match operation {
+            ij_core::binary_morphology::BinaryMorphology::Erode => "Erode",
+            ij_core::binary_morphology::BinaryMorphology::Dilate => "Dilate",
+            ij_core::binary_morphology::BinaryMorphology::Open => "Open",
+            ij_core::binary_morphology::BinaryMorphology::Close => "Close",
+        };
+        let is_stack;
+        {
+            let doc = self.active_doc_mut()?;
+            if whole_stack && doc.stack_size() > 1 {
+                doc.binary_morphology_stack(operation, iterations, count, black_background)?;
+            } else {
+                doc.binary_morphology(operation, iterations, count, black_background)?;
+            }
+            is_stack = doc.stack_size() > 1;
+        }
+        // Defaults stay unrecorded (the menu command records plain
+        // `run("Erode");`); stack/slice mirrors the Math commands'
+        // IJ.setupDialog outcome (recorder records the `stack` token,
+        // PlugInFilterRunner.java line 126 records nothing on replay).
+        let mut parameters = iterations == 1 && count == 1 && black_background;
+        let mut options = String::new();
+        if !parameters {
+            let mut recorded = format!("iterations={iterations} count={count}");
+            if black_background {
+                recorded.push_str(" black");
+            }
+            options = recorded;
+        }
+        if is_stack {
+            if !options.is_empty() {
+                options.push(' ');
+            }
+            options.push_str(if whole_stack { "stack" } else { "slice" });
+            parameters = false;
+        }
+        if parameters {
+            self.macro_recorder.push(format!("run(\"{op_name}\");"));
+        } else {
+            self.macro_recorder
+                .push(format!("run(\"{op_name}\", \"{options}\");"));
+        }
+        self.mark_active_dirty();
         Ok(CommandOutcome::Updated)
     }
 

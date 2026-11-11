@@ -9,6 +9,42 @@
 
 use ij_session::{Command, ImageId};
 
+/// The `Binary` `StackOperation`'s session command. The menu commands run
+/// ImageJ's static option defaults (Binary.java lines 22-23: iterations 1,
+/// count 1) with the black-background pref's 1.54u default `true`
+/// (Prefs.java 551-553).
+fn binary_command(
+    operation: ij_core::binary_morphology::BinaryMorphology,
+    whole_stack: bool,
+) -> Command {
+    match operation {
+        ij_core::binary_morphology::BinaryMorphology::Erode => Command::BinaryErode {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack,
+        },
+        ij_core::binary_morphology::BinaryMorphology::Dilate => Command::BinaryDilate {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack,
+        },
+        ij_core::binary_morphology::BinaryMorphology::Open => Command::BinaryOpen {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack,
+        },
+        ij_core::binary_morphology::BinaryMorphology::Close => Command::BinaryClose {
+            iterations: 1,
+            count: 1,
+            black_background: true,
+            whole_stack,
+        },
+    }
+}
+
 /// The filter or command that was invoked while a stack was active.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StackOperation {
@@ -22,6 +58,7 @@ pub enum StackOperation {
     Maximum { radius: f64 },
     Despeckle,
     Math(ij_core::math::MathOperation),
+    Binary(ij_core::binary_morphology::BinaryMorphology),
 }
 
 impl StackOperation {
@@ -37,6 +74,12 @@ impl StackOperation {
             Self::Maximum { .. } => "Maximum",
             Self::Despeckle => "Despeckle",
             Self::Math(operation) => operation.name(),
+            Self::Binary(operation) => match operation {
+                ij_core::binary_morphology::BinaryMorphology::Erode => "Erode",
+                ij_core::binary_morphology::BinaryMorphology::Dilate => "Dilate",
+                ij_core::binary_morphology::BinaryMorphology::Open => "Open",
+                ij_core::binary_morphology::BinaryMorphology::Close => "Close",
+            },
         }
     }
 
@@ -53,6 +96,12 @@ impl StackOperation {
             Self::Maximum { .. } => "Maximum filter",
             Self::Despeckle => "Despeckle",
             Self::Math(operation) => operation.name(),
+            Self::Binary(operation) => match operation {
+                ij_core::binary_morphology::BinaryMorphology::Erode => "Erode",
+                ij_core::binary_morphology::BinaryMorphology::Dilate => "Dilate",
+                ij_core::binary_morphology::BinaryMorphology::Open => "Open",
+                ij_core::binary_morphology::BinaryMorphology::Close => "Close",
+            },
         }
     }
 
@@ -70,6 +119,7 @@ impl StackOperation {
                 | Self::Maximum { .. }
                 | Self::Despeckle
                 | Self::Math(_)
+                | Self::Binary(_)
         )
     }
 
@@ -102,6 +152,7 @@ impl StackOperation {
                 operation: *operation,
                 whole_stack: false,
             },
+            Self::Binary(operation) => binary_command(*operation, false),
         }
     }
 
@@ -121,6 +172,7 @@ impl StackOperation {
                 operation: *operation,
                 whole_stack: true,
             }),
+            Self::Binary(operation) => Some(binary_command(*operation, true)),
         }
     }
 
@@ -138,6 +190,15 @@ impl StackOperation {
             Self::Maximum { radius } => format!("Maximum filter (radius={radius}) applied"),
             Self::Despeckle => "Despeckle applied".to_string(),
             Self::Math(operation) => format!("{} applied", operation.name()),
+            Self::Binary(operation) => {
+                let name = match operation {
+                    ij_core::binary_morphology::BinaryMorphology::Erode => "Erode",
+                    ij_core::binary_morphology::BinaryMorphology::Dilate => "Dilate",
+                    ij_core::binary_morphology::BinaryMorphology::Open => "Open",
+                    ij_core::binary_morphology::BinaryMorphology::Close => "Close",
+                };
+                format!("{name} applied")
+            }
         }
     }
 

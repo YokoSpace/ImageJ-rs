@@ -1059,6 +1059,35 @@ impl ImageJApp {
         self.begin_stack_aware(StackOperation::FindEdges)
     }
 
+    /// `Process > Binary > Erode` through `Close` (ij.plugin.filter.Binary).
+    /// The menu commands run the static option defaults — iterations 1,
+    /// count 1 (Binary.java lines 22-23) — with the black-background pref's
+    /// 1.54u default `true` (Prefs.java 551-553); iterations/count are only
+    /// changeable through `Options...`, which the app does not model yet.
+    pub fn binary_erode_active(&mut self) -> Result<(), SessionError> {
+        self.begin_stack_aware(StackOperation::Binary(
+            ij_core::binary_morphology::BinaryMorphology::Erode,
+        ))
+    }
+
+    pub fn binary_dilate_active(&mut self) -> Result<(), SessionError> {
+        self.begin_stack_aware(StackOperation::Binary(
+            ij_core::binary_morphology::BinaryMorphology::Dilate,
+        ))
+    }
+
+    pub fn binary_open_active(&mut self) -> Result<(), SessionError> {
+        self.begin_stack_aware(StackOperation::Binary(
+            ij_core::binary_morphology::BinaryMorphology::Open,
+        ))
+    }
+
+    pub fn binary_close_active(&mut self) -> Result<(), SessionError> {
+        self.begin_stack_aware(StackOperation::Binary(
+            ij_core::binary_morphology::BinaryMorphology::Close,
+        ))
+    }
+
     pub fn gaussian_blur_active(&mut self, sigma: f64) -> Result<(), SessionError> {
         self.begin_stack_aware(StackOperation::GaussianBlur { sigma })
     }
