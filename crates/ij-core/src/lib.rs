@@ -2150,7 +2150,7 @@ impl ImageDocument {
             None
         };
         if let Some(Roi::Line(line)) = &self.roi {
-            return Ok(self.measure_line(*line, limit));
+            return Ok(self.measure_line(*line, config.contains(MeasurementFlags::LIMIT), limit));
         }
         let (rx, ry, rw, rh) = match &self.roi {
             // A selection entirely outside the image leaves a 0x0 processor
@@ -2222,7 +2222,12 @@ impl ImageDocument {
     /// values in a one-row FloatProcessor. Default measurements therefore
     /// report the profile statistics (`Area` is the number of samples), plus
     /// the Results-table-only `Length` and `Angle` columns.
-    fn measure_line(&self, line: LineRoi, limit: Option<ThresholdLevels>) -> MeasurementSummary {
+    fn measure_line(
+        &self,
+        line: LineRoi,
+        limit_enabled: bool,
+        limit: Option<ThresholdLevels>,
+    ) -> MeasurementSummary {
         let x1 = line.x1 as f64;
         let y1 = line.y1 as f64;
         let x2 = line.x2 as f64;
@@ -2247,7 +2252,27 @@ impl ImageDocument {
         }
 
         let samples = (n + 1) as u32;
-        let raw = self.measure_float(&profile, 0, 0, samples, 1, None, None, limit);
+        // Analyzer.java 500-511 converts the float profile back to the source
+        // depth whenever LIMIT is selected, even if no threshold is active.
+        let raw = match (limit_enabled, self.plane()) {
+            (true, PixelPlane::Gray8(_) | PixelPlane::Color256 { .. }) => {
+                // ByteProcessor.setPixels(int, FloatProcessor) adds 0.5f,
+                // clamps, then narrows to byte (ByteProcessor.java 1268-1278).
+                let pixels: Vec<u8> = profile
+                    .iter()
+                    .map(|&value| (value + 0.5_f32).clamp(0.0, 255.0) as u8)
+                    .collect();
+                self.measure_byte_like(&pixels, 0, 0, samples, 1, None, None, limit)
+            }
+            (true, PixelPlane::Gray16(_)) => {
+                let pixels: Vec<u16> = profile
+                    .iter()
+                    .map(|&value| float_to_short(value, 0.0, 1.0))
+                    .collect();
+                self.measure_short(&pixels, 0, 0, samples, 1, None, None, limit)
+            }
+            _ => self.measure_float(&profile, 0, 0, samples, 1, None, None, limit),
+        };
         let mut summary = self.finish_measurement(0, 0, samples, 1, raw);
 
         // Line.getLength (Line.java 430-437) and Roi.getFloatAngle

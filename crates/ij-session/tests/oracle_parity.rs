@@ -1064,6 +1064,88 @@ fn parity_limit_preserves_full_roi_area_fraction_like_java_oracle() {
     );
 }
 
+#[test]
+fn parity_line_roi_limit_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('line-limit','8-bit ramp',16,16,1); makeLine(2,3,12,9); \
+             setThreshold(60,180); \
+             run('Set Measurements...', 'area mean standard min median limit decimal=3'); \
+             run('Measure');",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("line-limit", 16, 16).unwrap();
+    doc.set_line_roi(2, 3, 12, 9);
+    doc.threshold = Some(ThresholdLevels { lower: 60.0, upper: 180.0 });
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+    let columns = oracle_columns(&oracle.stdout);
+    for (name, value) in [
+        ("Area", stats.area),
+        ("Mean", stats.mean),
+        ("StdDev", stats.std_dev),
+        ("Min", stats.min),
+        ("Max", stats.max),
+        ("Median", stats.median),
+    ] {
+        assert_eq!(format_ij_num(value), columns[name], "{name}");
+    }
+}
+
+#[test]
+fn parity_line_roi_limit_without_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('line-limit','8-bit ramp',16,16,1); makeLine(2,3,12,9); \
+             run('Set Measurements...', 'area mean standard min median limit decimal=3'); \
+             run('Measure');",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("line-limit", 16, 16).unwrap();
+    doc.set_line_roi(2, 3, 12, 9);
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+    let columns = oracle_columns(&oracle.stdout);
+    for (name, value) in [
+        ("Area", stats.area),
+        ("Mean", stats.mean),
+        ("StdDev", stats.std_dev),
+        ("Min", stats.min),
+        ("Max", stats.max),
+        ("Median", stats.median),
+    ] {
+        assert_eq!(format_ij_num(value), columns[name], "{name}");
+    }
+}
+
+#[test]
+fn parity_16bit_line_roi_limit_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('line-limit','16-bit ramp',16,16,1); makeLine(2,3,12,9); \
+             setThreshold(10000,50000); \
+             run('Set Measurements...', 'area mean standard min median limit decimal=3'); \
+             run('Measure');",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_16bit("line-limit", 16, 16).unwrap();
+    doc.set_line_roi(2, 3, 12, 9);
+    doc.threshold = Some(ThresholdLevels { lower: 10000.0, upper: 50000.0 });
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+    let columns = oracle_columns(&oracle.stdout);
+    for (name, value) in [
+        ("Area", stats.area),
+        ("Mean", stats.mean),
+        ("StdDev", stats.std_dev),
+        ("Min", stats.min),
+        ("Max", stats.max),
+        ("Median", stats.median),
+    ] {
+        assert_eq!(format_ij_num(value), columns[name], "{name}");
+    }
+}
+
 fn ramp8_plane(width: u32, height: u32) -> PixelPlane {
     ImageDocument::new_ramp_8bit("plane", width, height)
         .unwrap()
