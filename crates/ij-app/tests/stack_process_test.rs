@@ -76,6 +76,9 @@ fn invoke(app: &mut ImageJApp, operation: &StackOperation) -> Result<(), Session
         StackOperation::Binary(ij_core::binary_morphology::BinaryMorphology::Close) => {
             app.binary_close_active()
         }
+        // The Image Calculator is dialog-covering; it is not started through
+        // this stack-prompt entry point.
+        StackOperation::ImageCalculator(_) => Ok(()),
     }
 }
 

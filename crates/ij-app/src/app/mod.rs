@@ -860,6 +860,146 @@ impl ImageJApp {
         }
     }
 
+    /// Opens `Process > Image Calculator...` (ImageCalculator.java 31-78):
+    /// a GenericDialog over the titles of all open windows, defaulting to the
+    /// last-used images and operator statics.
+    pub fn open_image_calculator_dialog(&mut self) -> Result<(), SessionError> {
+        let titles: Vec<String> = self
+            .session
+            .image_ids()
+            .iter()
+            .filter_map(|id| self.session.get_image(*id).map(|doc| doc.title.clone()))
+            .collect();
+        if titles.is_empty() {
+            self.status_message = "Image Calculator requires an open image".to_string();
+            return Err(SessionError::NoActiveImage);
+        }
+        let last = self.dialogs.calculator_last.clone();
+        let resolve = |title: &str, fallback: usize| match titles.iter().position(|t| t == title)
+        {
+            Some(index) => index,
+            None => fallback,
+        };
+        let index1 = resolve(&last.title1, 0);
+        let index2 = resolve(&last.title2, 0);
+        self.dialogs.calculator = Some(crate::dialogs::ImageCalculatorDialog {
+            titles,
+            index1,
+            index2,
+            operation: last.operation,
+            create_window: last.create_window,
+            float_result: last.float_result,
+        });
+        Ok(())
+    }
+
+    /// OK/Cancel handling for the Image Calculator dialog. OK runs the
+    /// operation; with a stack image1 this first asks ImageJ's
+    /// "Process Stack?" question (ImageCalculator.java 161-175).
+    pub fn resolve_image_calculator_dialog(&mut self, apply: bool) -> Result<(), SessionError> {
+        let Some(dialog) = self.dialogs.calculator.take() else {
+            return Ok(());
+        };
+        if !apply {
+            return Ok(());
+        }
+        let Some(title1) = dialog.titles.get(dialog.index1).cloned() else {
+            return Err(SessionError::NoActiveImage);
+        };
+        let Some(title2) = dialog.titles.get(dialog.index2).cloned() else {
+            return Err(SessionError::NoActiveImage);
+        };
+        if self
+            .session
+            .image_id_by_title(&title1)
+            .is_none()
+            || self.session.image_id_by_title(&title2).is_none()
+        {
+            return Err(SessionError::Core(ij_core::CoreError::InvalidOperation(
+                "Image Calculator canceled: one of the images was closed",
+            )));
+        }
+        // ImageCalculator's statics keep the accepted dialog fields
+        // (ImageCalculator.java 66-73).
+        let operation = crate::dialogs::CALCULATOR_OPERATORS
+            .get(dialog.operation)
+            .copied()
+            .ok_or(SessionError::Core(ij_core::CoreError::InvalidOperation(
+                "Unknown Image Calculator operation",
+            )))?;
+        self.dialogs.calculator_last = crate::dialogs::ImageCalculatorLast {
+            title1: title1.clone(),
+            title2: title2.clone(),
+            operation: dialog.operation,
+            create_window: dialog.create_window,
+            float_result: dialog.float_result,
+        };
+        let id1 = self.session.image_id_by_title(&title1).unwrap();
+        let stack_size1 = self
+            .session
+            .get_image(id1)
+            .map(|doc| doc.stack_size())
+            .unwrap_or(1);
+        let operation_state = crate::stack_process::ImageCalculatorOperation {
+            title1,
+            title2,
+            operation,
+            create_window: dialog.create_window,
+            float_result: dialog.float_result,
+        };
+        if stack_size1 > 1 {
+            // IJ.setupDialog targets image1, so make it the foreground window
+            // before asking; the "32-bit" option cannot be combined with the
+            // slice-only answer because a float result forces a new window.
+            self.session.set_active_image(id1)?;
+            if let Some(err) = self.reject_while_closing("Image Calculator") {
+                return Err(err);
+            }
+            self.pending_stack_process = Some(PendingStackProcess {
+                image_id: id1,
+                operation: StackOperation::ImageCalculator(operation_state),
+                stack_size: stack_size1,
+            });
+            self.status_message = format!("Process all {stack_size1} images?");
+            return Ok(());
+        }
+        if let Some(err) = self.reject_while_closing("Image Calculator") {
+            return Err(err);
+        }
+        self.run_image_calculator(Command::ImageCalculator {
+            title1: operation_state.title1.clone(),
+            title2: operation_state.title2.clone(),
+            operation: operation_state.operation,
+            create_window: operation_state.create_window,
+            float_result: operation_state.float_result,
+            process_stack: false,
+        })
+    }
+
+    /// Dispatches one resolved Image Calculator command and reflects the
+    /// result window in the UI.
+    fn run_image_calculator(&mut self, command: Command) -> Result<(), SessionError> {
+        match self.session.dispatch(command) {
+            Ok(CommandOutcome::ImageOpened(id)) => {
+                if let Some(doc) = self.session.get_image(id) {
+                    let (width, height) = (doc.width, doc.height);
+                    self.image_views.insert(id, ImageView::new(width, height));
+                    self.status_message = format!("Created \"{}\"", doc.title);
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                self.status_message = "Image Calculator applied".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Image Calculator failed: {e}");
+                self.dialogs.last_error = Some(format!("Image Calculator failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn math_active(
         &mut self,
         operation: ij_core::math::MathOperation,
@@ -949,7 +1089,15 @@ impl ImageJApp {
 
     fn apply_current_slice(&mut self, operation: StackOperation) -> Result<(), SessionError> {
         match self.session.dispatch(operation.current_slice_command()) {
-            Ok(_) => {
+            Ok(outcome) => {
+                // The Image Calculator can open a result window as a side
+                // effect of the slice-only answer.
+                if let CommandOutcome::ImageOpened(id) = outcome {
+                    if let Some(doc) = self.session.get_image(id) {
+                        let (width, height) = (doc.width, doc.height);
+                        self.image_views.insert(id, ImageView::new(width, height));
+                    }
+                }
                 self.status_message = operation.success_message();
                 Ok(())
             }
@@ -1007,7 +1155,15 @@ impl ImageJApp {
                 };
                 self.pending_stack_process = None;
                 match self.session.dispatch(command) {
-                    Ok(_) => {
+                    Ok(outcome) => {
+                        // The whole-stack Image Calculator can open a result
+                        // window (doStackOperation's duplicateStack path).
+                        if let CommandOutcome::ImageOpened(id) = outcome {
+                            if let Some(doc) = self.session.get_image(id) {
+                                let (width, height) = (doc.width, doc.height);
+                                self.image_views.insert(id, ImageView::new(width, height));
+                            }
+                        }
                         self.status_message = pending
                             .operation
                             .whole_stack_success_message(pending.stack_size);

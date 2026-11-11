@@ -68,6 +68,7 @@ pub enum AppAction {
     BinaryDilate,
     BinaryOpen,
     BinaryClose,
+    ImageCalculator,
     Measure,
     Histogram,
     PlotProfile,
@@ -258,6 +259,10 @@ const PROCESS_MENU: &[MenuNode] = &[
     submenu("Binary", PROCESS_BINARY),
     submenu("Math", PROCESS_MATH),
     unsupported("FFT", None),
+    // Menus.java 203-207: after the FFT submenu, Image Calculator follows
+    // the separator (the unwired Batch submenu sits in between).
+    SEPARATOR,
+    item("Image Calculator...", None, AppAction::ImageCalculator),
 ];
 
 const ANALYZE_TOOLS: &[MenuNode] = &[
@@ -809,6 +814,9 @@ impl ImageJApp {
             }
             BinaryClose => {
                 let _ = self.binary_close_active();
+            }
+            ImageCalculator => {
+                let _ = self.open_image_calculator_dialog();
             }
             Measure => {
                 let _ = self.measure_active();

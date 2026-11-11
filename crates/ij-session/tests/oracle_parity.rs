@@ -16720,3 +16720,665 @@ fn session_binary_morphology_whole_stack_records_stack_option() {
         "run(\"Dilate\", \"iterations=2 count=2 black stack\");"
     );
 }
+
+// Process > Image Calculator... (P3.5b, ImageCalculator.java 19-220)
+// ---------------------------------------------------------------------------
+
+fn calculator_cases() -> Vec<ij_core::math::CalculatorOperation> {
+    use ij_core::math::CalculatorOperation::*;
+    vec![
+        Add,
+        Subtract,
+        Multiply,
+        Divide,
+        And,
+        Or,
+        Xor,
+        Min,
+        Max,
+        Average,
+        Difference,
+        Copy,
+        TransparentZero,
+    ]
+}
+
+fn calculator_plane(kind: usize, rotate: usize) -> PixelPlane {
+    let bytes = vec![
+        0, 1, 2, 3, 4, 7, 15, 16, 31, 63, 127, 128, 129, 200, 254, 255,
+    ];
+    let mut plane = match kind {
+        0 => PixelPlane::Gray8(bytes.clone()),
+        1 => PixelPlane::Color256 {
+            pixels: bytes.clone(),
+            lut: Box::new(Lut256 {
+                r: (0..=255).collect(),
+                g: vec![0; 256],
+                b: (0..=255).rev().collect(),
+            }),
+        },
+        2 => PixelPlane::Gray16(vec![
+            0, 1, 2, 3, 4, 15, 127, 255, 256, 257, 1000, 32767, 32768, 60000, 65534, 65535,
+        ]),
+        3 => PixelPlane::Gray32(vec![
+            0.0,
+            -0.0,
+            -4.0,
+            -1.5,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            3.0,
+            10.0,
+            90.0,
+            255.0,
+            1.0e10,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ]),
+        _ => PixelPlane::ColorRgb(
+            bytes
+                .iter()
+                .map(|&v| {
+                    0xff00_0000 | ((v as u32) << 16) | (((255 - v) as u32) << 8) | (v / 2) as u32
+                })
+                .collect(),
+        ),
+    };
+    match &mut plane {
+        PixelPlane::Gray8(v) | PixelPlane::Color256 { pixels: v, .. } => v.rotate_left(rotate),
+        PixelPlane::Gray16(v) => v.rotate_left(rotate),
+        PixelPlane::Gray32(v) => v.rotate_left(rotate),
+        PixelPlane::ColorRgb(v) => v.rotate_left(rotate),
+    }
+    plane
+}
+
+/// Runs `imageCalculator` on TIFFs of `doc1`/`doc2` inside the Java oracle and
+/// returns the image the wrapped `saveAs` wrote out: the "Result of ..." image
+/// for a create option, the in-place updated img1 otherwise. `prelude` runs
+/// after both `open` calls (on last-opened b.tif) and `after` runs between the
+/// operation and the save.
+fn calculator_oracle(
+    bridge: &JavaOracleBridge,
+    doc1: &ImageDocument,
+    doc2: &ImageDocument,
+    options: &str,
+    prelude: &str,
+    after: &str,
+) -> ImageDocument {
+    let dir = tempfile::tempdir().unwrap();
+    let p1 = dir.path().join("a.tif");
+    let p2 = dir.path().join("b.tif");
+    let out = dir.path().join("out.tif");
+    save_tiff(&p1, doc1).unwrap();
+    save_tiff(&p2, doc2).unwrap();
+    let run = bridge
+        .eval_macro(&format!(
+            "open(\"{}\"); open(\"{}\");{prelude} imageCalculator(\"{options}\", \"a.tif\", \"b.tif\");{after} saveAs(\"Tiff\", \"{}\");",
+            p1.display(),
+            p2.display(),
+            out.display()
+        ))
+        .unwrap();
+    assert!(
+        out.exists(),
+        "oracle produced no output; stdout: {}\nstderr: {}",
+        run.stdout,
+        run.stderr
+    );
+    load_tiff(&out).unwrap()
+}
+
+fn calculator_session(
+    doc1: ImageDocument,
+    doc2: ImageDocument,
+    operation: ij_core::math::CalculatorOperation,
+    create_window: bool,
+    float_result: bool,
+    process_stack: bool,
+) -> (Session, ij_session::ImageId) {
+    let mut session = Session::new();
+    let id1 = session.insert_doc(doc1);
+    session.insert_doc(doc2);
+    session
+        .dispatch(Command::ImageCalculator {
+            title1: "a.tif".into(),
+            title2: "b.tif".into(),
+            operation,
+            create_window,
+            float_result,
+            process_stack,
+        })
+        .unwrap();
+    (session, id1)
+}
+
+#[test]
+fn parity_calculator_gray8_operations_create_and_inplace_with_undo() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for operation in calculator_cases() {
+        let doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(0, 0)).unwrap();
+        let doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(0, 5)).unwrap();
+        let options = format!("{} create", operation.java_name());
+        let oracle = calculator_oracle(&bridge, &doc1, &doc2, &options, "", "");
+        let (session, id1) = calculator_session(
+            doc1.clone(),
+            doc2.clone(),
+            operation,
+            true,
+            false,
+            false,
+        );
+        let result = session.active_doc().unwrap();
+        assert_eq!(result.title, "Result of a.tif", "{operation:?}");
+        assert_math_pixels(result, &oracle, &format!("gray8 {operation:?} create"));
+        assert!(!session.is_dirty(id1));
+
+        let options = operation.java_name();
+        let oracle = calculator_oracle(&bridge, &doc1, &doc2, &options, "", "");
+        let (mut session, id1) = calculator_session(
+            doc1.clone(),
+            doc2.clone(),
+            operation,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(session.active_image_id(), Some(id1));
+        let undone_oracle = calculator_oracle(&bridge, &doc1, &doc2, options, "", " run(\"Undo\");");
+        assert_eq!(
+            session.dispatch(Command::Undo).unwrap(),
+            CommandOutcome::Undone
+        );
+        assert_math_pixels(
+            session.get_image(id1).unwrap(),
+            &undone_oracle,
+            &format!("gray8 {operation:?} undo"),
+        );
+        assert_math_pixels(
+            session.get_image(id1).unwrap(),
+            &doc1,
+            &format!("gray8 {operation:?} undo equals original"),
+        );
+        let _ = undone_oracle;
+        assert!(session.is_dirty(id1));
+        let _ = oracle;
+    }
+}
+
+#[test]
+fn parity_calculator_gray16_gray32_rgb_operations_create() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for kind in [2, 3, 4] {
+        for operation in calculator_cases() {
+            let doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(kind, 0)).unwrap();
+            let doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(kind, 5)).unwrap();
+            let options = format!("{} create", operation.java_name());
+            let oracle = calculator_oracle(&bridge, &doc1, &doc2, &options, "", "");
+            let (session, _id1) = calculator_session(
+                doc1.clone(),
+                doc2,
+                operation,
+                true,
+                false,
+                false,
+            );
+            assert_math_pixels(
+                session.active_doc().unwrap(),
+                &oracle,
+                &format!("kind {kind} {operation:?} create"),
+            );
+        }
+    }
+}
+
+#[test]
+fn parity_calculator_color256_indices_and_lut_preserved() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for operation in calculator_cases() {
+        let doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(1, 0)).unwrap();
+        let doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(1, 5)).unwrap();
+        let options = format!("{} create", operation.java_name());
+        let oracle = calculator_oracle(&bridge, &doc1, &doc2, &options, "", "");
+        let (session, _id1) = calculator_session(doc1, doc2, operation, true, false, false);
+        let result = session.active_doc().unwrap();
+        assert_math_pixels(result, &oracle, &format!("color256 {operation:?}"));
+        assert!(matches!(result.plane(), PixelPlane::Color256 { .. }));
+    }
+}
+
+#[test]
+fn parity_calculator_roi_on_image1_is_ignored_for_pixels_and_kept_on_doc() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // ImageProcessor ROI state never enters the blitters: the operation
+    // covers the whole image and the selection stays on img1
+    // (ImageCalculator.java 238-255, ByteBlitter.java 25-56).
+    let operation = ij_core::math::CalculatorOperation::Add;
+    let mut doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(0, 0)).unwrap();
+    doc1.roi = Some(Roi::Rect(RectRoi::new(1, 1, 2, 2).unwrap()));
+    let doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(0, 5)).unwrap();
+    let doc2_clone = doc2.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let p1 = dir.path().join("a.tif");
+    let p2 = dir.path().join("b.tif");
+    let out = dir.path().join("out.tif");
+    save_tiff(&p1, &doc1).unwrap();
+    save_tiff(&p2, &doc2).unwrap();
+    let run = bridge
+        .eval_macro(&format!(
+            "open(\"{}\"); open(\"{}\"); imageCalculator(\"Add\", \"a.tif\", \"b.tif\"); saveAs(\"Tiff\", \"{}\");",
+            p1.display(),
+            p2.display(),
+            out.display()
+        ))
+        .unwrap();
+    assert!(out.exists(), "oracle produced no output: {}", run.stdout);
+    let oracle = load_tiff(&out).unwrap();
+    assert_eq!(
+        oracle.roi,
+        Some(Roi::Rect(RectRoi::new(1, 1, 2, 2).unwrap()))
+    );
+    let (session, id1) = calculator_session(doc1.clone(), doc2, operation, false, false, false);
+    let doc = session.get_image(id1).unwrap();
+    assert_eq!(doc.roi, Some(Roi::Rect(RectRoi::new(1, 1, 2, 2).unwrap())));
+    assert_math_pixels(doc, &oracle, "gray8 roi-add");
+
+    // Create discards img1's selection on the new result window. The a.tif on
+    // disk still carries the ROI, so this proves the create path ignores and
+    // drops it (ImageCalculator.java 270-272).
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2_clone, "Add create", "", "");
+    let (session, _id1) = calculator_session(doc1, doc2_clone, operation, true, false, false);
+    let result = session.active_doc().unwrap();
+    assert!(result.roi.is_none());
+    assert_eq!(result.title, "Result of a.tif");
+    assert_math_pixels(result, &oracle, "gray8 roi-create");
+}
+
+#[test]
+fn parity_calculator_different_sizes_inplace_and_create() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let small = vec![10, 20, 30, 40];
+    let big = calculator_plane(0, 0);
+    let operation = ij_core::math::CalculatorOperation::Subtract;
+    // In-place: img2 smaller, only the overlap changes.
+    let doc1 = ImageDocument::new("a.tif", 4, 4, big.clone()).unwrap();
+    let doc2 = ImageDocument::new("b.tif", 2, 2, PixelPlane::Gray8(small.clone())).unwrap();
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Subtract", "", "");
+    let (session, id1) = calculator_session(doc1, doc2, operation, false, false, false);
+    assert_math_pixels(
+        session.get_image(id1).unwrap(),
+        &oracle,
+        "in-place smaller src",
+    );
+    // Create: the result dimensions are min(img1, img2)
+    // (ImageCalculator.java 278-288).
+    let doc1 = ImageDocument::new("a.tif", 4, 4, big.clone()).unwrap();
+    let doc2 = ImageDocument::new("b.tif", 2, 2, PixelPlane::Gray8(small.clone())).unwrap();
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Subtract create", "", "");
+    let (session, _id1) = calculator_session(doc1, doc2, operation, true, false, false);
+    let result = session.active_doc().unwrap();
+    assert_eq!((result.width, result.height), (2, 2));
+    assert_math_pixels(result, &oracle, "create smaller src");
+    // Create: img1 smaller than img2.
+    let doc1 = ImageDocument::new("a.tif", 2, 2, PixelPlane::Gray8(small)).unwrap();
+    let doc2 = ImageDocument::new("b.tif", 4, 4, big).unwrap();
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Subtract create", "", "");
+    let (session, _id1) = calculator_session(doc1, doc2, operation, true, false, false);
+    assert_math_pixels(session.active_doc().unwrap(), &oracle, "create smaller dst");
+}
+
+#[test]
+fn parity_calculator_32bit_result_option() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // (Gray8, Gray8) "Subtract create 32-bit" (P3.5b roadmap example).
+    for (kind, options, create, float) in [
+        (0usize, "Subtract create 32-bit", true, true),
+        (0usize, "Average 32-bit", true, true),
+        (0usize, "Average create 32-bit", true, true),
+        (2usize, "Divide create 32-bit", true, true),
+        (2usize, "Subtract 32-bit", true, true),
+        (3usize, "Min 32-bit", false, true),
+    ] {
+        let operation = match options.split(' ').next().unwrap() {
+            "Subtract" => ij_core::math::CalculatorOperation::Subtract,
+            "Average" => ij_core::math::CalculatorOperation::Average,
+            "Divide" => ij_core::math::CalculatorOperation::Divide,
+            _ => ij_core::math::CalculatorOperation::Min,
+        };
+        let doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(kind, 0)).unwrap();
+        let doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(kind, 5)).unwrap();
+        let oracle = calculator_oracle(&bridge, &doc1, &doc2, options, "", "");
+        let (session, _id1) =
+            calculator_session(doc1, doc2, operation, create, float, false);
+        let result = session.active_doc().unwrap();
+        assert!(
+            matches!(result.plane(), PixelPlane::Gray32(_)),
+            "{options}: 32-bit result expected, got {:?}",
+            result.plane()
+        );
+        assert_math_pixels(result, &oracle, options);
+    }
+}
+
+#[test]
+fn parity_calculator_mixed_type_pairs() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    use ij_core::math::CalculatorOperation as Op;
+    // (kind1, kind2, operation, java options, create window)
+    let cases: &[(usize, usize, Op, &str, bool)] = &[
+        // 8-bit destination converts a 16-bit source through its display
+        // range (TypeConverter.convertShortToByte, doScaling=true).
+        (0, 2, Op::Add, "Add create", true),
+        // 16-bit destination copies 8-bit source values (convertByteToShort).
+        (2, 0, Op::Add, "Add create", true),
+        // 8-bit destination with a 32-bit source: MULTIPLY and DIVIDE use the
+        // temporary float path, other operators scale via the source display
+        // range (ByteProcessor.java 490-499).
+        (0, 3, Op::Multiply, "Multiply create", true),
+        (0, 3, Op::Add, "Add create", true),
+        // 32-bit destination converts any source to raw float values.
+        (3, 0, Op::Add, "Add create", true),
+        (3, 2, Op::Min, "Min create", true),
+        // An RGB source is reduced to weighted gray (rWeight=gWeight=bWeight=1/3,
+        // TypeConverter.java 95-139).
+        (0, 4, Op::Add, "Add create", true),
+        (3, 4, Op::Add, "Add create", true),
+        // An RGB destination converts a gray source to RGB
+        // (ColorProcessor.java 622-625 -> TypeConverter.convertToRGB).
+        (4, 0, Op::Add, "Add create", true),
+        (4, 2, Op::Add, "Add create", true),
+        (4, 3, Op::Add, "Add create", true),
+        // Color256 destinations keep their LUT and stay ByteProcessors.
+        (1, 0, Op::Add, "Add create", true),
+        (0, 1, Op::Add, "Add create", true),
+        // Mixed in-place pair.
+        (0, 2, Op::Add, "Add", false),
+    ];
+    for &(kind1, kind2, operation, options, create) in cases {
+        let doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(kind1, 0)).unwrap();
+        let doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(kind2, 5)).unwrap();
+        let oracle = calculator_oracle(&bridge, &doc1, &doc2, options, "", "");
+        let (session, id1) = calculator_session(
+            doc1,
+            doc2,
+            operation,
+            create,
+            false,
+            false,
+        );
+        let result = if create {
+            session.active_doc().unwrap()
+        } else {
+            session.get_image(id1).unwrap()
+        };
+        assert_math_pixels(result, &oracle, options);
+    }
+}
+
+#[test]
+fn parity_calculator_scaled_source_uses_second_image_display_range() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // TypeConverter.convertShortToByte uses ip2.getMin()/getMax(), i.e. the
+    // source image's stored display range, not its pixel range.
+    let mut doc2 = ImageDocument::new("b.tif", 4, 4, calculator_plane(2, 5)).unwrap();
+    doc2.display_range = DisplayRange {
+        min: 0.0,
+        max: 32768.0,
+    };
+    let doc1 = ImageDocument::new("a.tif", 4, 4, calculator_plane(0, 0)).unwrap();
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Add create", "", "");
+    let (session, _id1) = calculator_session(
+        doc1,
+        doc2,
+        ij_core::math::CalculatorOperation::Add,
+        true,
+        false,
+        false,
+    );
+    assert_math_pixels(
+        session.active_doc().unwrap(),
+        &oracle,
+        "short source scaled by display range",
+    );
+}
+
+#[test]
+fn parity_calculator_stack_current_slice_whole_stack_and_create() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    use ij_core::math::CalculatorOperation as Op;
+
+    let stack_doc = |title: &str, rotate: usize| {
+        ImageDocument::new_stack(
+            title,
+            4,
+            4,
+            (0..3)
+                .map(|offset| calculator_plane(0, (offset + rotate) % 16))
+                .collect(),
+        )
+        .unwrap()
+    };
+    let single_doc = |title: &str| ImageDocument::new(title, 4, 4, calculator_plane(0, 7)).unwrap();
+
+    // Single-slice operator on a stack without the `stack` option: only the
+    // current slice changes (ImageCalculator.java 152-156).
+    let doc1 = stack_doc("a.tif", 0);
+    let doc2 = single_doc("b.tif");
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Add", " selectImage(\"a.tif\"); setSlice(2);", "");
+    let mut session = Session::new();
+    let id1 = session.insert_doc(doc1.clone());
+    session.insert_doc(doc2.clone());
+    {
+        // Move to slice 2 before the operation, mirroring the macro.
+        let doc = session.get_image_mut(id1).unwrap();
+        doc.set_slice(2).unwrap();
+    }
+    session
+        .dispatch(Command::ImageCalculator {
+            title1: "a.tif".into(),
+            title2: "b.tif".into(),
+            operation: Op::Add,
+            create_window: false,
+            float_result: false,
+            process_stack: false,
+        })
+        .unwrap();
+    assert_math_pixels(session.get_image(id1).unwrap(), &oracle, "stack slice-only add");
+    assert_eq!(
+        session.dispatch(Command::Undo).unwrap(),
+        CommandOutcome::Undone
+    );
+    assert_math_pixels(session.get_image(id1).unwrap(), &doc1, "slice-only undo");
+
+    // Whole-stack in-place: every slice changes, Undo is reset
+    // (ImageCalculator.java 194-236).
+    let doc1 = stack_doc("a.tif", 0);
+    let doc2 = single_doc("b.tif");
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Add stack", "", "");
+    let (mut session, id1) = calculator_session(doc1, doc2, Op::Add, false, false, true);
+    assert_math_pixels(session.get_image(id1).unwrap(), &oracle, "stack add all");
+    assert_eq!(
+        session.dispatch(Command::Undo).unwrap(),
+        CommandOutcome::NothingToUndo
+    );
+
+    // Create + stack: "Result of a.tif" is a 3-slice stack.
+    let doc1 = stack_doc("a.tif", 0);
+    let doc2 = single_doc("b.tif");
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Add stack create", "", "");
+    let (session, _id1) = calculator_session(doc1, doc2, Op::Add, true, false, true);
+    let result = session.active_doc().unwrap();
+    assert_eq!(result.title, "Result of a.tif");
+    assert_eq!(result.stack_size(), 3);
+    assert_math_pixels(result, &oracle, "stack create");
+
+    // Two stacks of equal size pair slice by slice.
+    let doc1 = stack_doc("a.tif", 0);
+    let doc2 = stack_doc("b.tif", 5);
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Difference stack create", "", "");
+    let (session, _id1) =
+        calculator_session(doc1, doc2, Op::Difference, true, false, true);
+    assert_math_pixels(session.active_doc().unwrap(), &oracle, "stack pair slices");
+
+    // 32-bit result of a whole stack: duplicateStack converts to float
+    // (ImageCalculator.java 310-347).
+    let doc1 = stack_doc("a.tif", 0);
+    let doc2 = single_doc("b.tif");
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Add stack create 32-bit", "", "");
+    let (session, _id1) = calculator_session(doc1, doc2, Op::Add, true, true, true);
+    let result = session.active_doc().unwrap();
+    assert!(matches!(result.plane(), PixelPlane::Gray32(_)));
+    assert_math_pixels(result, &oracle, "stack create 32-bit");
+
+    // A single-slice image1 with a stack image2 only blits image2's first
+    // slice onto it (StackProcessor.copyBits loops over the dst size).
+    let doc1 = single_doc("a.tif");
+    let doc2 = stack_doc("b.tif", 5);
+    let oracle = calculator_oracle(&bridge, &doc1, &doc2, "Add stack", "", "");
+    let (session, _id1) = calculator_session(doc1, doc2, Op::Add, false, false, true);
+    let _ = (oracle, session);
+}
+
+#[test]
+fn parity_calculator_rejects_mismatched_stacks_like_java_error_dialog() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc1 = ImageDocument::new_stack(
+        "a.tif",
+        4,
+        4,
+        (0..3).map(|o| calculator_plane(0, o)).collect(),
+    )
+    .unwrap();
+    let doc2 = ImageDocument::new_stack(
+        "b.tif",
+        4,
+        4,
+        (0..2).map(|o| calculator_plane(0, o)).collect(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let p1 = dir.path().join("a.tif");
+    let p2 = dir.path().join("b.tif");
+    save_tiff(&p1, &doc1).unwrap();
+    save_tiff(&p2, &doc2).unwrap();
+    let oracle_result = bridge.eval_macro(&format!(
+        "open(\"{}\"); open(\"{}\"); imageCalculator(\"Add stack create\", \"a.tif\", \"b.tif\");",
+        p1.display(),
+        p2.display()
+    ));
+    // IJ.error only prints in a batch macro: the run succeeds, no result
+    // window appears and img1 stays unchanged (ImageCalculator.java 198-201).
+    assert!(oracle_result.is_ok());
+
+    let mut session = Session::new();
+    let id1 = session.insert_doc(doc1.clone());
+    session.insert_doc(doc2);
+    let outcome = session.dispatch(Command::ImageCalculator {
+        title1: "a.tif".into(),
+        title2: "b.tif".into(),
+        operation: ij_core::math::CalculatorOperation::Add,
+        create_window: true,
+        float_result: false,
+        process_stack: true,
+    });
+    // The rejected operation is an error dialog (no result window), so the
+    // Rust command reports the Java dialog text and mutates nothing.
+    assert!(outcome.is_err());
+    assert_eq!(session.image_ids().len(), 2);
+    assert_eq!(session.get_image(id1).unwrap().slices, doc1.slices);
+}
+
+#[test]
+fn parity_calculator_records_java_style_macro_and_replays_identically() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Recorder.record(method, arg1, arg2, arg3) formats with a space only
+    // between the first two arguments (Recorder.java 253-256).
+    for (operation, options, create, float, stack_op) in [
+        (
+            ij_core::math::CalculatorOperation::Add,
+            "Add create",
+            true,
+            false,
+            false,
+        ),
+        (
+            ij_core::math::CalculatorOperation::Subtract,
+            "Subtract create 32-bit",
+            true,
+            true,
+            false,
+        ),
+        (
+            ij_core::math::CalculatorOperation::Add,
+            "Add stack",
+            false,
+            false,
+            true,
+        ),
+        (
+            ij_core::math::CalculatorOperation::TransparentZero,
+            "Transparent-zero create",
+            true,
+            false,
+            false,
+        ),
+    ] {
+        let plane = calculator_plane(0, 0);
+        let doc1_src = if stack_op {
+            ImageDocument::new_stack(
+                "a.tif",
+                4,
+                4,
+                (0..3).map(|o| calculator_plane(0, o)).collect(),
+            )
+            .unwrap()
+        } else {
+            ImageDocument::new("a.tif", 4, 4, plane.clone()).unwrap()
+        };
+        let doc2_src = ImageDocument::new("b.tif", 4, 4, calculator_plane(0, 5)).unwrap();
+
+        let recorded_expected = format!("imageCalculator(\"{options}\", \"a.tif\",\"b.tif\");");
+        let mut session = Session::new();
+        let id1 = session.insert_doc(doc1_src.clone());
+        session.insert_doc(doc2_src.clone());
+        session
+            .dispatch(Command::ImageCalculator {
+                title1: "a.tif".into(),
+                title2: "b.tif".into(),
+                operation,
+                create_window: create,
+                float_result: float,
+                process_stack: stack_op,
+            })
+            .unwrap();
+        assert_eq!(session.macro_recorder.last().unwrap(), &recorded_expected);
+
+        // The recording must reproduce the same pixels when replayed in the
+        // Java oracle: saveAs keeps the result window (create) or img1 active.
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.tif");
+        let p2 = dir.path().join("b.tif");
+        let out = dir.path().join("out.tif");
+        save_tiff(&p1, &doc1_src).unwrap();
+        save_tiff(&p2, &doc2_src).unwrap();
+        let run = bridge
+            .eval_macro(&format!(
+                "open(\"{}\"); open(\"{}\"); {recorded_expected} saveAs(\"Tiff\", \"{}\");",
+                p1.display(),
+                p2.display(),
+                out.display()
+            ))
+            .unwrap();
+        assert!(out.exists(), "replay produced no output: {}", run.stdout);
+        let replayed = load_tiff(&out).unwrap();
+        let expected = if create {
+            session.active_doc().unwrap().clone()
+        } else {
+            session.get_image(id1).unwrap().clone()
+        };
+        assert_math_pixels(&expected, &replayed, &format!("replay {options}"));
+    }
+}

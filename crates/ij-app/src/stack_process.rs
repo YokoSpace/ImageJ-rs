@@ -59,6 +59,18 @@ pub enum StackOperation {
     Despeckle,
     Math(ij_core::math::MathOperation),
     Binary(ij_core::binary_morphology::BinaryMorphology),
+    ImageCalculator(ImageCalculatorOperation),
+}
+
+/// The pending Image Calculator parameters for the "Process Stack?" question
+/// (IJ.setupDialog asks when image1 is a stack, ImageCalculator.java 161-173).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageCalculatorOperation {
+    pub title1: String,
+    pub title2: String,
+    pub operation: ij_core::math::CalculatorOperation,
+    pub create_window: bool,
+    pub float_result: bool,
 }
 
 impl StackOperation {
@@ -80,6 +92,7 @@ impl StackOperation {
                 ij_core::binary_morphology::BinaryMorphology::Open => "Open",
                 ij_core::binary_morphology::BinaryMorphology::Close => "Close",
             },
+            Self::ImageCalculator(_) => "Image Calculator",
         }
     }
 
@@ -102,6 +115,7 @@ impl StackOperation {
                 ij_core::binary_morphology::BinaryMorphology::Open => "Open",
                 ij_core::binary_morphology::BinaryMorphology::Close => "Close",
             },
+            Self::ImageCalculator(_) => "Image Calculator",
         }
     }
 
@@ -120,6 +134,7 @@ impl StackOperation {
                 | Self::Despeckle
                 | Self::Math(_)
                 | Self::Binary(_)
+                | Self::ImageCalculator(_)
         )
     }
 
@@ -153,6 +168,14 @@ impl StackOperation {
                 whole_stack: false,
             },
             Self::Binary(operation) => binary_command(*operation, false),
+            Self::ImageCalculator(op) => Command::ImageCalculator {
+                title1: op.title1.clone(),
+                title2: op.title2.clone(),
+                operation: op.operation,
+                create_window: op.create_window,
+                float_result: op.float_result,
+                process_stack: false,
+            },
         }
     }
 
@@ -173,6 +196,14 @@ impl StackOperation {
                 whole_stack: true,
             }),
             Self::Binary(operation) => Some(binary_command(*operation, true)),
+            Self::ImageCalculator(op) => Some(Command::ImageCalculator {
+                title1: op.title1.clone(),
+                title2: op.title2.clone(),
+                operation: op.operation,
+                create_window: op.create_window,
+                float_result: op.float_result,
+                process_stack: true,
+            }),
         }
     }
 
@@ -198,6 +229,9 @@ impl StackOperation {
                     ij_core::binary_morphology::BinaryMorphology::Close => "Close",
                 };
                 format!("{name} applied")
+            }
+            Self::ImageCalculator(op) => {
+                format!("Image Calculator: {} applied", op.operation.java_name())
             }
         }
     }

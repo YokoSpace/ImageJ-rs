@@ -300,6 +300,20 @@ pub enum Command {
         operation: ij_core::math::MathOperation,
         whole_stack: bool,
     },
+    /// `Process > Image Calculator...` (ImageCalculator.java 19-220). The
+    /// operation is `img1 op img2` (e.g. Subtract means `img1 - img2`).
+    /// `create_window` selects a new "Result of ..." image; `float_result`
+    /// is the "32-bit (float) result" checkbox; `process_stack` is the
+    /// positive answer to ImageJ's "Process Stack?" question or the macro
+    /// `stack` option.
+    ImageCalculator {
+        title1: String,
+        title2: String,
+        operation: ij_core::math::CalculatorOperation,
+        create_window: bool,
+        float_result: bool,
+        process_stack: bool,
+    },
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
@@ -1509,6 +1523,95 @@ impl Session {
                 doc.set_position(channel, slice, frame);
                 Ok(CommandOutcome::Updated)
             }
+            Command::ImageCalculator {
+                title1,
+                title2,
+                operation,
+                create_window,
+                float_result,
+                process_stack,
+            } => {
+                let id1 = self
+                    .image_id_by_title(&title1)
+                    .ok_or_else(|| SessionError::UnknownCommand(format!(
+                        "Image Calculator: no image titled {title1:?}"
+                    )))?;
+                let id2 = self
+                    .image_id_by_title(&title2)
+                    .ok_or_else(|| SessionError::UnknownCommand(format!(
+                        "Image Calculator: no image titled {title2:?}"
+                    )))?;
+                // calculate() only reads image2, but the blit routes through
+                // its TypeConverter conversions with image2 metadata intact.
+                let other = self
+                    .images
+                    .get(&id2)
+                    .ok_or(SessionError::NoActiveImage)?
+                    .clone();
+                let stack_size1 = self
+                    .images
+                    .get(&id1)
+                    .map(|doc| doc.stack_size())
+                    .unwrap_or(1);
+                // ImageCalculator.java 148-149: a float result forces a new
+                // window unless both images are 32-bit. The recorded `create`
+                // and `32-bit` options are these effective values (the static
+                // fields hold them by the time Recorder runs, 176-179).
+                let both_gray32 = self
+                    .images
+                    .get(&id1)
+                    .map(|doc| matches!(doc.plane(), PixelPlane::Gray32(_)))
+                    .unwrap_or(false)
+                    && matches!(other.plane(), PixelPlane::Gray32(_));
+                let effective_create = create_window || (float_result && !both_gray32);
+                let outcome = {
+                    let doc = self
+                        .images
+                        .get_mut(&id1)
+                        .ok_or(SessionError::NoActiveImage)?;
+                    doc.image_calculate(
+                        &other,
+                        operation,
+                        create_window,
+                        float_result,
+                        process_stack,
+                    )?
+                };
+                let result_id = match outcome {
+                    Some(new_doc) => {
+                        let new_id = self.insert_doc(new_doc);
+                        self.dirty_images.insert(new_id);
+                        Some(new_id)
+                    }
+                    None => {
+                        // doOperation/doStackOperation select img1's window
+                        // when the result stays in it (248-253, 211-215).
+                        self.set_active_image(id1)?;
+                        self.dirty_images.insert(id1);
+                        self.bump_image_revision(id1);
+                        None
+                    }
+                };
+                let mut options = operation.java_name().to_string();
+                if effective_create {
+                    options.push_str(" create");
+                }
+                if float_result {
+                    options.push_str(" 32-bit");
+                }
+                // calculate() sets stackOp only for a whole-stack dialog run
+                // (161-172); both stacks equal, image2 may be a single slice.
+                if process_stack && stack_size1 > 1 {
+                    options.push_str(" stack");
+                }
+                self.macro_recorder.push(format!(
+                    "imageCalculator(\"{options}\", \"{title1}\",\"{title2}\");"
+                ));
+                match result_id {
+                    Some(new_id) => Ok(CommandOutcome::ImageOpened(new_id)),
+                    None => Ok(CommandOutcome::Updated),
+                }
+            }
             Command::Math {
                 operation,
                 whole_stack,
@@ -2259,6 +2362,15 @@ impl Session {
 
     pub fn image_ids(&self) -> Vec<ImageId> {
         self.images.keys().copied().collect()
+    }
+
+    /// First window with the given title, mirroring `WindowManager.getImage
+    /// (String)`'s "first match wins" lookup used by the Image Calculator.
+    pub fn image_id_by_title(&self, title: &str) -> Option<ImageId> {
+        self.images
+            .iter()
+            .find(|(_, doc)| doc.title == title)
+            .map(|(id, _)| *id)
     }
 
     pub fn get_image(&self, id: ImageId) -> Option<&ImageDocument> {

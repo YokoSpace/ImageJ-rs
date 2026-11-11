@@ -58,6 +58,59 @@ pub struct MathDialog {
     pub operation: ij_core::math::MathOperation,
 }
 
+/// The dialog choice labels in ImageCalculator's order
+/// (ImageCalculator.java 21).
+pub const CALCULATOR_OPERATORS: [ij_core::math::CalculatorOperation; 13] = [
+    ij_core::math::CalculatorOperation::Add,
+    ij_core::math::CalculatorOperation::Subtract,
+    ij_core::math::CalculatorOperation::Multiply,
+    ij_core::math::CalculatorOperation::Divide,
+    ij_core::math::CalculatorOperation::And,
+    ij_core::math::CalculatorOperation::Or,
+    ij_core::math::CalculatorOperation::Xor,
+    ij_core::math::CalculatorOperation::Min,
+    ij_core::math::CalculatorOperation::Max,
+    ij_core::math::CalculatorOperation::Average,
+    ij_core::math::CalculatorOperation::Difference,
+    ij_core::math::CalculatorOperation::Copy,
+    ij_core::math::CalculatorOperation::TransparentZero,
+];
+
+/// Editable state of `Process > Image Calculator...` (ImageCalculator.java
+/// 46-63): two image choices, one operator choice and two checkboxes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageCalculatorDialog {
+    pub titles: Vec<String>,
+    pub index1: usize,
+    pub index2: usize,
+    pub operation: usize,
+    pub create_window: bool,
+    pub float_result: bool,
+}
+
+/// ImageCalculator's `static` fields (23-28): the dialog re-opens with the
+/// last-used images, operator and checkbox states.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageCalculatorLast {
+    pub title1: String,
+    pub title2: String,
+    pub operation: usize,
+    pub create_window: bool,
+    pub float_result: bool,
+}
+
+impl Default for ImageCalculatorLast {
+    fn default() -> Self {
+        Self {
+            title1: String::new(),
+            title2: String::new(),
+            operation: 0,
+            create_window: true,
+            float_result: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MathDefaults {
     pub add: f64,
@@ -103,6 +156,8 @@ pub struct DialogState {
     pub duplicate: DuplicateDialog,
     pub math: Option<MathDialog>,
     pub math_defaults: MathDefaults,
+    pub calculator: Option<ImageCalculatorDialog>,
+    pub calculator_last: ImageCalculatorLast,
     /// Duplicator's `staticDuplicateStack`: the checkbox starts checked again
     /// on the next stack duplicate (Duplicator.java 56, 528).
     pub duplicate_stack_default: bool,
@@ -135,6 +190,8 @@ impl DialogState {
             duplicate: DuplicateDialog::default(),
             math: None,
             math_defaults: MathDefaults::default(),
+            calculator: None,
+            calculator_last: ImageCalculatorLast::default(),
             duplicate_stack_default: false,
             pending_stack_binary: None,
         }

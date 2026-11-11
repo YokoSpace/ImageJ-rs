@@ -251,6 +251,21 @@ impl ImageJApp {
             );
             if cancel { let _ = self.resolve_math_dialog(false); }
         }
+        if let Some(dialog) = self.dialogs.calculator.as_ref() {
+            let _ = dialog;
+            let mut cancel = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("ij_image_calculator_dialog"),
+                egui::ViewportBuilder::default().with_title("Image Calculator")
+                    .with_inner_size([340.0, 210.0]).with_resizable(false),
+                |ctx, class| {
+                    if !matches!(class, egui::ViewportClass::Embedded)
+                        && ctx.input(|i| i.viewport().close_requested()) { cancel = true; }
+                    egui::CentralPanel::default().show(ctx, |ui| self.render_image_calculator_content(ui));
+                },
+            );
+            if cancel { let _ = self.resolve_image_calculator_dialog(false); }
+        }
         if self.dialogs.show_about {
             let mut is_open = true;
             ctx.show_viewport_immediate(
@@ -2374,6 +2389,64 @@ mod math_dialog_tests {
 }
 
 impl ImageJApp {
+    fn render_image_calculator_content(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.dialogs.calculator.as_mut() else {
+            return;
+        };
+        // GenericDialog order: Image1, Operation, Image2, "Create new
+        // window", "32-bit (float) result" (ImageCalculator.java 52-61).
+        let names: Vec<&'static str> = crate::dialogs::CALCULATOR_OPERATORS
+            .iter()
+            .map(|op| op.java_name())
+            .collect();
+        let current = dialog.titles.get(dialog.index1).cloned().unwrap_or_default();
+        egui::ComboBox::from_id_salt("ij_calculator_image1")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                for (index, title) in dialog.titles.iter().enumerate() {
+                    ui.selectable_value(&mut dialog.index1, index, title.clone());
+                }
+            });
+        let operation_name = names.get(dialog.operation).copied().unwrap_or("Add");
+        egui::ComboBox::from_id_salt("ij_calculator_operation")
+            .selected_text(operation_name)
+            .show_ui(ui, |ui| {
+                for (index, name) in names.iter().enumerate() {
+                    ui.selectable_value(&mut dialog.operation, index, *name);
+                }
+            });
+        let current = dialog.titles.get(dialog.index2).cloned().unwrap_or_default();
+        egui::ComboBox::from_id_salt("ij_calculator_image2")
+            .selected_text(current)
+            .show_ui(ui, |ui| {
+                for (index, title) in dialog.titles.iter().enumerate() {
+                    ui.selectable_value(&mut dialog.index2, index, title.clone());
+                }
+            });
+        ui.checkbox(&mut dialog.create_window, "Create new window");
+        ui.checkbox(&mut dialog.float_result, "32-bit (float) result");
+        let mut answer = None;
+        ui.horizontal(|ui| {
+            if ui.button("OK").clicked() {
+                answer = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(false);
+            }
+        });
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            answer = Some(true);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(false);
+        }
+        if let Some(apply) = answer {
+            if let Err(error) = self.resolve_image_calculator_dialog(apply) {
+                self.dialogs.last_error = Some(error.to_string());
+            }
+        }
+    }
+
     fn render_math_content(&mut self, ui: &mut egui::Ui) {
         let Some(dialog) = self.dialogs.math.as_mut() else {
             return;
@@ -2588,5 +2661,247 @@ impl ImageJApp {
         } else {
             self.dialogs.pending_stack_binary = Some(pending);
         }
+    }
+}
+
+#[cfg(test)]
+mod calculator_dialog_tests {
+    use super::*;
+    use crate::action::AppAction;
+    use ij_core::math::CalculatorOperation;
+    use ij_core::{ImageDocument, PixelPlane};
+    use ij_session::Command;
+
+    fn fixture(stack: bool) -> ImageJApp {
+        let mut app = ImageJApp::new();
+        let slices = match stack {
+            true => vec![
+                PixelPlane::Gray8(vec![1, 2, 3, 4]),
+                PixelPlane::Gray8(vec![5, 6, 7, 8]),
+                PixelPlane::Gray8(vec![9, 10, 11, 12]),
+            ],
+            false => vec![PixelPlane::Gray8(vec![1, 2, 3, 4])],
+        };
+        let doc1 = ImageDocument::new_stack("a", 2, 2, slices).unwrap();
+        let doc2 = ImageDocument::new("b", 2, 2, PixelPlane::Gray8(vec![10, 20, 30, 40])).unwrap();
+        app.session.insert_doc(doc1);
+        app.session.insert_doc(doc2);
+        // Make image1 the active window, as the dialog's user would.
+        app.session
+            .set_active_image(app.session.image_id_by_title("a").unwrap())
+            .unwrap();
+        app
+    }
+
+    fn press_enter(app: &mut ImageJApp) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.render_image_calculator_content(ui);
+            });
+        });
+    }
+
+    #[test]
+    fn calculator_dialog_defaults_and_required_image() {
+        let mut app = ImageJApp::new();
+        let ctx = egui::Context::default();
+        app.perform(AppAction::ImageCalculator, &ctx);
+        // ImageCalculator.run with no image shows ImageJ's "no image" error.
+        assert!(app.dialogs.calculator.is_none());
+
+        let mut app = fixture(false);
+        app.perform(AppAction::ImageCalculator, &ctx);
+        // ImageCalculator.java 26-28 statics: Add, createWindow=true.
+        let dialog = app.dialogs.calculator.as_ref().unwrap();
+        assert_eq!(dialog.operation, 0);
+        assert_eq!(dialog.index1, 0);
+        assert_eq!(dialog.index2, 0);
+        assert!(dialog.create_window);
+        assert!(!dialog.float_result);
+        assert_eq!(dialog.titles, ["a", "b"]);
+
+        // Cancel must not touch any document.
+        app.resolve_image_calculator_dialog(false).unwrap();
+        assert!(app.dialogs.calculator.is_none());
+        assert_eq!(app.session.image_ids().len(), 2);
+        assert_eq!(
+            app.session.active_doc().unwrap().plane(),
+            &PixelPlane::Gray8(vec![1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn calculator_dialog_add_create_and_in_place_dispatch() {
+        let mut app = fixture(false);
+        let ctx = egui::Context::default();
+        app.perform(AppAction::ImageCalculator, &ctx);
+        // Subtract = operator index 1, image2 = the second open window.
+        app.dialogs.calculator.as_mut().unwrap().operation = 1;
+        app.dialogs.calculator.as_mut().unwrap().index2 = 1;
+        press_enter(&mut app);
+        assert!(app.dialogs.calculator.is_none());
+        let result = app.session.active_doc().unwrap();
+        assert_eq!(result.title, "Result of a");
+        assert_eq!(
+            result.plane(),
+            &PixelPlane::Gray8(vec![0, 0, 0, 0]),
+            "a - b clamps at zero (ByteBlitter.java 101-106)"
+        );
+        assert_eq!(app.session.image_ids().len(), 3);
+        assert!(app
+            .image_views
+            .contains_key(&app.session.active_image_id().unwrap()));
+        assert_eq!(
+            app.session.macro_recorder.last().unwrap(),
+            "imageCalculator(\"Subtract create\", \"a\",\"b\");"
+        );
+        // ImageCalculator statics keep the accepted dialog fields (63-73).
+        assert_eq!(app.dialogs.calculator_last.operation, 1);
+        assert!(app.dialogs.calculator_last.create_window);
+
+        // In-place Create-off Subtract modifies image1 and keeps it active.
+        let mut app = fixture(false);
+        app.perform(AppAction::ImageCalculator, &ctx);
+        {
+            let dialog = app.dialogs.calculator.as_mut().unwrap();
+            dialog.operation = 1;
+            dialog.index2 = 1;
+            dialog.create_window = false;
+        }
+        press_enter(&mut app);
+        let id1 = app.session.image_id_by_title("a").unwrap();
+        assert_eq!(app.session.active_image_id(), Some(id1));
+        assert_eq!(
+            app.session.get_image(id1).unwrap().plane(),
+            &PixelPlane::Gray8(vec![0, 0, 0, 0])
+        );
+        assert_eq!(app.session.image_ids().len(), 2);
+        let undone = app.undo_active().unwrap();
+        assert_eq!(undone, ij_session::CommandOutcome::Undone);
+        assert_eq!(
+            app.session.get_image(id1).unwrap().plane(),
+            &PixelPlane::Gray8(vec![1, 2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn calculator_dialog_32bit_result_forces_create_and_persists() {
+        let mut app = fixture(false);
+        let ctx = egui::Context::default();
+        app.perform(AppAction::ImageCalculator, &ctx);
+        {
+            let dialog = app.dialogs.calculator.as_mut().unwrap();
+            dialog.operation = 1;
+            dialog.index2 = 1;
+            dialog.create_window = false;
+            dialog.float_result = true;
+        }
+        press_enter(&mut app);
+        let result = app.session.active_doc().unwrap();
+        // ImageCalculator.java 148-149: a 32-bit result forces "create".
+        assert_eq!(result.title, "Result of a");
+        assert!(matches!(result.plane(), PixelPlane::Gray32(_)));
+        assert_eq!(
+            result.plane(),
+            &PixelPlane::Gray32(vec![-9.0, -18.0, -27.0, -36.0])
+        );
+        // In-place off: image1 is untouched, three windows exist.
+        assert_eq!(app.session.image_ids().len(), 3);
+        assert_eq!(
+            app.session.macro_recorder.last().unwrap(),
+            "imageCalculator(\"Subtract create 32-bit\", \"a\",\"b\");"
+        );
+
+        // Reopening restores the stored statics: Min is still selected.
+        app.perform(AppAction::ImageCalculator, &ctx);
+        assert_eq!(app.dialogs.calculator_last.operation, 1);
+        assert!(app.dialogs.calculator.as_ref().unwrap().float_result);
+        assert_eq!(app.dialogs.calculator.as_ref().unwrap().operation, 1);
+        assert!(app.dialogs.calculator_last.float_result);
+        let _ = CalculatorOperation::TransparentZero;
+    }
+
+    #[test]
+    fn calculator_dialog_stack_prompts_and_all_current_choices() {
+        let mut app = fixture(true);
+        let ctx = egui::Context::default();
+        app.perform(AppAction::ImageCalculator, &ctx);
+        {
+            let dialog = app.dialogs.calculator.as_mut().unwrap();
+            dialog.index2 = 1;
+        }
+        press_enter(&mut app);
+        // IJ.setupDialog asks before a stack runs (161-175); nothing changed.
+        assert!(app.pending_stack_process.is_some());
+        assert_eq!(app.status_message, "Process all 3 images?");
+        assert_eq!(app.session.image_ids().len(), 2);
+        assert_eq!(
+            app.session.get_image(app.session.image_id_by_title("a").unwrap())
+                .unwrap()
+                .plane(),
+            &PixelPlane::Gray8(vec![1, 2, 3, 4])
+        );
+
+        // "No" runs the current slice only (166, 173).
+        app.resolve_stack_process(crate::stack_process::StackProcessChoice::Current)
+            .unwrap();
+        assert!(app.pending_stack_process.is_none());
+        let result = app.session.active_doc().unwrap();
+        assert_eq!(result.title, "Result of a");
+        assert_eq!(result.stack_size(), 1);
+        assert_eq!(
+            result.plane(),
+            &PixelPlane::Gray8(vec![11, 22, 33, 44])
+        );
+        assert_eq!(
+            app.session.macro_recorder.last().unwrap(),
+            "imageCalculator(\"Add create\", \"a\",\"b\");"
+        );
+
+        // "Yes" runs the whole stack (167-171).
+        let mut app = fixture(true);
+        app.perform(AppAction::ImageCalculator, &ctx);
+        app.dialogs.calculator.as_mut().unwrap().index2 = 1;
+        press_enter(&mut app);
+        app.resolve_stack_process(crate::stack_process::StackProcessChoice::All)
+            .unwrap();
+        let result = app.session.active_doc().unwrap();
+        assert_eq!(result.title, "Result of a");
+        assert_eq!(result.stack_size(), 3);
+        assert_eq!(
+            result.plane(),
+            &PixelPlane::Gray8(vec![11, 22, 33, 44])
+        );
+        assert_eq!(
+            app.session.get_image(app.session.image_id_by_title("a").unwrap())
+                .unwrap()
+                .plane(),
+            &PixelPlane::Gray8(vec![1, 2, 3, 4]),
+            "create leaves image1 untouched"
+        );
+        assert_eq!(
+            app.session.macro_recorder.last().unwrap(),
+            "imageCalculator(\"Add create stack\", \"a\",\"b\");"
+        );
+        assert_eq!(result.plane(), &PixelPlane::Gray8(vec![11, 22, 33, 44]));
+
+        // "Cancel" aborts without any pixel or window change.
+        let mut app = fixture(true);
+        app.perform(AppAction::ImageCalculator, &ctx);
+        press_enter(&mut app);
+        app.resolve_stack_process(crate::stack_process::StackProcessChoice::Cancel)
+            .unwrap();
+        assert!(app.pending_stack_process.is_none());
+        assert_eq!(app.session.image_ids().len(), 2);
+        let _ = Command::Undo;
     }
 }
