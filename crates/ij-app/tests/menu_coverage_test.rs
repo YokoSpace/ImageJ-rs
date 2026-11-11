@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 const KNOWN_UNWIRED: &[&str] = &[
     "Duplicate...",
     "Histogram",
-    "Set Measurements...",
     "Save",
     "Tiff...",
     "Results...",

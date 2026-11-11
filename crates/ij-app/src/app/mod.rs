@@ -17,7 +17,7 @@ use ij_bridge::plugin_discovery::{
     DiscoveredPlugin, InspectionOptions, InspectionSummary, PluginCatalog, PluginDiscoveryError,
     ScanOptions,
 };
-use ij_core::{MeasurementSummary, PixelPlane, Roi};
+use ij_core::{MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, Roi};
 use ij_session::{
     Command, CommandOutcome, ImageId, PluginFilterOutcome, PluginFilterTicket, Session,
     SessionError,
@@ -37,6 +37,11 @@ mod close_guard;
 mod shortcuts;
 pub use self::menu::scrollable_menu;
 pub use self::image_window::draw_ellipse_stroke;
+pub use self::adjust_dialogs::{
+    SetMeasurementsDialog, SetMeasurementsOption, SET_MEASUREMENTS_FIRST_GROUP,
+    SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS, SET_MEASUREMENTS_OPTIONS,
+    SET_MEASUREMENTS_SECOND_ROWS, clamp_set_measurements_precision, set_measurements_slot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
@@ -147,6 +152,8 @@ pub struct ImageJApp {
     pub image_views: BTreeMap<ImageId, ImageView>,
     pub show_results_window: bool,
     pub dialogs: DialogState,
+    /// `Analyze > Set Measurements...` window and its uncommitted options.
+    pub set_measurements: SetMeasurementsDialog,
     pub pending_close: Option<PendingClose>,
     pub pending_stack_process: Option<PendingStackProcess>,
     pub pending_plugin_filter: Option<PendingPluginFilter>,
@@ -179,6 +186,7 @@ impl ImageJApp {
             image_views: BTreeMap::new(),
             show_results_window: false,
             dialogs: DialogState::new(),
+            set_measurements: SetMeasurementsDialog::default(),
             pending_close: None,
             pending_stack_process: None,
             pending_plugin_filter: None,

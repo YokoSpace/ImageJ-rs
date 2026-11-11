@@ -32,6 +32,7 @@ pub enum AppAction {
     Maximum,
     Despeckle,
     Measure,
+    SetMeasurements,
     ClearResults,
     InstalledPlugins,
     RunPluginFilter,
@@ -168,7 +169,7 @@ const PROCESS_MENU: &[MenuNode] = &[
 const ANALYZE_MENU: &[MenuNode] = &[
     item("Measure", Some("M"), AppAction::Measure),
     item("Clear Results", None, AppAction::ClearResults),
-    unsupported("Set Measurements...", None),
+    item("Set Measurements...", None, AppAction::SetMeasurements),
     unsupported("Plot Profile", None),
     unsupported("Calibrate...", None),
 ];
@@ -212,7 +213,10 @@ impl ImageJApp {
     pub fn action_enabled(&self, action: AppAction) -> Result<(), String> {
         use AppAction::*;
         match action {
-            NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About => Ok(()),
+            // Set Measurements is a user-option dialog, not an image command:
+            // ImageJ's Analyze menu enables it with no image open.
+            NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
+            | SetMeasurements => Ok(()),
             SaveResults | ClearResults => {
                 if self.session.results.rows.is_empty() {
                     Err("No results to save or clear".into())
@@ -400,6 +404,9 @@ impl ImageJApp {
             }
             Measure => {
                 let _ = self.measure_active();
+            }
+            SetMeasurements => {
+                self.open_set_measurements_dialog();
             }
             ClearResults => {
                 let _ = self.session.dispatch(Command::ClearResults);

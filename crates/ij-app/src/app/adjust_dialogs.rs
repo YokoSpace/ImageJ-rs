@@ -5,6 +5,215 @@ mod bc_palette;
 #[path = "threshold_palette.rs"]
 mod threshold_palette;
 
+/// One checkbox of ImageJ's `Set Measurements` dialog.
+///
+/// `label` is the exact 1.54u text and the order follows Analyzer's ordered
+/// `list` (original_imagej/ij/plugin/filter/Analyzer.java 29-32). `supported`
+/// records the flags ImageJ-rs actually honours; the remaining rows are still
+/// displayed (so the layout matches ImageJ) but cannot be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetMeasurementsOption {
+    pub label: &'static str,
+    pub flag: u32,
+    pub supported: bool,
+}
+
+const SUPPORTED: bool = true;
+const NOT_SUPPORTED: bool = false;
+
+pub const SET_MEASUREMENTS_OPTIONS: [SetMeasurementsOption; 24] = [
+    SetMeasurementsOption {
+        label: "Area",
+        flag: MeasurementFlags::AREA,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Mean gray value",
+        flag: MeasurementFlags::MEAN,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Standard deviation",
+        flag: MeasurementFlags::STD_DEV,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Modal gray value",
+        flag: MeasurementFlags::MODE,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Min & max gray value",
+        flag: MeasurementFlags::MIN_MAX,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Centroid",
+        flag: MeasurementFlags::CENTROID,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Center of mass",
+        flag: MeasurementFlags::CENTER_OF_MASS,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Perimeter",
+        flag: MeasurementFlags::PERIMETER,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Bounding rectangle",
+        flag: MeasurementFlags::RECT,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Fit ellipse",
+        flag: MeasurementFlags::ELLIPSE,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Shape descriptors",
+        flag: MeasurementFlags::SHAPE_DESCRIPTORS,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Feret's diameter",
+        flag: MeasurementFlags::FERET,
+        supported: NOT_SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Integrated density",
+        flag: MeasurementFlags::INTEGRATED_DENSITY,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Median",
+        flag: MeasurementFlags::MEDIAN,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Skewness",
+        flag: MeasurementFlags::SKEWNESS,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Kurtosis",
+        flag: MeasurementFlags::KURTOSIS,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Area_fraction",
+        flag: MeasurementFlags::AREA_FRACTION,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Stack position",
+        flag: MeasurementFlags::STACK_POSITION,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Limit to threshold",
+        flag: MeasurementFlags::LIMIT,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Display label",
+        flag: MeasurementFlags::LABELS,
+        supported: NOT_SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Invert Y coordinates",
+        flag: MeasurementFlags::INVERT_Y,
+        supported: NOT_SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Scientific notation",
+        flag: MeasurementFlags::SCIENTIFIC_NOTATION,
+        supported: SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "Add to overlay",
+        flag: MeasurementFlags::ADD_TO_OVERLAY,
+        supported: NOT_SUPPORTED,
+    },
+    SetMeasurementsOption {
+        label: "NaN empty cells",
+        flag: MeasurementFlags::NAN_EMPTY_CELLS,
+        supported: NOT_SUPPORTED,
+    },
+];
+
+/// First `addCheckboxGroup(10, 2, ...)` covers this many options
+/// (Analyzer.java 154-183); the `addCheckboxGroup(3, 2, ...)` group covers the
+/// remaining six (Analyzer.java 184-200).
+pub const SET_MEASUREMENTS_FIRST_GROUP: usize = 18;
+pub const SET_MEASUREMENTS_GROUP_ROWS: usize = 10;
+pub const SET_MEASUREMENTS_GROUP_COLUMNS: usize = 2;
+pub const SET_MEASUREMENTS_SECOND_ROWS: usize = 3;
+
+/// Option index drawn at `(row, column)` of one checkbox panel.
+///
+/// `GenericDialog.addCheckboxGroup` fills its `GridLayout` column by column
+/// (`i2 = col*rows+row`, GenericDialog.java 653-656), so the left column holds
+/// the first `rows` labels rather than every other label.
+pub fn set_measurements_slot(
+    first: usize,
+    count: usize,
+    rows: usize,
+    row: usize,
+    column: usize,
+) -> Option<usize> {
+    let index = first + column * rows + row;
+    (row < rows && index < first + count).then_some(index)
+}
+
+/// `doSetDialog` clamps the numeric field to 0..=9 before storing it
+/// (Analyzer.java 219-221).
+pub fn clamp_set_measurements_precision(value: i64) -> u8 {
+    value.clamp(0, 9) as u8
+}
+
+/// Editable state of the `Set Measurements` window.
+///
+/// The defaults reproduce ImageJ's startup options: Area, Mean and Min/Max at
+/// three decimals (Analyzer.java 40-42). The dialog edits a copy and only
+/// dispatches on OK, so Cancel leaves the session unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetMeasurementsDialog {
+    pub open: bool,
+    pub flags: u32,
+    pub precision: u8,
+}
+
+impl Default for SetMeasurementsDialog {
+    fn default() -> Self {
+        let config = MeasurementConfig::default();
+        Self {
+            open: false,
+            flags: config.flags,
+            precision: config.precision,
+        }
+    }
+}
+
+impl SetMeasurementsDialog {
+    pub fn contains(&self, flag: u32) -> bool {
+        self.flags & flag != 0
+    }
+
+    fn toggle(&mut self, flag: u32, checked: bool) {
+        if checked {
+            self.flags |= flag;
+        } else {
+            self.flags &= !flag;
+        }
+    }
+}
+
+const OPTION_RECT_ID: &str = "ij_set_measurements_option_rect";
+const BUTTON_RECT_ID: &str = "ij_set_measurements_button_rect";
+
 impl ImageJApp {
     pub fn render_dialogs(&mut self, ctx: &egui::Context) {
         if self.dialogs.show_about {
@@ -93,6 +302,10 @@ impl ImageJApp {
 
         if self.dialogs.show_threshold {
             self.render_threshold_palette(ctx);
+        }
+
+        if self.set_measurements.open {
+            self.render_set_measurements_dialog(ctx);
         }
 
         // "Process Stack?" decision, matching IJ.setupDialog. Yes is offered
@@ -551,5 +764,188 @@ impl ImageJApp {
         }
 
         self.render_plugin_browser_window(ctx);
+    }
+
+    /// Opens `Analyze > Set Measurements...` with the session's live options.
+    pub fn open_set_measurements_dialog(&mut self) {
+        let config = self.session.results.config;
+        self.set_measurements = SetMeasurementsDialog {
+            open: true,
+            flags: config.flags,
+            precision: config.precision.min(9),
+        };
+    }
+
+    /// Applies the dialog's draft options as one `SetMeasurements` command and
+    /// closes the window (Analyzer.doSetDialog only stores on OK).
+    pub fn apply_set_measurements_dialog(&mut self) -> Result<(), SessionError> {
+        let flags = self.set_measurements.flags;
+        let precision =
+            clamp_set_measurements_precision(i64::from(self.set_measurements.precision));
+        match self
+            .session
+            .dispatch(Command::SetMeasurements { flags, precision })
+        {
+            Ok(_) => {
+                self.set_measurements.open = false;
+                self.set_measurements.flags = flags;
+                self.set_measurements.precision = precision;
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Set Measurements failed: {e}");
+                self.dialogs.last_error = Some(format!("Set Measurements failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    pub fn set_measurements_option_rect(ctx: &egui::Context, label: &str) -> Option<egui::Rect> {
+        ctx.data(|data| data.get_temp(egui::Id::new((OPTION_RECT_ID, label))))
+    }
+
+    pub fn set_measurements_button_rect(ctx: &egui::Context, label: &str) -> Option<egui::Rect> {
+        ctx.data(|data| data.get_temp(egui::Id::new((BUTTON_RECT_ID, label))))
+    }
+
+    /// The same "Set Measurements" content is used by the native window and by
+    /// headless egui tests.
+    pub fn render_set_measurements_content(&mut self, ui: &mut egui::Ui) {
+        let mut dialog = self.set_measurements;
+
+        render_option_group(
+            ui,
+            0,
+            SET_MEASUREMENTS_FIRST_GROUP,
+            SET_MEASUREMENTS_GROUP_ROWS,
+            &mut dialog,
+        );
+        ui.add_space(10.0);
+        render_option_group(
+            ui,
+            SET_MEASUREMENTS_FIRST_GROUP,
+            SET_MEASUREMENTS_OPTIONS.len() - SET_MEASUREMENTS_FIRST_GROUP,
+            SET_MEASUREMENTS_SECOND_ROWS,
+            &mut dialog,
+        );
+
+        ui.add_space(12.0);
+        // ImageJ offers a Redirect list here (Analyzer.java 204). The narrow
+        // Rust session has no redirect target, so show the Java default
+        // ("None") disabled rather than pretend to redirect.
+        ui.horizontal(|ui| {
+            ui.label("Redirect to:");
+            ui.add_enabled(false, egui::Button::new("None"))
+                .on_hover_text("Redirect targets are not supported yet");
+        });
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Decimal places (0-9):");
+            let mut places = i32::from(dialog.precision);
+            ui.add(egui::DragValue::new(&mut places).speed(1.0).range(0..=9));
+            dialog.precision = clamp_set_measurements_precision(i64::from(places));
+        });
+
+        ui.separator();
+        let mut action = None;
+        ui.horizontal(|ui| {
+            for label in ["OK", "Cancel"] {
+                let response = ui.button(label);
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new((BUTTON_RECT_ID, label)), response.rect)
+                });
+                if response.clicked() {
+                    action = Some(label);
+                }
+            }
+        });
+
+        self.set_measurements = dialog;
+        match action {
+            Some("OK") => {
+                let _ = self.apply_set_measurements_dialog();
+            }
+            Some(_) => {
+                self.set_measurements.open = false;
+            }
+            None => {}
+        }
+    }
+
+    fn render_set_measurements_dialog(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_set_measurements_dialog"),
+            egui::ViewportBuilder::default()
+                .with_title("Set Measurements")
+                .with_inner_size([430.0, 400.0])
+                .with_resizable(false),
+            |ctx, class| {
+                let is_embedded = matches!(class, egui::ViewportClass::Embedded);
+                if (!is_embedded && ctx.input(|i| i.viewport().close_requested()))
+                    || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    close = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        .show(ui, |ui| self.render_set_measurements_content(ui));
+                });
+            },
+        );
+        if close {
+            self.set_measurements.open = false;
+        }
+    }
+}
+
+fn render_option_group(
+    ui: &mut egui::Ui,
+    first: usize,
+    count: usize,
+    rows: usize,
+    dialog: &mut SetMeasurementsDialog,
+) {
+    egui::Grid::new(("ij_set_measurements_group", first))
+        .num_columns(SET_MEASUREMENTS_GROUP_COLUMNS)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for row in 0..rows {
+                for column in 0..SET_MEASUREMENTS_GROUP_COLUMNS {
+                    match set_measurements_slot(first, count, rows, row, column) {
+                        Some(index) => {
+                            let option = SET_MEASUREMENTS_OPTIONS[index];
+                            render_option(ui, &option, dialog);
+                        }
+                        None => {
+                            ui.label("");
+                        }
+                    }
+                }
+                ui.end_row();
+            }
+        });
+}
+
+fn render_option(
+    ui: &mut egui::Ui,
+    option: &SetMeasurementsOption,
+    dialog: &mut SetMeasurementsDialog,
+) {
+    let mut checked = dialog.contains(option.flag);
+    let response = ui.add_enabled(
+        option.supported,
+        egui::Checkbox::new(&mut checked, option.label),
+    );
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(egui::Id::new((OPTION_RECT_ID, option.label)), response.rect)
+    });
+    if !option.supported {
+        response.on_hover_text("Not implemented in ImageJ-rs yet");
+        return;
+    }
+    if response.changed() {
+        dialog.toggle(option.flag, checked);
     }
 }
