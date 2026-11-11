@@ -519,6 +519,23 @@ impl ImageJApp {
         }
     }
 
+    pub fn select_all(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Select All") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::SelectAll) {
+            Ok(_) => {
+                self.status_message = "Selection: all".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Select All failed: {e}");
+                self.dialogs.last_error = Some(format!("Select All failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn clear_roi(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("Clear selection") {
             return Err(err);
@@ -531,6 +548,23 @@ impl ImageJApp {
             Err(e) => {
                 self.status_message = format!("Clear selection failed: {e}");
                 self.dialogs.last_error = Some(format!("Clear selection failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    pub fn restore_selection(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Restore selection") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::RestoreSelection) {
+            Ok(_) => {
+                self.status_message = "Selection restored".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Restore selection failed: {e}");
+                self.dialogs.last_error = Some(format!("Restore selection failed: {e}"));
                 Err(e)
             }
         }

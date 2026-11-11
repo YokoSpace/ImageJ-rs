@@ -145,6 +145,31 @@ impl ImageJApp {
             return;
         }
 
+        // Select All: Cmd+A or Ctrl+A (without Shift)
+        let select_all = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)
+                || i.consume_key(egui::Modifiers::CTRL, egui::Key::A)
+        });
+        if select_all {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::SelectAll, ctx);
+            return;
+        }
+
+        // Restore Selection: Shift+E or Command/Ctrl+Shift+E
+        let restore_selection = ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+                egui::Key::E,
+            ) || i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::E)
+                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::E)
+        });
+        if restore_selection {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::RestoreSelection, ctx);
+            return;
+        }
+
         // Zoom In: '+' or '='
         let zoom_in = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)

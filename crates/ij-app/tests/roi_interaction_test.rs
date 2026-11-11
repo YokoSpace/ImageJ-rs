@@ -214,3 +214,36 @@ fn arrows_nudge_roi_and_shift_arrows_navigate_stack() {
     key(&ctx, &mut app, id, Key::ArrowLeft, Modifiers::NONE);
     assert_eq!(app.session.get_image(id).unwrap().current_slice, 1);
 }
+
+#[test]
+fn select_all_and_restore_selection_shortcuts() {
+    let ctx = Context::default();
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("sel_test", 100, 80).unwrap();
+    assert!(app.session.get_image(id).unwrap().roi.is_none());
+
+    // Cmd+A triggers Select All
+    key(&ctx, &mut app, id, Key::A, Modifiers::COMMAND);
+    assert_eq!(
+        app.session.get_image(id).unwrap().roi.as_ref().unwrap().bounds(),
+        (0, 0, 100, 80)
+    );
+
+    // Create a smaller rect ROI
+    app.dispatch_rect_roi(10, 20, 30, 40).unwrap();
+    assert_eq!(
+        app.session.get_image(id).unwrap().roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+
+    // Shift+A triggers Select None
+    key(&ctx, &mut app, id, Key::A, Modifiers::SHIFT);
+    assert!(app.session.get_image(id).unwrap().roi.is_none());
+
+    // Shift+E triggers Restore Selection
+    key(&ctx, &mut app, id, Key::E, Modifiers::SHIFT);
+    assert_eq!(
+        app.session.get_image(id).unwrap().roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+}

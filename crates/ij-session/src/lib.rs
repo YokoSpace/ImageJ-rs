@@ -7,7 +7,7 @@ pub use ij_bridge::plugin::{
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
     MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
-    ThresholdLevels,
+    Roi, ThresholdLevels,
 };
 use ij_io::{IoError, load_tiff, save_tiff};
 use serde::{Deserialize, Serialize};
@@ -120,7 +120,9 @@ pub enum Command {
         x2: i32,
         y2: i32,
     },
+    SelectAll,
     ClearRoi,
+    RestoreSelection,
     SetDimensions {
         channels: u32,
         slices: u32,
@@ -425,6 +427,7 @@ pub struct Session {
     /// Configured explicitly by the caller; plugin execution is never enabled
     /// implicitly by a repository checkout.
     plugin_bridge: Option<Arc<PluginBridge>>,
+    pub previous_roi: Option<Roi>,
 }
 
 impl Session {
@@ -449,6 +452,19 @@ impl Session {
 
     pub fn clone_plugin_bridge(&self) -> Option<Arc<PluginBridge>> {
         self.plugin_bridge.clone()
+    }
+
+    /// Saves the active document's current ROI to `previous_roi` if it has width > 0 or height > 0
+    /// (ImagePlus.saveRoi, ImagePlus.java lines 2245-2258).
+    pub fn save_roi(&mut self) {
+        if let Ok(doc) = self.active_doc() {
+            if let Some(ref roi) = doc.roi {
+                let (_, _, w, h) = roi.bounds();
+                if w > 0 || h > 0 {
+                    self.previous_roi = Some(roi.clone());
+                }
+            }
+        }
     }
 
     /// Runs the bridge's single preflight validator against one document.
@@ -593,6 +609,7 @@ impl Session {
                 width,
                 height,
             } => {
+                self.save_roi();
                 let doc = ImageDocument::new_ramp_8bit(&title, width, height)?;
                 self.macro_recorder.push(format!(
                     "newImage(\"{title}\", \"8-bit ramp\", {width}, {height}, 1);"
@@ -602,6 +619,7 @@ impl Session {
                 Ok(CommandOutcome::ImageOpened(id))
             }
             Command::OpenTiff { path } => {
+                self.save_roi();
                 let remembered_path = std::path::absolute(&path)?;
                 let doc = load_tiff(&path)?;
                 self.macro_recorder
@@ -798,7 +816,22 @@ impl Session {
                     .push(format!("makeLine({x1}, {y1}, {x2}, {y2});"));
                 Ok(CommandOutcome::Updated)
             }
+            Command::SelectAll => {
+                self.save_roi();
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let before = doc.roi.clone();
+                    doc.select_all()?;
+                    doc.roi != before
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push("run(\"Select All\");".into());
+                Ok(CommandOutcome::Updated)
+            }
             Command::ClearRoi => {
+                self.save_roi();
                 let changed = {
                     let doc = self.active_doc_mut()?;
                     let changed = doc.roi.is_some();
@@ -809,6 +842,21 @@ impl Session {
                     self.mark_active_dirty();
                 }
                 self.macro_recorder.push("run(\"Select None\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::RestoreSelection => {
+                let changed = if let Some(prev) = self.previous_roi.clone() {
+                    let doc = self.active_doc_mut()?;
+                    let before = doc.roi.clone();
+                    let restored = doc.restore_roi(&prev);
+                    restored && doc.roi != before
+                } else {
+                    false
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push("run(\"Restore Selection\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::SetDimensions {

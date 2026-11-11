@@ -607,6 +607,51 @@ impl Roi {
             pixels,
         }))
     }
+
+    /// Moves the ROI so that its bounding box top-left is at (new_x, new_y)
+    /// (Roi.java lines 262-277).
+    pub fn set_location(&mut self, new_x: i32, new_y: i32) {
+        match self {
+            Self::Rect(r) | Self::Oval(r) => {
+                r.x = new_x;
+                r.y = new_y;
+            }
+            Self::Polygon(p) => {
+                let (bx, by, _, _) = p.bounds();
+                let dx = new_x - bx;
+                let dy = new_y - by;
+                for x in &mut p.xpoints {
+                    *x += dx;
+                }
+                for y in &mut p.ypoints {
+                    *y += dy;
+                }
+            }
+            Self::Line(l) => {
+                let (bx, by, _, _) = l.bounds();
+                let dx = new_x - bx;
+                let dy = new_y - by;
+                l.x1 += dx;
+                l.y1 += dy;
+                l.x2 += dx;
+                l.y2 += dy;
+            }
+        }
+    }
+
+    /// Evaluates `ImagePlus.isSmaller(Roi r)` (ImagePlus.java lines 2285-2290).
+    /// If the ROI has a mask, returns true if the mask foreground area is <= image area.
+    /// If the ROI has no mask (Rect, Line), returns false.
+    pub fn is_smaller(&self, img_width: u32, img_height: u32) -> bool {
+        let (_, _, bw, bh) = self.bounds();
+        let mask = match self {
+            Self::Rect(_) | Self::Line(_) => return false,
+            Self::Oval(_) => oval_mask(bw, bh),
+            Self::Polygon(p) => polygon_mask(&p.xpoints, &p.ypoints, bw, bh),
+        };
+        let area = mask.into_iter().filter(|&b| b).count();
+        area <= (img_width as usize) * (img_height as usize)
+    }
 }
 
 /// OvalRoi.getMask() (original_imagej/ij/gui/OvalRoi.java lines 403-425).
@@ -1607,6 +1652,33 @@ impl ImageDocument {
 
     pub fn clear_roi(&mut self) {
         self.roi = None;
+    }
+
+    /// `Edit > Selection > Select All`: sets a rectangular selection covering the whole image
+    /// (Selection.java lines 40-44, ImagePlus.java line 2098).
+    pub fn select_all(&mut self) -> Result<(), CoreError> {
+        self.set_rect_roi(0, 0, self.width as i32, self.height as i32)
+    }
+
+    /// Restores a previously saved ROI according to ImagePlus.restoreRoi (ImagePlus.java 2261-2283).
+    /// Returns true if the ROI was restored, false if it did not fit.
+    pub fn restore_roi(&mut self, prev: &Roi) -> bool {
+        let (rx, ry, rw, rh) = prev.bounds();
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let fits =
+            rw <= w || rh <= h || (rx < w && ry < h) || prev.is_smaller(self.width, self.height);
+        if !fits {
+            return false;
+        }
+        let mut restored = prev.clone();
+        if rx >= w || ry >= h || (rx + rw) < 0 || (ry + rh) < 0 {
+            restored.set_location((w - rw) / 2, (h - rh) / 2);
+        } else if rw == w && rh == h {
+            restored.set_location(0, 0);
+        }
+        self.roi = Some(restored);
+        true
     }
 
     /// Crops every stack plane to the area selection's clipped bounds

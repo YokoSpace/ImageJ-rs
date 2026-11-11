@@ -13419,3 +13419,249 @@ fn whole_stack_filters_reject_rgb_and_indexed_stacks_without_touching_pixels() {
     assert!(indexed.minimum_stack(1.0).is_err());
     assert_eq!(indexed.slices, before);
 }
+
+#[test]
+fn session_select_all_and_restore_selection_geometry_and_lifecycle() {
+    let mut session = Session::new();
+    let doc = ImageDocument::new_ramp_8bit("doc1", 100, 80).unwrap();
+    let id1 = session.insert_doc(doc);
+
+    // Select All on empty ROI creates (0, 0, width, height)
+    session.dispatch(Command::SelectAll).unwrap();
+    assert_eq!(
+        session.get_image(id1).unwrap().roi.as_ref().unwrap().bounds(),
+        (0, 0, 100, 80)
+    );
+    assert_eq!(session.macro_recorder.last().unwrap(), "run(\"Select All\");");
+
+    // Make an oval ROI inside doc1
+    session
+        .dispatch(Command::MakeOvalRoi {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        })
+        .unwrap();
+    assert_eq!(
+        session.get_image(id1).unwrap().roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+
+    // Select None saves previous_roi
+    session.dispatch(Command::ClearRoi).unwrap();
+    assert!(session.get_image(id1).unwrap().roi.is_none());
+    assert_eq!(
+        session.previous_roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+    assert_eq!(session.macro_recorder.last().unwrap(), "run(\"Select None\");");
+
+    // Restore Selection restores oval
+    session.dispatch(Command::RestoreSelection).unwrap();
+    assert!(matches!(
+        session.get_image(id1).unwrap().roi.as_ref().unwrap(),
+        Roi::Oval(_)
+    ));
+    assert_eq!(
+        session.get_image(id1).unwrap().roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+    assert_eq!(
+        session.macro_recorder.last().unwrap(),
+        "run(\"Restore Selection\");"
+    );
+
+    // Select All saves existing oval to previous_roi and sets full-image rect
+    session.dispatch(Command::SelectAll).unwrap();
+    assert_eq!(
+        session.previous_roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+    assert_eq!(
+        session.get_image(id1).unwrap().roi.as_ref().unwrap().bounds(),
+        (0, 0, 100, 80)
+    );
+
+    // Restore Selection restores the oval again
+    session.dispatch(Command::RestoreSelection).unwrap();
+    assert_eq!(
+        session.get_image(id1).unwrap().roi.as_ref().unwrap().bounds(),
+        (10, 20, 30, 40)
+    );
+
+    // Test Polygon ROI
+    let pts = vec![(15, 25), (45, 25), (45, 55), (15, 55)];
+    session
+        .dispatch(Command::MakePolygonRoi { points: pts.clone() })
+        .unwrap();
+    session.dispatch(Command::ClearRoi).unwrap();
+    assert_eq!(
+        session.previous_roi.as_ref().unwrap().bounds(),
+        (15, 25, 30, 30)
+    );
+
+    // Open a second, smaller image (50x50)
+    let doc2 = ImageDocument::new_ramp_8bit("doc2", 50, 50).unwrap();
+    let id2 = session.insert_doc(doc2);
+    // On 50x50, polygon with bounds (15, 25, 30, 30) has r.x < 50 && r.y < 50, not out-of-bounds
+    session.dispatch(Command::RestoreSelection).unwrap();
+    assert_eq!(
+        session.get_image(id2).unwrap().roi.as_ref().unwrap().bounds(),
+        (15, 25, 30, 30)
+    );
+
+    // Now test out-of-bounds relocation:
+    // Place ROI with r.x = 60, r.y = 60 on doc1 (bounds 100x80)
+    session.set_active_image(id1).unwrap();
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 60,
+            y: 60,
+            width: 20,
+            height: 20,
+        })
+        .unwrap();
+    session.dispatch(Command::ClearRoi).unwrap(); // previous_roi is at (60, 60, 20, 20)
+
+    // Switch to doc2 (50x50): r.x (60) >= w (50) and r.y (60) >= h (50)
+    session.set_active_image(id2).unwrap();
+    session.dispatch(Command::RestoreSelection).unwrap();
+    // Relocated to ((w - rw)/2, (h - rh)/2) = ((50 - 20)/2, (50 - 20)/2) = (15, 15)
+    assert_eq!(
+        session.get_image(id2).unwrap().roi.as_ref().unwrap().bounds(),
+        (15, 15, 20, 20)
+    );
+
+    // Test same-size relocation: ROI of size (50, 50) restored on (50, 50) goes to (0, 0)
+    session.dispatch(Command::SelectAll).unwrap();
+    session.dispatch(Command::ClearRoi).unwrap();
+    // Now move doc2's roi to (10, 10, 30, 30)
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 10,
+            y: 10,
+            width: 30,
+            height: 30,
+        })
+        .unwrap();
+    // Restore the 50x50 previous_roi -> fits and rw == w && rh == h -> (0, 0)
+    session.dispatch(Command::RestoreSelection).unwrap();
+    assert_eq!(
+        session.get_image(id2).unwrap().roi.as_ref().unwrap().bounds(),
+        (0, 0, 50, 50)
+    );
+}
+
+#[test]
+fn parity_select_all_and_restore_selection() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // 1. Rect ROI
+    let rect_setup = "newImage('test', '8-bit ramp', 100, 100, 1);\
+                      makeRectangle(10, 20, 30, 40);\
+                      run('Select None');\
+                      run('Restore Selection');\
+                      run('Measure');";
+    let rect_expected = oracle_saved_results_tsv(rect_setup, "restore_rect");
+    let mut session = Session::new();
+    let doc = ImageDocument::new_ramp_8bit("test", 100, 100).unwrap();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+        })
+        .unwrap();
+    session.dispatch(Command::ClearRoi).unwrap();
+    session.dispatch(Command::RestoreSelection).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end(), rect_expected.trim_end());
+
+    // 2. Oval ROI
+    let oval_setup = "newImage('test', '8-bit ramp', 100, 100, 1);\
+                      makeOval(15, 25, 30, 40);\
+                      run('Select None');\
+                      run('Restore Selection');\
+                      run('Measure');";
+    let oval_expected = oracle_saved_results_tsv(oval_setup, "restore_oval");
+    let mut session = Session::new();
+    let doc = ImageDocument::new_ramp_8bit("test", 100, 100).unwrap();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeOvalRoi {
+            x: 15,
+            y: 25,
+            width: 30,
+            height: 40,
+        })
+        .unwrap();
+    session.dispatch(Command::ClearRoi).unwrap();
+    session.dispatch(Command::RestoreSelection).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end(), oval_expected.trim_end());
+
+    // 3. Polygon ROI
+    let poly_setup = "newImage('test', '8-bit ramp', 100, 100, 1);\
+                      makePolygon(10, 10, 40, 15, 35, 50, 15, 45);\
+                      run('Select None');\
+                      run('Restore Selection');\
+                      run('Measure');";
+    let poly_expected = oracle_saved_results_tsv(poly_setup, "restore_poly");
+    let mut session = Session::new();
+    let doc = ImageDocument::new_ramp_8bit("test", 100, 100).unwrap();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakePolygonRoi {
+            points: vec![(10, 10), (40, 15), (35, 50), (15, 45)],
+        })
+        .unwrap();
+    session.dispatch(Command::ClearRoi).unwrap();
+    session.dispatch(Command::RestoreSelection).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end(), poly_expected.trim_end());
+
+    // 4. Center relocation on different-sized image
+    let center_setup = "newImage('big', '8-bit ramp', 100, 100, 1);\
+                        makeRectangle(80, 80, 30, 30);\
+                        run('Select None');\
+                        newImage('small', '8-bit ramp', 50, 50, 1);\
+                        run('Restore Selection');\
+                        getSelectionBounds(x, y, w, h);\
+                        print('CENTERED:' + x + ',' + y + ',' + w + ',' + h);";
+    let output = bridge.eval_macro(center_setup).unwrap();
+    let oracle_line = output
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("CENTERED:"))
+        .expect("oracle must print CENTERED bounds");
+    let mut session = Session::new();
+    session
+        .dispatch(Command::NewRamp8Bit {
+            title: "big".into(),
+            width: 100,
+            height: 100,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 80,
+            y: 80,
+            width: 30,
+            height: 30,
+        })
+        .unwrap();
+    session.dispatch(Command::ClearRoi).unwrap();
+    session
+        .dispatch(Command::NewRamp8Bit {
+            title: "small".into(),
+            width: 50,
+            height: 50,
+        })
+        .unwrap();
+    session.dispatch(Command::RestoreSelection).unwrap();
+    let (x, y, w, h) = session.active_doc().unwrap().roi.as_ref().unwrap().bounds();
+    assert_eq!(oracle_line, format!("CENTERED:{x},{y},{w},{h}"));
+}

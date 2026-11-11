@@ -264,6 +264,13 @@ fn native_shortcuts_only_come_from_cmd_chords() {
             shift: false,
         })
     );
+    assert_eq!(
+        action_node(&spec, AppAction::SelectAll).shortcut,
+        Some(NativeShortcut {
+            key: "A".to_string(),
+            shift: false,
+        })
+    );
 
     for action in [
         AppAction::Close,
@@ -290,7 +297,7 @@ fn native_shortcuts_only_come_from_cmd_chords() {
         if let Some(shortcut) = &node.shortcut {
             assert!(!shortcut.shift, "{:?} unexpectedly uses Shift", node.label);
             assert!(
-                matches!(shortcut.key.as_str(), "S" | "Q"),
+                matches!(shortcut.key.as_str(), "A" | "S" | "Q"),
                 "{:?} unexpectedly maps {:?}",
                 node.label,
                 shortcut.key

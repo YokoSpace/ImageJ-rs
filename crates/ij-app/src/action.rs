@@ -25,7 +25,9 @@ pub enum AppAction {
     ConvertTo16Bit,
     ConvertTo32Bit,
     ConvertToRgb,
+    SelectAll,
     SelectNone,
+    RestoreSelection,
     BrightnessContrast,
     Threshold,
     InvertStack,
@@ -124,7 +126,11 @@ const FILE_MENU: &[MenuNode] = &[
     item("Quit", Some("Cmd+Q"), AppAction::Quit),
 ];
 
-const EDIT_SELECTION: &[MenuNode] = &[item("Select None", Some("Shift+A"), AppAction::SelectNone)];
+const EDIT_SELECTION: &[MenuNode] = &[
+    item("Select All", Some("Cmd+A"), AppAction::SelectAll),
+    item("Select None", Some("Shift+A"), AppAction::SelectNone),
+    item("Restore Selection", Some("Shift+E"), AppAction::RestoreSelection),
+];
 const EDIT_MENU: &[MenuNode] = &[
     item("Undo", Some("Z"), AppAction::Undo),
     SEPARATOR,
@@ -573,8 +579,14 @@ impl ImageJApp {
             ConvertToRgb => {
                 let _ = self.convert_to_rgb_active();
             }
+            SelectAll => {
+                let _ = self.select_all();
+            }
             SelectNone => {
                 let _ = self.clear_roi();
+            }
+            RestoreSelection => {
+                let _ = self.restore_selection();
             }
             BrightnessContrast => {
                 if let Ok(doc) = self.session.active_doc() {
