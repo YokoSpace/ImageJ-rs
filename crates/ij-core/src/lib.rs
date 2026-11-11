@@ -341,6 +341,134 @@ fn polygon_bounds(xpoints: &[i32], ypoints: &[i32]) -> (i32, i32, i32, i32) {
     (min_x, min_y, max_x - min_x, max_y - min_y)
 }
 
+fn convex_hull_area(points: &[(i32, i32)]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut sorted = points.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let cross = |a: (i32, i32), b: (i32, i32), c: (i32, i32)| -> i128 {
+        let abx = i128::from(b.0) - i128::from(a.0);
+        let aby = i128::from(b.1) - i128::from(a.1);
+        let acx = i128::from(c.0) - i128::from(a.0);
+        let acy = i128::from(c.1) - i128::from(a.1);
+        abx * acy - aby * acx
+    };
+    let mut hull = Vec::with_capacity(sorted.len() * 2);
+    for &point in &sorted {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0 {
+            hull.pop();
+        }
+        hull.push(point);
+    }
+    let lower_len = hull.len();
+    for &point in sorted.iter().rev().skip(1) {
+        while hull.len() > lower_len
+            && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0
+        {
+            hull.pop();
+        }
+        hull.push(point);
+    }
+    let twice_area: i128 = (0..hull.len())
+        .map(|i| {
+            let j = (i + 1) % hull.len();
+            i128::from(hull[i].0) * i128::from(hull[j].1)
+                - i128::from(hull[j].0) * i128::from(hull[i].1)
+        })
+        .sum();
+    twice_area.abs() as f64 / 2.0
+}
+
+fn oval_convex_area(oval: RectRoi) -> f64 {
+    // OvalRoi.getFloatPolygon passes a slightly expanded Ellipse2D through
+    // ShapeRoi's 0.1-flatness path iterator, then Roi.getConvexHull rounds
+    // those points before Analyzer.getArea uses the shoelace formula.
+    let x = f64::from(oval.x) - 0.0004;
+    let y = f64::from(oval.y) - 0.0004;
+    let w = f64::from(oval.width) + 0.0008;
+    let h = f64::from(oval.height) + 0.0008;
+    let cx = x + w / 2.0;
+    let cy = y + h / 2.0;
+    let rx = w / 2.0;
+    let ry = h / 2.0;
+    let k = 0.5522847498307933;
+    let arcs = [
+        ([(cx + rx, cy), (cx + rx, cy + k * ry), (cx + k * rx, cy + ry), (cx, cy + ry)]),
+        ([(cx, cy + ry), (cx - k * rx, cy + ry), (cx - rx, cy + k * ry), (cx - rx, cy)]),
+        ([(cx - rx, cy), (cx - rx, cy - k * ry), (cx - k * rx, cy - ry), (cx, cy - ry)]),
+        ([(cx, cy - ry), (cx + k * rx, cy - ry), (cx + rx, cy - k * ry), (cx + rx, cy)]),
+    ];
+    let mut points = vec![arcs[0][0]];
+    for arc in arcs {
+        flatten_cubic(arc, 0, &mut points);
+    }
+    let mut points: Vec<(f64, f64)> = points
+        .into_iter()
+        .map(|(x, y)| (x as f32 as f64, y as f32 as f64))
+        .collect();
+    points.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    points.dedup();
+    let cross = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+        (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
+    };
+    let mut hull = Vec::new();
+    for &point in &points {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(point);
+    }
+    let lower_len = hull.len();
+    for &point in points.iter().rev().skip(1) {
+        while hull.len() > lower_len && cross(hull[hull.len() - 2], hull[hull.len() - 1], point) <= 0.0 {
+            hull.pop();
+        }
+        hull.push(point);
+    }
+    let rounded: Vec<(i32, i32)> = hull
+        .into_iter()
+        .map(|(x, y)| ((x + 0.5).floor() as i32, (y + 0.5).floor() as i32))
+        .collect();
+    let twice_area: i128 = (0..rounded.len())
+        .map(|i| {
+            let j = (i + 1) % rounded.len();
+            i128::from(rounded[i].0) * i128::from(rounded[j].1)
+                - i128::from(rounded[j].0) * i128::from(rounded[i].1)
+        })
+        .sum();
+    twice_area.abs() as f64 / 2.0
+}
+
+fn flatten_cubic(curve: [(f64, f64); 4], depth: u8, points: &mut Vec<(f64, f64)>) {
+    let (x0, y0) = curve[0];
+    let (x3, y3) = curve[3];
+    let dx = x3 - x0;
+    let dy = y3 - y0;
+    let distance2 = |(x, y): (f64, f64)| {
+        if dx == 0.0 && dy == 0.0 {
+            (x - x0).powi(2) + (y - y0).powi(2)
+        } else {
+            let t = ((x - x0) * dx + (y - y0) * dy) / (dx * dx + dy * dy);
+            (x - x0 - t * dx).powi(2) + (y - y0 - t * dy).powi(2)
+        }
+    };
+    if depth >= 10 || distance2(curve[1]).max(distance2(curve[2])) < 0.01 {
+        points.push(curve[3]);
+        return;
+    }
+    let midpoint = |a: (f64, f64), b: (f64, f64)| ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let p01 = midpoint(curve[0], curve[1]);
+    let p12 = midpoint(curve[1], curve[2]);
+    let p23 = midpoint(curve[2], curve[3]);
+    let p012 = midpoint(p01, p12);
+    let p123 = midpoint(p12, p23);
+    let center = midpoint(p012, p123);
+    flatten_cubic([curve[0], p01, p012, center], depth + 1, points);
+    flatten_cubic([center, p123, p23, curve[3]], depth + 1, points);
+}
+
 fn polygon_perimeter(poly: &PolygonRoi, pixel_width: f64, pixel_height: f64) -> f64 {
     let n = poly.xpoints.len();
     if n < 2 {
@@ -2150,7 +2278,9 @@ impl ImageDocument {
             None
         };
         if let Some(Roi::Line(line)) = &self.roi {
-            return Ok(self.measure_line(*line, config.contains(MeasurementFlags::LIMIT), limit));
+            let mut summary = self.measure_line(*line, config.contains(MeasurementFlags::LIMIT), limit);
+            self.populate_shape_descriptors(&mut summary, config);
+            return Ok(summary);
         }
         let (rx, ry, rw, rh) = match &self.roi {
             // A selection entirely outside the image leaves a 0x0 processor
@@ -2212,7 +2342,20 @@ impl ImageDocument {
             PixelPlane::ColorRgb(pixels) => self.measure_rgb(pixels, rx, ry, rw, rh, mask.as_ref()),
         };
 
-        Ok(self.finish_measurement(rx, ry, rw, rh, raw))
+        let mut summary = self.finish_measurement(rx, ry, rw, rh, raw);
+        if config.contains(MeasurementFlags::ELLIPSE)
+            || config.contains(MeasurementFlags::SHAPE_DESCRIPTORS)
+        {
+            let (major, minor, angle, centroid) =
+                self.fit_ellipse(rx, ry, rw, rh, mask.as_ref(), limit);
+            summary.major = major;
+            summary.minor = minor;
+            summary.ellipse_angle = angle;
+            summary.x_centroid = self.calibration.transform_x(centroid.0);
+            summary.y_centroid = self.calibration.transform_y(centroid.1, self.height);
+        }
+        self.populate_shape_descriptors(&mut summary, config);
+        Ok(summary)
     }
 
     /// Port of `Analyzer.measureLength` for a 1-pixel-wide straight line.
@@ -2395,6 +2538,13 @@ impl ImageDocument {
             roi_width: (rw as f64) * self.calibration.pixel_width,
             roi_height: (rh as f64) * self.calibration.pixel_height,
             perimeter: self.roi_perimeter(),
+            major: 0.0,
+            minor: 0.0,
+            ellipse_angle: 0.0,
+            circularity: 0.0,
+            aspect_ratio: 0.0,
+            roundness: 0.0,
+            solidity: 0.0,
             int_den: area * mean,
             raw_int_den: raw.sum,
             histogram: raw.histogram,
@@ -2406,6 +2556,144 @@ impl ImageDocument {
             stack_position: self.stack_position(),
             line: None,
         }
+    }
+
+    fn fit_ellipse(
+        &self,
+        rx: u32,
+        ry: u32,
+        rw: u32,
+        rh: u32,
+        roi_mask: Option<&RoiMask>,
+        limit: Option<ThresholdLevels>,
+    ) -> (f64, f64, f64, (f64, f64)) {
+        let psize = if ((self.calibration.pixel_width - self.calibration.pixel_height).abs()
+            / self.calibration.pixel_width)
+            < 0.01
+        {
+            self.calibration.pixel_width
+        } else {
+            0.0
+        };
+        if roi_mask.is_none() && limit.is_none() {
+            let mut major = 2.0 * f64::from(rw) / 1.772453851;
+            let mut minor = 2.0 * f64::from(rh) / 1.772453851;
+            let mut angle = 0.0;
+            if major < minor {
+                std::mem::swap(&mut major, &mut minor);
+                angle = 90.0;
+            }
+            return (
+                major * psize,
+                minor * psize,
+                angle,
+                (f64::from(rx) + f64::from(rw) / 2.0, f64::from(ry) + f64::from(rh) / 2.0),
+            );
+        }
+
+        // EllipseFitter.java 190-238: sum the ROI mask in local coordinates,
+        // including its 1/12 pixel-area correction to the second moments.
+        let mut count = 0.0;
+        let (mut sx, mut sy, mut sx2, mut sy2, mut sxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for y in 0..rh {
+            for x in 0..rw {
+                let ix = rx + x;
+                let iy = ry + y;
+                if roi_mask.is_some_and(|m| !m.contains(ix, iy)) {
+                    continue;
+                }
+                if limit.is_some_and(|t| {
+                    let value = self.pixel_value(ix as i32, iy as i32);
+                    value < t.lower || value > t.upper
+                }) {
+                    continue;
+                }
+                let x = f64::from(x);
+                let y = f64::from(y);
+                count += 1.0;
+                sx += x;
+                sy += y;
+                sx2 += x * x;
+                sy2 += y * y;
+                sxy += x * y;
+            }
+        }
+        if count == 0.0 {
+            return (0.0, 0.0, 0.0, (f64::from(rx) + 0.5, f64::from(ry) + 0.5));
+        }
+        sx2 += 0.08333333 * count;
+        sy2 += 0.08333333 * count;
+        let xm = sx / count;
+        let ym = sy / count;
+        let u20 = sx2 / count - xm * xm;
+        let u02 = sy2 / count - ym * ym;
+        let u11 = sxy / count - xm * ym;
+        let m4 = (4.0 * (u02 * u20 - u11 * u11).abs()).max(0.000001);
+        let mut a11 = u02 / m4;
+        let a12 = u11 / m4;
+        let mut a22 = u20 / m4;
+        let mut delta = a11 - a22;
+        if delta == 0.0 {
+            delta = 0.000001;
+        }
+        let mut theta = 0.5 * (2.0 * a12 / delta).atan();
+        if theta < 0.0 {
+            theta += 1.5707963267949;
+        }
+        if a12 > 0.0 {
+            theta += 1.5707963267949;
+        } else if a12 == 0.0 {
+            if a22 > a11 {
+                theta = 0.0;
+                std::mem::swap(&mut a22, &mut a11);
+            } else if a11 != a22 {
+                theta = 1.5707963267949;
+            }
+        }
+        let sin = if theta.sin() == 0.0 { 0.000001 } else { theta.sin() };
+        let z = a12 * theta.cos() / sin;
+        let mut major = (1.0 / (a22 + z).abs()).sqrt();
+        let mut minor = (1.0 / (a11 - z).abs()).sqrt();
+        let scale = (count / (std::f64::consts::PI * major * minor)).sqrt();
+        major *= scale * 2.0;
+        minor *= scale * 2.0;
+        let mut angle = 180.0 * theta / std::f64::consts::PI;
+        if angle == 180.0 {
+            angle = 0.0;
+        }
+        if major < minor {
+            std::mem::swap(&mut major, &mut minor);
+        }
+        (major * psize, minor * psize, angle, (f64::from(rx) + xm + 0.5, f64::from(ry) + ym + 0.5))
+    }
+
+    fn populate_shape_descriptors(&self, summary: &mut MeasurementSummary, config: MeasurementConfig) {
+        if !config.contains(MeasurementFlags::SHAPE_DESCRIPTORS) {
+            return;
+        }
+        let perimeter = summary.perimeter;
+        summary.circularity = if perimeter == 0.0 {
+            0.0
+        } else {
+            (4.0 * std::f64::consts::PI * summary.area / (perimeter * perimeter)).min(1.0)
+        };
+        if self.roi.as_ref().is_some_and(|roi| !roi.is_area()) {
+            summary.solidity = f64::NAN;
+            return;
+        }
+        summary.aspect_ratio = summary.major / summary.minor;
+        summary.roundness = 4.0 * summary.area
+            / (std::f64::consts::PI * summary.major * summary.major);
+        let convex_area = match &self.roi {
+            None => summary.pixel_count as f64,
+            Some(Roi::Rect(rect)) => f64::from(rect.width) * f64::from(rect.height),
+            Some(Roi::Polygon(poly)) => {
+                convex_hull_area(&poly.xpoints.iter().copied().zip(poly.ypoints.iter().copied()).collect::<Vec<_>>())
+            }
+            Some(Roi::Oval(oval)) => oval_convex_area(*oval),
+            Some(Roi::Line(_)) => unreachable!(),
+        };
+        summary.solidity = summary.pixel_count as f64 / convex_area;
     }
 
     /// `Analyzer.saveResults` uses `roi.getLength()` for selections and raw
@@ -3376,6 +3664,20 @@ pub struct MeasurementSummary {
     /// `Roi.getLength()` as written to the `Perim.` column.
     #[serde(default)]
     pub perimeter: f64,
+    #[serde(default)]
+    pub major: f64,
+    #[serde(default)]
+    pub minor: f64,
+    #[serde(default)]
+    pub ellipse_angle: f64,
+    #[serde(default)]
+    pub circularity: f64,
+    #[serde(default)]
+    pub aspect_ratio: f64,
+    #[serde(default)]
+    pub roundness: f64,
+    #[serde(default)]
+    pub solidity: f64,
     pub int_den: f64,
     pub raw_int_den: f64,
     /// ROI histogram: 256 bins for 8-bit, RGB and 32-bit planes and the full

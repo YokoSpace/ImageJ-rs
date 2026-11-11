@@ -1146,6 +1146,113 @@ fn parity_16bit_line_roi_limit_matches_java_oracle() {
     }
 }
 
+#[test]
+fn parity_shape_descriptors_and_fitted_ellipse_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (name, selection) in [
+        ("whole", ""),
+        ("rectangle", "makeRectangle(2,3,10,8);"),
+        ("oval", "makeOval(2,3,10,8);"),
+        ("polygon", "makePolygon(2,2,12,2,8,5,12,10,2,10);"),
+    ] {
+        let oracle = bridge
+            .eval_macro(&format!(
+                "newImage('shape','8-bit ramp',16,16,1); {selection} \
+                 run('Set Measurements...', 'area perimeter centroid fit shape decimal=3'); run('Measure');"
+            ))
+            .unwrap();
+        let mut doc = ImageDocument::new_ramp_8bit("shape", 16, 16).unwrap();
+        match name {
+            "rectangle" => doc.set_rect_roi(2, 3, 10, 8).unwrap(),
+            "oval" => doc.set_oval_roi(2, 3, 10, 8).unwrap(),
+            "polygon" => doc
+                .set_polygon_roi(&[(2, 2), (12, 2), (8, 5), (12, 10), (2, 10)])
+                .unwrap(),
+            _ => {}
+        }
+        let config = MeasurementConfig {
+            flags: MeasurementFlags::AREA
+                | MeasurementFlags::PERIMETER
+                | MeasurementFlags::CENTROID
+                | MeasurementFlags::ELLIPSE
+                | MeasurementFlags::SHAPE_DESCRIPTORS,
+            precision: 3,
+        };
+        let stats = doc.measure_with_config(config).unwrap();
+        let columns = oracle_columns(&oracle.stdout);
+        for (heading, value) in [
+            ("Area", stats.area),
+            ("X", stats.x_centroid),
+            ("Y", stats.y_centroid),
+            ("Perim.", stats.perimeter),
+            ("Major", stats.major),
+            ("Minor", stats.minor),
+            ("Angle", stats.ellipse_angle),
+            ("Circ.", stats.circularity),
+            ("AR", stats.aspect_ratio),
+            ("Round", stats.roundness),
+            ("Solidity", stats.solidity),
+        ] {
+            let formatted = if matches!(heading, "Circ." | "AR" | "Round" | "Solidity") {
+                format!("{value:.3}")
+            } else {
+                format_ij_num(value)
+            };
+            assert_eq!(formatted, columns[heading], "{name}: {heading}");
+        }
+    }
+}
+
+#[test]
+fn parity_fitted_ellipse_with_threshold_and_anisotropic_pixels_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('shape','8-bit ramp',16,16,1); makeRectangle(2,3,10,8); \
+             setThreshold(100,200); \
+             run('Set Measurements...', 'area fit shape limit decimal=3'); run('Measure');",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("shape", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    doc.threshold = Some(ThresholdLevels { lower: 100.0, upper: 200.0 });
+    let config = MeasurementConfig {
+        flags: MeasurementFlags::AREA | MeasurementFlags::ELLIPSE
+            | MeasurementFlags::SHAPE_DESCRIPTORS | MeasurementFlags::LIMIT,
+        precision: 3,
+    };
+    let stats = doc.measure_with_config(config).unwrap();
+    let columns = oracle_columns(&oracle.stdout);
+    for (heading, value) in [
+        ("Major", stats.major), ("Minor", stats.minor),
+        ("Angle", stats.ellipse_angle),
+        ("Solidity", stats.solidity),
+    ] {
+        let formatted = if heading == "Solidity" { format!("{value:.3}") } else { format_ij_num(value) };
+        assert_eq!(formatted, columns[heading], "{heading}");
+    }
+
+    let oracle = bridge
+        .eval_macro(
+            "newImage('shape','8-bit ramp',16,16,1); setVoxelSize(0.5,0.25,1,'mm'); \
+             makeRectangle(2,3,10,8); \
+             run('Set Measurements...', 'area fit decimal=3'); run('Measure');",
+        )
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("shape", 16, 16).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    let stats = doc.measure_with_config(MeasurementConfig {
+        flags: MeasurementFlags::AREA | MeasurementFlags::ELLIPSE,
+        precision: 3,
+    }).unwrap();
+    let columns = oracle_columns(&oracle.stdout);
+    for (heading, value) in [("Major", stats.major), ("Minor", stats.minor), ("Angle", stats.ellipse_angle)] {
+        assert_eq!(format_ij_num(value), columns[heading], "{heading}");
+    }
+}
+
 fn ramp8_plane(width: u32, height: u32) -> PixelPlane {
     ImageDocument::new_ramp_8bit("plane", width, height)
         .unwrap()
