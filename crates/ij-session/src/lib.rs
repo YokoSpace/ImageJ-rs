@@ -423,6 +423,7 @@ impl Session {
             plugin_undo_policy(filter_flags, ticket.pre_slices, doc.snapshot.take());
         doc.snapshot = snapshot;
         if mark_dirty {
+            doc.snapshot_display_range = None;
             self.dirty_images.insert(ticket.target);
         }
         self.bump_image_revision(ticket.target);

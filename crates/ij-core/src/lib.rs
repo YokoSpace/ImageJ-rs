@@ -701,6 +701,9 @@ pub struct ImageDocument {
     /// dimensions, so restoring only its pixels would invalidate the document.
     #[serde(default)]
     pub snapshot_dimensions: Option<(u32, u32)>,
+    /// Original processor range saved for TYPE_CONVERSION undo only.
+    #[serde(default)]
+    pub snapshot_display_range: Option<DisplayRange>,
 }
 
 impl ImageDocument {
@@ -765,6 +768,7 @@ impl ImageDocument {
             threshold: None,
             snapshot: None,
             snapshot_dimensions: None,
+            snapshot_display_range: None,
         })
     }
 
@@ -1048,6 +1052,7 @@ impl ImageDocument {
             // ImagePlus.setSlice swaps in different stack pixels and calls
             // ip.setSnapshotPixels(null) (ImagePlus.java 1997-1999).
             self.snapshot = None;
+            self.snapshot_display_range = None;
         }
     }
 
@@ -1078,6 +1083,7 @@ impl ImageDocument {
         // processors, so Undo no longer has a snapshot (ImagePlus.java
         // 1997-1999).
         self.snapshot = None;
+        self.snapshot_display_range = None;
         Ok(())
     }
 
@@ -1233,6 +1239,7 @@ impl ImageDocument {
         } else {
             self.snapshot = None;
             self.snapshot_dimensions = None;
+            self.snapshot_display_range = None;
         }
 
         let source_width = self.width;
@@ -1344,6 +1351,7 @@ impl ImageDocument {
         };
         self.slices[0] = converted;
         if new_processor {
+            self.snapshot_display_range = Some(self.display_range);
             // A new ByteProcessor starts with the default 0..255 range.
             self.display_range = DisplayRange {
                 min: 0.0,
@@ -1357,6 +1365,7 @@ impl ImageDocument {
         // ImageJ's Undo is a no-op afterwards (measured with the 1.54u oracle).
         self.snapshot = None;
         self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
 
         let current = self.current_slice_index();
         let color256 = matches!(self.slices[current], PixelPlane::Color256 { .. });
@@ -1431,6 +1440,7 @@ impl ImageDocument {
     pub fn save_snapshot(&mut self) {
         self.snapshot = Some(self.slices.clone());
         self.snapshot_dimensions = Some((self.width, self.height));
+        self.snapshot_display_range = None;
     }
 
     pub fn undo(&mut self) -> bool {
@@ -1445,15 +1455,20 @@ impl ImageDocument {
                 .unwrap_or((self.width, self.height));
             let expected = (dimensions.0 as usize).saturating_mul(dimensions.1 as usize);
             if prev.iter().any(|plane| plane.len() != expected) {
+                self.snapshot_display_range = None;
                 return false;
             }
             self.slices = prev;
             self.width = dimensions.0;
             self.height = dimensions.1;
+            if let Some(display_range) = self.snapshot_display_range.take() {
+                self.display_range = display_range;
+            }
             let size = self.slices.len().max(1) as u32;
             self.current_slice = self.current_slice.clamp(1, size);
             true
         } else {
+            self.snapshot_display_range = None;
             false
         }
     }
@@ -1472,6 +1487,7 @@ impl ImageDocument {
     pub fn invert_stack(&mut self) {
         if self.slices.len() > 1 {
             self.snapshot = None;
+            self.snapshot_display_range = None;
         } else {
             self.save_snapshot();
         }
@@ -2628,6 +2644,44 @@ mod tests {
         };
         degenerate.convert_to_8bit();
         assert_eq!(degenerate.plane(), &PixelPlane::Gray8(vec![0, 0, 255]));
+    }
+
+    #[test]
+    fn undo_after_8bit_conversion_restores_original_display_range() {
+        // TYPE_CONVERSION saves the original processor, including its min/max
+        // (Undo.java 149-160).
+        let mut doc = ImageDocument::new(
+            "conversion-undo",
+            3,
+            1,
+            PixelPlane::Gray16(vec![100, 250, 500]),
+        )
+        .unwrap();
+        let original = doc.plane().clone();
+        doc.display_range = DisplayRange { min: 100.0, max: 500.0 };
+        doc.convert_to_8bit();
+        assert_eq!(doc.display_range, DisplayRange { min: 0.0, max: 255.0 });
+        assert!(doc.undo());
+        assert_eq!(doc.plane(), &original);
+        assert_eq!(doc.display_range, DisplayRange { min: 100.0, max: 500.0 });
+    }
+
+    #[test]
+    fn later_filter_replaces_type_conversion_undo_range() {
+        let mut doc = ImageDocument::new(
+            "conversion-then-filter",
+            2,
+            1,
+            PixelPlane::Gray16(vec![100, 500]),
+        )
+        .unwrap();
+        doc.display_range = DisplayRange { min: 100.0, max: 500.0 };
+        doc.convert_to_8bit();
+        let converted = doc.plane().clone();
+        doc.invert();
+        assert!(doc.undo());
+        assert_eq!(doc.plane(), &converted);
+        assert_eq!(doc.display_range, DisplayRange { min: 0.0, max: 255.0 });
     }
 
     #[test]

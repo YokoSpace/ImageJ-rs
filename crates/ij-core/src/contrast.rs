@@ -123,7 +123,7 @@ impl ImageDocument {
                 (((value - min) as f64 / (max - min) as f64) * 256.0) as u8
             };
         }
-        self.snapshot = Some(self.slices.clone());
+        self.save_snapshot();
         let pixels = match self.plane_mut() {
             PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => pixels,
             _ => unreachable!(),
