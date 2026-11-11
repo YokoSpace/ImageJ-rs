@@ -2418,6 +2418,18 @@ impl ImageDocument {
         };
         let mut summary = self.finish_measurement(0, 0, samples, 1, raw);
 
+        // Analyzer.saveResults uses the line's integer ROI bounds for RECT,
+        // not the sampled profile's 0..samples processor ROI. Roi.setIntBounds
+        // includes both endpoint pixels (Roi.java 538-549).
+        let bounds_x = line.x1.min(line.x2);
+        let bounds_y = line.y1.min(line.y2);
+        summary.roi_x = self.calibration.transform_x(f64::from(bounds_x));
+        summary.roi_y = self.calibration.transform_y(f64::from(bounds_y), self.height);
+        summary.roi_width = f64::from((line.x2 - line.x1).abs() + 1)
+            * self.calibration.pixel_width;
+        summary.roi_height = f64::from((line.y2 - line.y1).abs() + 1)
+            * self.calibration.pixel_height;
+
         // Line.getLength (Line.java 430-437) and Roi.getFloatAngle
         // (Roi.java 1960-1969) apply the spatial calibration; the angle's dy
         // is y1-y2 so ImageJ reports negative angles for downward lines.

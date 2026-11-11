@@ -11555,7 +11555,7 @@ fn parity_results_table_tsv_line_rows_match_java_oracle() {
     for (index, options) in [
         "area mean min decimal=3",
         "area mean min decimal=5",
-        "area mean perimeter fit shape decimal=2",
+        "area mean perimeter bounding fit shape decimal=2",
         "mean standard median decimal=2",
         "perimeter bounding decimal=3",
         "fit shape decimal=4",
@@ -11576,6 +11576,25 @@ fn parity_results_table_tsv_line_rows_match_java_oracle() {
         let actual = rust_results_tsv(vec![doc.measure_with_config(config).unwrap()], config);
         assert_eq!(actual, expected, "{options}");
     }
+}
+
+#[test]
+fn parity_results_table_tsv_calibrated_line_bounds_match_java_oracle() {
+    let options = "area mean bounding decimal=3";
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "newImage('t','8-bit ramp',16,16,1); setVoxelSize(0.5,0.25,1,'mm'); \
+             makeLine(2,3,10,7); run('Set Measurements...', '{options}'); run('Measure');"
+        ),
+        "calibrated_line_bounds",
+    );
+    let config = table_config(options);
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    doc.set_line_roi(2, 3, 10, 7);
+    let actual = rust_results_tsv(vec![doc.measure_with_config(config).unwrap()], config);
+    assert_eq!(actual, expected);
 }
 
 #[test]
