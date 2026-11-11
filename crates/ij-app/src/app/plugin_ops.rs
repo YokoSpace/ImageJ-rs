@@ -663,13 +663,12 @@ impl ImageJApp {
     }
 
     pub fn is_plugin_filter_running(&self) -> bool {
-        self.pending_plugin_filter.is_some()
+        self.pending_plugin_filter.is_some() || self.plugin_parameters.is_some()
     }
 
     pub fn is_plugin_filter_running_for(&self, id: ImageId) -> bool {
-        self.pending_plugin_filter
-            .as_ref()
-            .is_some_and(|p| p.target_image_id == id)
+        self.plugin_parameters.as_ref().is_some_and(|p| p.target() == id)
+            || self.pending_plugin_filter.as_ref().is_some_and(|p| p.target_image_id == id)
     }
 
     pub fn plugin_filter_phase(&self) -> Option<PluginFilterPhase> {
@@ -685,6 +684,10 @@ impl ImageJApp {
     /// that the child JVM has been killed and reaped. Returns `true` only for
     /// the first request.
     pub fn cancel_plugin_filter(&mut self) -> bool {
+        if self.plugin_parameters.take().is_some() {
+            self.status_message = "PlugInFilter parameters cancelled".into();
+            return true;
+        }
         let Some(pending) = self.pending_plugin_filter.as_mut() else {
             return false;
         };
@@ -770,25 +773,14 @@ impl ImageJApp {
             return Err(err);
         }
 
-        let bridge = match self.session.clone_plugin_bridge() {
-            Some(b) => b,
-            None => {
-                if self.try_detect_plugin_bridge() {
-                    self.session.clone_plugin_bridge().unwrap()
-                } else {
-                    let err = SessionError::PluginBridgeUnavailable;
-                    self.status_message =
-                        "No plugin bridge is configured in this session".to_string();
-                    self.dialogs.last_error = Some(
-                        "Plugin bridge is unavailable. Auto-detect from repository root or configure one."
-                            .to_string(),
-                    );
-                    return Err(err);
-                }
-            }
-        };
+        if self.session.plugin_bridge().is_none() && !self.try_detect_plugin_bridge() {
+            let err = SessionError::PluginBridgeUnavailable;
+            self.status_message = "No plugin bridge is configured in this session".into();
+            self.dialogs.last_error = Some(err.to_string());
+            return Err(err);
+        }
 
-        let prepared =
+        let mut prepared =
             match self
                 .session
                 .prepare_plugin_filter(target_id, &class_name, &classpath, &arg)
@@ -801,14 +793,42 @@ impl ImageJApp {
                 }
             };
 
+        if let Some(catalog) = &self.plugins_browser.catalog {
+            if catalog.classpath == classpath {
+                if let Some(entry) = catalog.plugins.iter().find(|entry| {
+                    let (name, argument) = split_plugin_class_spec(&entry.class_spec);
+                    name == class_name && argument.unwrap_or_default() == arg
+                }) {
+                    prepared.request.command = entry.label.clone();
+                }
+            }
+        }
+        self.start_prepared_plugin_filter(prepared)
+    }
+
+    pub(super) fn start_prepared_plugin_filter(
+        &mut self,
+        prepared: ij_session::PreparedPluginFilter,
+    ) -> Result<(), SessionError> {
+        if self.pending_close.is_some() || self.quit_app || self.pending_plugin_filter.is_some() {
+            return Err(SessionError::InvalidPluginFilterRequest(
+                "Resolve the active operation before running a filter".into(),
+            ));
+        }
+        let bridge = self.session.clone_plugin_bridge()
+            .ok_or(SessionError::PluginBridgeUnavailable)?;
         let ij_session::PreparedPluginFilter { ticket, request } = prepared;
+        let target_id = ticket.target();
+        let class_name = request.class_name.clone();
+        let arg = request.arg.clone();
+        let worker_request = request.clone();
         let cancel_token = CancellationToken::new();
         let worker_token = cancel_token.clone();
         let (tx, rx) = channel();
 
         thread::spawn(move || {
             let res = bridge
-                .run_filter_with_cancel(&request, &worker_token)
+                .run_filter_with_cancel(&worker_request, &worker_token)
                 .map_err(SessionError::Plugin);
             let _ = tx.send(res);
         });
@@ -818,6 +838,7 @@ impl ImageJApp {
             class_name: class_name.clone(),
             arg,
             ticket,
+            request,
             receiver: rx,
             cancel_token,
             phase: PluginFilterPhase::Running,
@@ -864,6 +885,18 @@ impl ImageJApp {
                     || matches!(err, SessionError::Plugin(PluginBridgeError::Cancelled));
                 if cancelled {
                     return Some(Err(Self::plugin_filter_cancelled(&mut self.status_message)));
+                }
+                if let SessionError::Plugin(PluginBridgeError::DialogRequired { schema }) = err {
+                    self.plugin_parameters = Some(super::plugins_ui::PluginParameterDialog::new(
+                        schema,
+                        ij_session::PreparedPluginFilter {
+                            ticket: pending.ticket,
+                            request: pending.request,
+                        },
+                    ));
+                    self.status_message = format!("Enter parameters for {}", pending.class_name);
+                    self.dialogs.last_error = None;
+                    return None;
                 }
                 self.status_message = format!("PlugInFilter {} failed: {err}", pending.class_name);
                 self.dialogs.last_error = Some(format!("{err}"));

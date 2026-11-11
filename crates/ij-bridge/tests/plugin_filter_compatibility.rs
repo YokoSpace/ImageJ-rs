@@ -110,6 +110,9 @@ fn run_reference_filter(request: &PluginFilterRequest) -> ImageDocument {
             .arg(request.image.current_slice.to_string());
     }
 
+    if let Some(options) = &request.macro_options {
+        cmd.arg("--macro-options").arg(options);
+    }
     let child = cmd.output().expect("run reference filter");
     assert!(
         child.status.success(),
@@ -984,4 +987,161 @@ fn host_reports_missing_input_as_io_error_not_unsupported_filter() {
         !output.exists(),
         "an I/O failure must not create an output file"
     );
+}
+
+#[test]
+fn generic_dialog_parameters_match_real_imagej() {
+    let _bridge = bridge();
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("input.tif");
+    let output = tmp.path().join("host.tif");
+    let reference = tmp.path().join("reference.tif");
+    let result = tmp.path().join("result.json");
+    save_tiff(&input, &sample_image_without_roi()).unwrap();
+    let options = "amount=7.25 text_value=[two words] mode=[Subtract value] enabled";
+    let host = Command::new(repo_root().join("tools/plugin-host/run_host.sh"))
+        .args(["--plugin-cp"])
+        .arg(fixture_jar_path())
+        .args([
+            "--class",
+            "fixtures.ParameterFilter",
+            "--macro-options",
+            options,
+        ])
+        .arg("--input-image")
+        .arg(&input)
+        .arg("--output-image")
+        .arg(&output)
+        .arg("--result-file")
+        .arg(&result)
+        .output()
+        .unwrap();
+    assert!(host.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();
+    assert_eq!(json["status"], "success", "{json}");
+    let oracle = Command::new(repo_root().join("tools/plugin-host/run_reference_filter.sh"))
+        .arg("--plugins-dir")
+        .arg(fixture_jar_path().parent().unwrap())
+        .args([
+            "--class",
+            "fixtures.ParameterFilter",
+            "--macro-options",
+            options,
+        ])
+        .arg("--input-image")
+        .arg(&input)
+        .arg("--output-image")
+        .arg(&reference)
+        .output()
+        .unwrap();
+    assert!(
+        oracle.status.success(),
+        "{}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(
+        gray8(&load_tiff(output).unwrap()),
+        gray8(&load_tiff(reference).unwrap())
+    );
+    let oracle_stdout = String::from_utf8_lossy(&oracle.stdout);
+    assert!(oracle_stdout.contains("PARAMETERS=7.25:two words:1:true"));
+    assert!(
+        oracle_stdout.contains(&format!("RECORDED_OPTIONS={options}")),
+        "{oracle_stdout}"
+    );
+    assert!(
+        oracle_stdout.contains(&format!(
+            "RECORDED_MACRO=run(\"fixtures.ParameterFilter\", \"{options}\");"
+        )),
+        "{oracle_stdout}"
+    );
+    assert!(
+        json["stdout"]
+            .as_str()
+            .unwrap()
+            .contains("PARAMETERS=7.25:two words:1:true")
+    );
+}
+
+#[test]
+fn generic_dialog_schema_and_unchecked_empty_parameters_match_imagej() {
+    use ij_bridge::plugin::PluginDialogFieldKind;
+    let bridge = bridge();
+    let request = filter_request("fixtures.ParameterFilter", sample_image_without_roi());
+    let schema = match bridge.run_filter(&request) {
+        Err(PluginBridgeError::DialogRequired { schema }) => schema,
+        other => panic!("expected schema, got {other:?}"),
+    };
+    assert_eq!(schema.title, "Fixture parameters");
+    assert_eq!(
+        schema
+            .fields
+            .iter()
+            .map(|f| f.key.as_str())
+            .collect::<Vec<_>>(),
+        ["amount", "text_value", "mode", "enabled"]
+    );
+    assert_eq!(
+        schema.default_values(),
+        ["2.5", "default text", "Add", "true"]
+    );
+    assert_eq!(
+        schema.fields[0].kind,
+        PluginDialogFieldKind::Numeric {
+            digits: 2,
+            units: Some("levels".into())
+        }
+    );
+    assert_eq!(
+        schema.fields[2].kind,
+        PluginDialogFieldKind::Choice {
+            choices: vec!["Add".into(), "Subtract value".into()]
+        }
+    );
+    let options = schema
+        .macro_options(&["3.0".into(), "".into(), "Add".into(), "false".into()])
+        .unwrap();
+    assert_eq!(options, "amount=3 text_value=[] mode=Add");
+    let request = request.with_macro_options(options);
+    let run = bridge.run_filter(&request).unwrap();
+    let oracle = run_reference_filter(&request);
+    assert_eq!(gray8(&run.image), gray8(&oracle));
+    assert_eq!(
+        gray8(&run.image),
+        gray8(&request.image),
+        "unchecked overrides the true default"
+    );
+    assert!(run.stdout.contains("PARAMETERS=3.0::0:false"));
+    let nested = vec![
+        "1".into(),
+        "[two] words".into(),
+        "Add".into(),
+        "true".into(),
+    ];
+    let request = request.with_macro_options(schema.macro_options(&nested).unwrap());
+    assert_eq!(
+        gray8(&bridge.run_filter(&request).unwrap().image),
+        gray8(&run_reference_filter(&request))
+    );
+    let mut invalid = nested;
+    invalid[0] = "NaN".into();
+    assert!(schema.macro_options(&invalid).is_err());
+    invalid[0] = "1".into();
+    invalid[1] = "unmatched]".into();
+    assert!(schema.macro_options(&invalid).is_err());
+}
+
+#[test]
+fn generic_dialog_refuses_multiple_dialogs_and_custom_controls() {
+    let bridge = bridge();
+    for (class, message) in [
+        ("fixtures.MultipleDialogsFilter", "Only one"),
+        (
+            "fixtures.UnsupportedDialogFilter",
+            "Unsupported GenericDialog",
+        ),
+    ] {
+        let request = filter_request(class, sample_image_without_roi()).with_macro_options(" ");
+        assert_filter_rejected(bridge.run_filter(&request), message);
+    }
 }

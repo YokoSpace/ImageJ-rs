@@ -321,14 +321,16 @@ pub enum Command {
     SaveResultsTsv {
         path: PathBuf,
     },
-    /// Runs one explicitly named Java `PlugInFilter` class through the narrow
-    /// `ij-bridge` plugin host.
-    ///
-    /// This is deliberately *not* a generic ImageJ menu/GUI compatibility
-    /// entry point: only `class_name`, the supplied `classpath`, and `arg` are
-    /// used. The document must be a single-plane 8-bit grayscale image with
-    /// default calibration/display-range metadata and an optional in-bounds
-    /// rectangular ROI. Unsupported inputs are rejected before the JVM starts.
+    /// Runs a legacy filter with dialog macro options, separate from setup's
+    /// `arg`. Accepts transferable 8/16/32-bit grayscale and RGB documents,
+    /// including plain Z-stacks, with an optional in-bounds rectangular ROI.
+    RunPluginFilterWithOptions {
+        class_name: String,
+        classpath: Vec<PathBuf>,
+        arg: String,
+        options: String,
+    },
+    /// Executes a filter or returns DialogRequired with its parameter schema.
     RunPluginFilter {
         class_name: String,
         classpath: Vec<PathBuf>,
@@ -475,6 +477,8 @@ pub struct PluginFilterTicket {
     pre_slices: Vec<PixelPlane>,
     class_name: String,
     arg: String,
+    macro_options: Option<String>,
+    command: String,
 }
 
 impl PluginFilterTicket {
@@ -496,6 +500,15 @@ impl PluginFilterTicket {
 pub struct PreparedPluginFilter {
     pub ticket: PluginFilterTicket,
     pub request: PluginFilterRequest,
+}
+
+impl PreparedPluginFilter {
+    pub fn with_macro_options(mut self, options: String) -> Self {
+        self.ticket.macro_options = Some(options.clone());
+        self.ticket.command = self.request.command.clone();
+        self.request.macro_options = Some(options);
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -649,6 +662,8 @@ impl Session {
             pre_slices: doc.slices.clone(),
             class_name: class_name.to_string(),
             arg: arg.to_string(),
+            macro_options: None,
+            command: String::new(),
         };
         Ok(PreparedPluginFilter { ticket, request })
     }
@@ -714,9 +729,22 @@ impl Session {
         self.bump_image_revision(ticket.target);
 
         let safe_class = run_class.replace(['\n', '\r'], " ");
-        self.macro_recorder.push(format!(
-            "// Java plugin filter {safe_class}: macro replay is not supported"
-        ));
+        if let Some(options) = &ticket.macro_options {
+            let command = if ticket.command.is_empty() {
+                &run_class
+            } else {
+                &ticket.command
+            };
+            self.macro_recorder.push(format!(
+                "run(\"{}\", \"{}\");",
+                macro_string(command),
+                macro_string(options)
+            ));
+        } else {
+            self.macro_recorder.push(format!(
+                "// Java plugin filter {safe_class}: macro replay is not supported"
+            ));
+        }
 
         Ok(PluginFilterOutcome {
             class_name: run_class,
@@ -1830,6 +1858,24 @@ impl Session {
                     .push(format!("saveAs(\"Results\", \"{}\");", path.display()));
                 Ok(CommandOutcome::Saved(path))
             }
+            Command::RunPluginFilterWithOptions {
+                class_name,
+                classpath,
+                arg,
+                options,
+            } => {
+                let bridge = self
+                    .plugin_bridge
+                    .as_ref()
+                    .ok_or(SessionError::PluginBridgeUnavailable)?;
+                let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let prepared = self
+                    .prepare_plugin_filter(id, &class_name, &classpath, &arg)?
+                    .with_macro_options(options);
+                let run = bridge.run_filter(&prepared.request)?;
+                let outcome = self.apply_plugin_filter_run(prepared.ticket, run)?;
+                Ok(CommandOutcome::PluginFiltered(outcome))
+            }
             Command::RunPluginFilter {
                 class_name,
                 classpath,
@@ -1990,6 +2036,14 @@ impl Session {
         self.active_image = Some(id);
         id
     }
+}
+
+fn macro_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Validates the host-shaped result against the ticket before the session

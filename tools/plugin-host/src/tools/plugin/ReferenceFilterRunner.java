@@ -26,9 +26,12 @@ public class ReferenceFilterRunner {
         String outputImage = null;
         String roiSpec = null;
         String currentSliceSpec = null;
+        String macroOptions = null;
 
         for (int i = 0; i < args.length; i++) {
-            if ("--class".equals(args[i]) && i + 1 < args.length) {
+            if ("--macro-options".equals(args[i]) && i + 1 < args.length) {
+                macroOptions = args[++i];
+            } else if ("--class".equals(args[i]) && i + 1 < args.length) {
                 className = args[++i];
             } else if ("--arg".equals(args[i]) && i + 1 < args.length) {
                 arg = args[++i];
@@ -50,6 +53,17 @@ public class ReferenceFilterRunner {
             System.exit(2);
         }
 
+        if (macroOptions != null) {
+            // The oracle uses the real AWT GenericDialog, disposed by macro mode
+            // at showDialog() (GenericDialog.java 1511-1513).
+            System.setProperty("java.awt.headless", "false");
+            Thread.currentThread().setName("Run$_reference");
+            ij.Macro.setOptions(macroOptions.isEmpty() ? " " : macroOptions);
+            new ij.plugin.frame.Recorder(false);
+            ij.plugin.frame.Recorder.record = true;
+            ij.plugin.frame.Recorder.recordInMacros = true;
+            ij.plugin.frame.Recorder.setCommand(className);
+        }
         ImagePlus imp = IJ.openImage(inputImage);
         if (imp == null) {
             System.err.println("reference oracle could not open " + inputImage);
@@ -78,6 +92,11 @@ public class ReferenceFilterRunner {
             if (plugin == null) {
                 System.err.println("reference oracle could not load/run " + className);
                 System.exit(3);
+            }
+            if (macroOptions != null) {
+                System.out.println("RECORDED_OPTIONS=" + ij.plugin.frame.Recorder.getCommandOptions());
+                ij.plugin.frame.Recorder.saveCommand();
+                System.out.println("RECORDED_MACRO=" + ij.plugin.frame.Recorder.getInstance().getText().trim());
             }
             if (!IJ.saveAsTiff(imp, outputImage)) {
                 System.err.println("reference oracle could not save " + outputImage);

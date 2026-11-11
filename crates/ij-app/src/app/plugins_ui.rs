@@ -1,12 +1,125 @@
 use super::*;
+use ij_bridge::plugin::{PluginDialogFieldKind, PluginDialogSchema};
+
+pub struct PluginParameterDialog {
+    pub schema: PluginDialogSchema,
+    pub values: Vec<String>,
+    pub error: Option<String>,
+    prepared: ij_session::PreparedPluginFilter,
+}
+
+impl PluginParameterDialog {
+    pub(super) fn new(
+        schema: PluginDialogSchema,
+        prepared: ij_session::PreparedPluginFilter,
+    ) -> Self {
+        let values = schema.default_values();
+        Self {
+            schema,
+            values,
+            error: None,
+            prepared,
+        }
+    }
+
+    pub fn target(&self) -> ImageId {
+        self.prepared.ticket.target()
+    }
+}
 
 impl ImageJApp {
+    pub fn submit_plugin_parameters(&mut self) -> Result<(), String> {
+        let state = self
+            .plugin_parameters
+            .as_mut()
+            .ok_or("No plugin parameter dialog is open")?;
+        let options = match state.schema.macro_options(&state.values) {
+            Ok(options) => options,
+            Err(error) => {
+                state.error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        let state = self.plugin_parameters.take().expect("parameter dialog");
+        self.start_prepared_plugin_filter(state.prepared.with_macro_options(options))
+            .map_err(|error| {
+                self.dialogs.last_error = Some(error.to_string());
+                error.to_string()
+            })
+    }
+
+    fn render_plugin_parameters(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.plugin_parameters.as_mut() else {
+            return;
+        };
+        let mut accept = false;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::new("ij_plugin_parameters")).show(ctx, |ui| {
+            ui.heading(&state.schema.title);
+            ui.label(format!("Target image ID {}", state.target().0));
+            egui::ScrollArea::vertical()
+                .max_height(ctx.screen_rect().height() * 0.6)
+                .show(ui, |ui| {
+                    egui::Grid::new("ij_plugin_parameter_fields").show(ui, |ui| {
+                        for (index, field) in state.schema.fields.iter().enumerate() {
+                            let label = field.label.replace('_', " ");
+                            ui.label(label.trim_end_matches(':'));
+                            let value = &mut state.values[index];
+                            match &field.kind {
+                                PluginDialogFieldKind::Checkbox => {
+                                    let mut checked = value == "true";
+                                    if ui.checkbox(&mut checked, "").changed() {
+                                        *value = checked.to_string();
+                                    }
+                                }
+                                PluginDialogFieldKind::Choice { choices } => {
+                                    egui::ComboBox::from_id_salt(("plugin_choice", index))
+                                        .selected_text(value.clone())
+                                        .show_ui(ui, |ui| {
+                                            for choice in choices {
+                                                ui.selectable_value(value, choice.clone(), choice);
+                                            }
+                                        });
+                                }
+                                PluginDialogFieldKind::Numeric { units, .. } => {
+                                    ui.horizontal(|ui| {
+                                        ui.text_edit_singleline(value);
+                                        if let Some(units) = units {
+                                            ui.label(units);
+                                        }
+                                    });
+                                }
+                                PluginDialogFieldKind::String => {
+                                    ui.text_edit_singleline(value);
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            if let Some(error) = &state.error {
+                ui.colored_label(Color32::RED, error);
+            }
+            ui.horizontal(|ui| {
+                accept = ui.button("OK").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+            cancel |= ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        });
+        if cancel {
+            self.cancel_plugin_filter();
+        } else if accept {
+            let _ = self.submit_plugin_parameters();
+        }
+    }
+
     /// Independent, scrollable Installed Plugins window.
     ///
     /// The window only performs read-only discovery and explicit inspection.
     /// The panel states plainly that loading/inspecting does not sandbox code
     /// and that running a verified filter still uses the external JVM.
     pub fn render_plugin_browser_window(&mut self, ctx: &egui::Context) {
+        self.render_plugin_parameters(ctx);
         if !self.plugins_browser.show {
             return;
         }
@@ -125,7 +238,7 @@ impl ImageJApp {
                     }
 
                     ui.group(|ui| {
-                        ui.label(egui::RichText::new("Narrow PlugInFilter target").strong());
+                        ui.label(egui::RichText::new("PlugInFilter target").strong());
                         if let Some((title, width, height, stack_size)) = &target_info {
                             ui.label(format!(
                                 "Active image: \"{title}\" (ID {}, {width}x{height})",
@@ -142,7 +255,7 @@ impl ImageJApp {
                             } else {
                                 ui.colored_label(
                                     Color32::from_rgb(60, 180, 60),
-                                    "Preflight: compatible with the narrow 8-bit single-slice subset.",
+                                    "Preflight: transferable 8/16/32-bit grayscale or RGB image; plain Z-stacks supported.",
                                 );
                             }
                         } else {
@@ -389,5 +502,4 @@ impl ImageJApp {
             self.close_plugins_browser();
         }
     }
-
 }

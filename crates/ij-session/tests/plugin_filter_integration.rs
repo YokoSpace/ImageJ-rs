@@ -41,6 +41,15 @@ fn gray8(doc: &ImageDocument) -> &[u8] {
 /// reference path in `tools/plugin-host/run_reference_filter.sh`) without the
 /// bridge's validation or TIFF-transfer logic.
 fn run_reference_filter(image: &ImageDocument, class_name: &str, arg: &str) -> ImageDocument {
+    run_reference_filter_options(image, class_name, arg, None).0
+}
+
+fn run_reference_filter_options(
+    image: &ImageDocument,
+    class_name: &str,
+    arg: &str,
+    options: Option<&str>,
+) -> (ImageDocument, String) {
     let tmp = tempfile::tempdir().expect("reference tempdir");
     let input = tmp.path().join("reference-input.tif");
     let output = tmp.path().join("reference-output.tif");
@@ -77,6 +86,9 @@ fn run_reference_filter(image: &ImageDocument, class_name: &str, arg: &str) -> I
             .arg(image.current_slice.to_string());
     }
 
+    if let Some(options) = options {
+        cmd.arg("--macro-options").arg(options);
+    }
     let child = cmd.output().expect("run reference filter");
     assert!(
         child.status.success(),
@@ -87,7 +99,7 @@ fn run_reference_filter(image: &ImageDocument, class_name: &str, arg: &str) -> I
     let mut doc = load_tiff(&output).expect("load reference output");
     doc.title = image.title.clone();
     doc.roi = image.roi.clone();
-    doc
+    (doc, String::from_utf8_lossy(&child.stdout).into_owned())
 }
 
 fn session_with_bridge() -> Session {
@@ -669,4 +681,54 @@ fn session_filter_rejects_empty_class_name_without_spawning_or_mutating() {
         other => panic!("expected InvalidPluginFilterRequest, got {other:?}"),
     }
     assert_unchanged(&session, id, &before, "empty class name");
+}
+
+#[test]
+fn session_generic_dialog_options_pixels_recorder_and_undo_match_imagej() {
+    let (mut session, id) = session_with_ramp("parameters", 32, 24);
+    let before = session.get_image(id).unwrap().clone();
+    let options = "amount=7.25 text_value=[two words] mode=[Subtract value] enabled";
+    let (oracle, stdout) =
+        run_reference_filter_options(&before, "fixtures.ParameterFilter", "", Some(options));
+    session
+        .dispatch(Command::RunPluginFilterWithOptions {
+            class_name: "fixtures.ParameterFilter".into(),
+            classpath: vec![fixture_jar_path()],
+            arg: String::new(),
+            options: options.into(),
+        })
+        .unwrap();
+    assert_eq!(gray8(session.get_image(id).unwrap()), gray8(&oracle));
+    let recorded = session.macro_recorder.last().unwrap();
+    let oracle_recorded = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("RECORDED_MACRO="))
+        .expect("real recorder output");
+    assert_eq!(recorded, oracle_recorded);
+    session.dispatch(Command::Undo).unwrap();
+    assert_eq!(gray8(session.get_image(id).unwrap()), gray8(&before));
+}
+
+#[test]
+fn session_generic_dialog_discovery_and_rejected_second_dialog_are_transactional() {
+    let (mut session, id) = session_with_ramp("parameters", 32, 24);
+    let before = transaction_state(&session, id);
+    assert!(matches!(
+        session.dispatch(run_filter_command("fixtures.ParameterFilter")),
+        Err(SessionError::Plugin(
+            PluginBridgeError::DialogRequired { .. }
+        ))
+    ));
+    assert_unchanged(&session, id, &before, "schema discovery");
+    assert!(
+        session
+            .dispatch(Command::RunPluginFilterWithOptions {
+                class_name: "fixtures.MultipleDialogsFilter".into(),
+                classpath: vec![fixture_jar_path()],
+                arg: String::new(),
+                options: " ".into(),
+            })
+            .is_err()
+    );
+    assert_unchanged(&session, id, &before, "second dialog rejection");
 }

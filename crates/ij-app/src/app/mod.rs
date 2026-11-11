@@ -105,6 +105,7 @@ pub struct PendingPluginFilter {
     pub class_name: String,
     pub arg: String,
     pub ticket: PluginFilterTicket,
+    pub request: ij_bridge::plugin::PluginFilterRequest,
     pub receiver: Receiver<Result<PluginFilterRun, SessionError>>,
     pub cancel_token: CancellationToken,
     pub phase: PluginFilterPhase,
@@ -185,6 +186,7 @@ pub struct ImageJApp {
     pub pending_revert: Option<ImageId>,
     pub pending_stack_process: Option<PendingStackProcess>,
     pub pending_plugin_filter: Option<PendingPluginFilter>,
+    pub plugin_parameters: Option<plugins_ui::PluginParameterDialog>,
     /// UI model for Plugins > Installed Plugins.
     pub plugins_browser: PluginBrowserState,
     /// At most one background catalog scan/inspection.
@@ -243,6 +245,7 @@ impl ImageJApp {
             pending_revert: None,
             pending_stack_process: None,
             pending_plugin_filter: None,
+            plugin_parameters: None,
             plugins_browser: PluginBrowserState::default(),
             pending_plugin_catalog_job: None,
             plugin_catalog_generation: 0,

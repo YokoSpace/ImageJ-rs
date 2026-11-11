@@ -33,8 +33,8 @@ import java.util.List;
  *   processing is claimed)
  * - io_error (the host could not read the input or publish the output)
  *
- * GUI, hyperstacks, dialogs/preview (GenericDialog, ExtendedPlugInFilter),
- * CONVERT_TO_FLOAT and non-rectangular-ROI compatibility are explicitly not
+ * A single standard GenericDialog is exchanged as JSON via ParameterDialog.
+ * Custom GUI, hyperstacks, preview/ExtendedPlugInFilter, CONVERT_TO_FLOAT and non-rectangular-ROI compatibility are explicitly not
  * claimed. Plain Z-stacks are processed by the unmodified ImageJ runner:
  * every slice with DOES_STACKS, otherwise only the current slice transferred
  * with --current-slice.
@@ -60,9 +60,12 @@ public class PluginHost {
         String roiSpec = null;
         String currentSliceSpec = null;
         boolean inspect = false;
+        String macroOptions = null;
 
         for (int i = 0; i < args.length; i++) {
-            if ("--inspect".equals(args[i])) {
+            if ("--macro-options".equals(args[i]) && i + 1 < args.length) {
+                macroOptions = args[++i];
+            } else if ("--inspect".equals(args[i])) {
                 inspect = true;
             } else if ("--plugin-cp".equals(args[i]) && i + 1 < args.length) {
                 pluginCp = args[++i];
@@ -137,6 +140,11 @@ public class PluginHost {
                 return;
             }
 
+            ParameterDialog.options = macroOptions;
+            if (macroOptions != null) {
+                Thread.currentThread().setName("Run$_plugin");
+                ij.Macro.setOptions(macroOptions.isEmpty() ? " " : macroOptions);
+            }
             Class<?> clazz;
             try {
                 clazz = Class.forName(className, true, loader);
@@ -169,7 +177,7 @@ public class PluginHost {
                 return;
             }
 
-            // Narrow PlugInFilter path: one 8-bit plane + optional rectangle ROI.
+            // Typed image/stack transfer with an optional rectangular ROI.
             if (isFilter) {
                 if (ExtendedPlugInFilter.class.isAssignableFrom(clazz)) {
                     interceptedOut.flush();
@@ -217,6 +225,17 @@ public class PluginHost {
                             finalRunId, className, pluginArg, filterResult.flags,
                             notProcessedMessage(filterResult), outStr, errStr));
                     }
+                } catch (ParameterDialog.Required required) {
+                    writeResult(resultFile, origOut, "{\"status\":\"dialog_required\",\"run_id\":"
+                        + ParameterDialog.quote(runId) + ",\"class_name\":" + ParameterDialog.quote(className)
+                        + ",\"arg\":" + ParameterDialog.quote(pluginArg)
+                        + ",\"schema\":" + required.dialog.json() + "}");
+                } catch (NoSuchMethodError | VerifyError e) {
+                    writeResult(resultFile, origOut, formatUnsupportedFilterJson(
+                        finalRunId, className, pluginArg,
+                        "Unsupported GenericDialog API or custom UI: " + e.toString(), 0,
+                        capturedOutStream.toString(StandardCharsets.UTF_8),
+                        capturedErrStream.toString(StandardCharsets.UTF_8)));
                 } catch (FilterIoException e) {
                     interceptedOut.flush();
                     interceptedErr.flush();
@@ -446,7 +465,7 @@ public class PluginHost {
                 }
             }
         }
-        return new URLClassLoader(urls.toArray(new URL[0]), PluginHost.class.getClassLoader());
+        return new DialogClassLoader(urls.toArray(new URL[0]), PluginHost.class.getClassLoader());
     }
 
     private static Throwable unwrapThrowable(Throwable t) {

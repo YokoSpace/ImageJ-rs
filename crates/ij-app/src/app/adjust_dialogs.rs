@@ -618,8 +618,8 @@ impl ImageJApp {
                                 );
                                 ui.label(
                                     "Runs an explicit Java PlugInFilter class through an isolated JVM process.\n\
-                                    • Supported: Single-slice 8-bit grayscale images with optional in-bounds rectangular ROI.\n\
-                                    • Unsupported: Stacks/multislice, RGB/16-bit, non-rectangular selections, active thresholds, custom LUTs/calibration, interactive dialogs, or macro replay.",
+                                    • Supported: 8/16/32-bit grayscale and RGB, plain Z-stacks, an in-bounds rectangular ROI, and one standard parameter dialog.\n\
+                                    • Unsupported: Hyperstacks, non-rectangular selections, active thresholds, custom LUTs/calibration, preview, and custom or multiple dialogs.",
                                 );
                             });
 

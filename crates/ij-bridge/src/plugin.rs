@@ -70,6 +70,8 @@ pub enum PluginBridgeError {
     ProtocolError { error: String, raw: String },
     #[error("PlugInFilter input is outside the supported subset: {0}")]
     UnsupportedFilterInput(#[from] PluginFilterInputError),
+    #[error("PlugInFilter requires parameters for {schema:?}")]
+    DialogRequired { schema: PluginDialogSchema },
     #[error("PlugInFilter host rejected the request: {message}")]
     FilterRejected { message: String },
     #[error("PlugInFilter host I/O failure: {message}")]
@@ -375,6 +377,110 @@ fn validate_inspection_class_name(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+/// Metadata captured at the first showDialog(), before any getters execute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginDialogSchema {
+    pub title: String,
+    pub fields: Vec<PluginDialogField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginDialogField {
+    pub key: String,
+    pub label: String,
+    #[serde(rename = "default")]
+    pub default_value: String,
+    #[serde(flatten)]
+    pub kind: PluginDialogFieldKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PluginDialogFieldKind {
+    Numeric { digits: i32, units: Option<String> },
+    String,
+    Choice { choices: Vec<String> },
+    Checkbox,
+}
+
+impl PluginDialogSchema {
+    pub fn default_values(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .map(|f| f.default_value.clone())
+            .collect()
+    }
+
+    /// ImageJ Macro.trimKey keys are supplied by the Java adapter. Checkbox
+    /// false is absence, even if its dialog default is true (GenericDialog 1352).
+    pub fn macro_options(&self, values: &[String]) -> Result<String, String> {
+        if values.len() != self.fields.len() {
+            return Err("Parameter count does not match the dialog".into());
+        }
+        let mut options = Vec::new();
+        for (field, value) in self.fields.iter().zip(values) {
+            match &field.kind {
+                PluginDialogFieldKind::Checkbox => match value.as_str() {
+                    "true" => options.push(field.key.clone()),
+                    "false" => {}
+                    _ => return Err(format!("{} must be true or false", field.label)),
+                },
+                PluginDialogFieldKind::Numeric { .. } => {
+                    let number = value
+                        .parse::<f64>()
+                        .map_err(|_| format!("{} requires a number", field.label))?;
+                    if !number.is_finite() {
+                        return Err(format!("{} requires a finite number", field.label));
+                    }
+                    // GenericDialog.trim removes .0/.00 for the recorder.
+                    let text = value
+                        .strip_suffix(".00")
+                        .or_else(|| value.strip_suffix(".0"))
+                        .unwrap_or(value);
+                    options.push(format!("{}={text}", field.key));
+                }
+                kind => {
+                    if let PluginDialogFieldKind::Choice { choices } = kind {
+                        if !choices.contains(value) {
+                            return Err(format!("{} requires a listed choice", field.label));
+                        }
+                    }
+                    // Macro.getValue supports balanced bracket literals. Reject
+                    // ambiguous literals instead of silently truncating a value.
+                    let mut depth = 0i32;
+                    for ch in value.chars() {
+                        if ch == '[' {
+                            depth += 1;
+                        }
+                        if ch == ']' {
+                            depth -= 1;
+                        }
+                        if depth < 0 {
+                            return Err(format!("{} contains unbalanced brackets", field.label));
+                        }
+                    }
+                    if depth != 0 || value.contains(['\n', '\r', '\0']) || value.starts_with('&') {
+                        return Err(format!(
+                            "{} cannot be represented as a literal macro option",
+                            field.label
+                        ));
+                    }
+                    let literal = if value.is_empty()
+                        || value.contains([' ', '[', ']'])
+                        || value.starts_with('\'')
+                    {
+                        format!("[{value}]")
+                    } else {
+                        value.clone()
+                    };
+                    options.push(format!("{}={literal}", field.key));
+                }
+            }
+        }
+        Ok(options.join(" "))
+    }
+}
+
 /// Request for the narrow PlugInFilter path.
 ///
 /// The image is transferred through a temporary TIFF and the returned image is
@@ -386,6 +492,8 @@ fn validate_inspection_class_name(name: &str) -> Result<&str, String> {
 /// `PlugInFilterRunner.checkImagePlus`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginFilterRequest {
+    /// None discovers a dialog; Some executes it with ImageJ macro options.
+    pub macro_options: Option<String>,
     pub plugin_classpath: Vec<PathBuf>,
     pub class_name: String,
     pub arg: String,
@@ -406,9 +514,15 @@ impl PluginFilterRequest {
             class_name: class_name.into(),
             arg: arg.into(),
             command: String::new(),
+            macro_options: None,
             image,
             work_dir: None,
         }
+    }
+
+    pub fn with_macro_options(mut self, options: impl Into<String>) -> Self {
+        self.macro_options = Some(options.into());
+        self
     }
 
     pub fn with_command(mut self, command: impl Into<String>) -> Self {
@@ -460,6 +574,9 @@ pub struct PluginFilterRun {
 #[serde(rename_all = "snake_case", tag = "status")]
 enum PluginFilterHostStatus {
     Success,
+    DialogRequired {
+        schema: PluginDialogSchema,
+    },
     ClassNotFound {
         message: String,
     },
@@ -1208,6 +1325,9 @@ impl PluginBridge {
         cmd.arg("--class").arg(&request.class_name);
         cmd.arg("--arg").arg(&request.arg);
         cmd.arg("--command").arg(&request.command);
+        if let Some(options) = &request.macro_options {
+            cmd.arg("--macro-options").arg(options);
+        }
         if let Some(Roi::Rect(rect)) = &request.image.roi {
             cmd.arg("--roi").arg(format!(
                 "{},{},{},{}",
@@ -1277,6 +1397,9 @@ impl PluginBridge {
 
         match output.status {
             PluginFilterHostStatus::Success => {}
+            PluginFilterHostStatus::DialogRequired { schema } => {
+                return Err(PluginBridgeError::DialogRequired { schema });
+            }
             PluginFilterHostStatus::ClassNotFound { message } => {
                 return Err(PluginBridgeError::FilterClassNotFound { message });
             }
