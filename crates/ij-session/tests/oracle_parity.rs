@@ -860,6 +860,210 @@ fn parity_rgb_area_fraction_is_zero_like_java_oracle() {
     );
 }
 
+/// `Analyze > Set Measurements...` flags exercised by the LIMIT tests.
+/// Analyzer.measure always requests AREA+MEAN+STD_DEV+MODE+MIN_MAX+MEDIAN
+/// (Analyzer.java 512), so those columns must all follow the threshold.
+const LIMIT_MEASUREMENTS: &str = "area mean standard min centroid center integrated median \
+                                  skewness kurtosis limit decimal=3";
+
+fn limit_measurement_config() -> MeasurementConfig {
+    MeasurementConfig {
+        flags: MeasurementFlags::AREA
+            | MeasurementFlags::MEAN
+            | MeasurementFlags::STD_DEV
+            | MeasurementFlags::MIN_MAX
+            | MeasurementFlags::CENTROID
+            | MeasurementFlags::CENTER_OF_MASS
+            | MeasurementFlags::INTEGRATED_DENSITY
+            | MeasurementFlags::MEDIAN
+            | MeasurementFlags::SKEWNESS
+            | MeasurementFlags::KURTOSIS
+            | MeasurementFlags::LIMIT,
+        precision: 3,
+    }
+}
+
+/// Every column the LIMIT statistics can change, including the two integrated
+/// densities (Analyzer.java 652-655).
+fn assert_limit_measurement_columns(
+    stats: &MeasurementSummary,
+    columns: &BTreeMap<String, String>,
+) {
+    let expected = [
+        ("Area", stats.area),
+        ("Mean", stats.mean),
+        ("StdDev", stats.std_dev),
+        ("Min", stats.min),
+        ("Max", stats.max),
+        ("X", stats.x_centroid),
+        ("Y", stats.y_centroid),
+        ("XM", stats.x_center_of_mass),
+        ("YM", stats.y_center_of_mass),
+        ("IntDen", stats.int_den),
+        ("Median", stats.median),
+        ("Skew", stats.skewness),
+        ("Kurt", stats.kurtosis),
+        ("RawIntDen", stats.raw_int_den),
+    ];
+    for (name, value) in expected {
+        let oracle = columns
+            .get(name)
+            .unwrap_or_else(|| panic!("oracle did not report column {name}"));
+        assert_eq!(
+            &format_ij_num(value),
+            oracle,
+            "column {name} differs (full oracle row: {columns:?})"
+        );
+    }
+}
+
+#[test]
+fn parity_8bit_limit_to_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '8-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             setThreshold(100, 200); \
+             run(\"Set Measurements...\", \"{LIMIT_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+
+    let mut doc = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 100.0,
+        upper: 200.0,
+    });
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+
+    // ByteStatistics restricts the histogram statistics, centroid and moments
+    // to the truncated threshold bins (ByteStatistics.java 21-51).
+    assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_16bit_limit_to_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '16-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             setThreshold(20000, 45000); \
+             run(\"Set Measurements...\", \"{LIMIT_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+
+    let mut doc = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 20000.0,
+        upper: 45000.0,
+    });
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+
+    assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_32bit_limit_to_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '32-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             setThreshold(0.25, 0.75); \
+             run(\"Set Measurements...\", \"{LIMIT_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+
+    let mut doc = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 0.25,
+        upper: 0.75,
+    });
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+
+    assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_limit_flag_without_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '8-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             run(\"Set Measurements...\", \"{LIMIT_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+    // ByteStatistics.java 24-26: with no threshold the LIMIT flag leaves the
+    // 0..255 range intact, so the row equals the ordinary measurement.
+    assert_eq!(stats, doc.measure().unwrap());
+    assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
+
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '16-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             run(\"Set Measurements...\", \"{LIMIT_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+    assert_eq!(stats, doc.measure().unwrap());
+    assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
+
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '32-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             run(\"Set Measurements...\", \"{LIMIT_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    let stats = doc.measure_with_config(limit_measurement_config()).unwrap();
+    assert_eq!(stats, doc.measure().unwrap());
+    assert_limit_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_limit_preserves_full_roi_area_fraction_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // calculateAreaFraction always reads the processor threshold and the full
+    // ROI histogram, independently of LIMIT (ImageStatistics.java 276-293).
+    let oracle = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             setThreshold(100, 200); \
+             run(\"Set Measurements...\", \"area mean area_fraction limit decimal=3\"); \
+             run('Measure');",
+        )
+        .unwrap();
+
+    let mut doc = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 100.0,
+        upper: 200.0,
+    });
+    let config = MeasurementConfig {
+        flags: MeasurementFlags::AREA
+            | MeasurementFlags::MEAN
+            | MeasurementFlags::AREA_FRACTION
+            | MeasurementFlags::LIMIT,
+        precision: 3,
+    };
+    let stats = doc.measure_with_config(config).unwrap();
+    let columns = oracle_columns(&oracle.stdout);
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        columns["%Area"],
+        "full oracle row: {columns:?}"
+    );
+}
+
 fn ramp8_plane(width: u32, height: u32) -> PixelPlane {
     ImageDocument::new_ramp_8bit("plane", width, height)
         .unwrap()

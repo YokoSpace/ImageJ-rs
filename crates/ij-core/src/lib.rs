@@ -2129,8 +2129,28 @@ impl ImageDocument {
     }
 
     pub fn measure(&self) -> Result<MeasurementSummary, CoreError> {
+        self.measure_with_config(MeasurementConfig::default())
+    }
+
+    /// Measures the active ROI/slice with the `Analyze > Set Measurements...`
+    /// options. Only `LIMIT` changes the numbers: when it is enabled and a
+    /// threshold is active, each statistics class clips its histogram and
+    /// moment scans to the threshold range (ByteStatistics.java 21-51,
+    /// ShortStatistics.java 23-63, FloatStatistics.java 22-46). Column
+    /// selection and precision belong to the ResultsTable layer.
+    pub fn measure_with_config(
+        &self,
+        config: MeasurementConfig,
+    ) -> Result<MeasurementSummary, CoreError> {
+        // Analyzer.java 510-511 applies the processor threshold to the profile
+        // FloatProcessor before measuring a line, so LIMIT also clips line stats.
+        let limit = if config.contains(MeasurementFlags::LIMIT) {
+            self.threshold
+        } else {
+            None
+        };
         if let Some(Roi::Line(line)) = &self.roi {
-            return Ok(self.measure_line(*line));
+            return Ok(self.measure_line(*line, limit));
         }
         let (rx, ry, rw, rh) = match &self.roi {
             // A selection entirely outside the image leaves a 0x0 processor
@@ -2149,21 +2169,47 @@ impl ImageDocument {
         };
 
         let raw = match self.plane() {
-            PixelPlane::Gray8(pixels) => {
-                self.measure_byte_like(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
-            }
-            PixelPlane::Color256 { pixels, .. } => {
-                self.measure_byte_like(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
-            }
-            PixelPlane::Gray16(pixels) => {
-                self.measure_short(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
-            }
-            PixelPlane::Gray32(pixels) => {
-                self.measure_float(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
-            }
-            PixelPlane::ColorRgb(pixels) => {
-                self.measure_rgb(pixels, rx, ry, rw, rh, mask.as_ref())
-            }
+            PixelPlane::Gray8(pixels) => self.measure_byte_like(
+                pixels,
+                rx,
+                ry,
+                rw,
+                rh,
+                mask.as_ref(),
+                self.threshold,
+                limit,
+            ),
+            PixelPlane::Color256 { pixels, .. } => self.measure_byte_like(
+                pixels,
+                rx,
+                ry,
+                rw,
+                rh,
+                mask.as_ref(),
+                self.threshold,
+                limit,
+            ),
+            PixelPlane::Gray16(pixels) => self.measure_short(
+                pixels,
+                rx,
+                ry,
+                rw,
+                rh,
+                mask.as_ref(),
+                self.threshold,
+                limit,
+            ),
+            PixelPlane::Gray32(pixels) => self.measure_float(
+                pixels,
+                rx,
+                ry,
+                rw,
+                rh,
+                mask.as_ref(),
+                self.threshold,
+                limit,
+            ),
+            PixelPlane::ColorRgb(pixels) => self.measure_rgb(pixels, rx, ry, rw, rh, mask.as_ref()),
         };
 
         Ok(self.finish_measurement(rx, ry, rw, rh, raw))
@@ -2176,7 +2222,7 @@ impl ImageDocument {
     /// values in a one-row FloatProcessor. Default measurements therefore
     /// report the profile statistics (`Area` is the number of samples), plus
     /// the Results-table-only `Length` and `Angle` columns.
-    fn measure_line(&self, line: LineRoi) -> MeasurementSummary {
+    fn measure_line(&self, line: LineRoi, limit: Option<ThresholdLevels>) -> MeasurementSummary {
         let x1 = line.x1 as f64;
         let y1 = line.y1 as f64;
         let x2 = line.x2 as f64;
@@ -2201,7 +2247,7 @@ impl ImageDocument {
         }
 
         let samples = (n + 1) as u32;
-        let raw = self.measure_float(&profile, 0, 0, samples, 1, None, None);
+        let raw = self.measure_float(&profile, 0, 0, samples, 1, None, None, limit);
         let mut summary = self.finish_measurement(0, 0, samples, 1, raw);
 
         // Line.getLength (Line.java 430-437) and Roi.getFloatAngle
@@ -2396,6 +2442,7 @@ impl ImageDocument {
         rh: u32,
         mask: Option<&RoiMask>,
         threshold: Option<ThresholdLevels>,
+        limit: Option<ThresholdLevels>,
     ) -> RawMeasurement {
         let mut histogram = vec![0u64; 256];
         for y in ry..(ry + rh) {
@@ -2409,23 +2456,40 @@ impl ImageDocument {
             }
         }
 
-        let pixel_count: u64 = histogram.iter().sum();
+        // ByteProcessor.setThreshold clamps the stored levels to 0..255
+        // (ByteProcessor.java 480-486); ByteStatistics then truncates them
+        // with `(int)` (ByteStatistics.java 28-29).
+        let (min_bin, max_bin) = match limit {
+            None => (0, 255),
+            Some(levels) => (
+                (levels.lower as i64).clamp(0, 255) as usize,
+                (levels.upper as i64).clamp(0, 255) as usize,
+            ),
+        };
+        let pixel_count: u64 = if min_bin <= max_bin {
+            histogram[min_bin..=max_bin].iter().sum()
+        } else {
+            0
+        };
         let (min, max) = if pixel_count == 0 {
             (f64::NAN, f64::NAN)
         } else {
-            raw_min_max(&histogram, 0, 255)
+            raw_min_max(&histogram, min_bin, max_bin)
         };
-        let (mode, _) = mode_from_hist(&histogram);
+        let mode = mode_in_range(&histogram, min_bin, max_bin);
         let mut sum = 0.0;
         let mut sum2 = 0.0;
-        for (i, &count) in histogram.iter().enumerate() {
-            let value = i as f64;
-            sum += value * count as f64;
-            sum2 += (value * value) * count as f64;
+        if min_bin <= max_bin {
+            for (i, &count) in histogram[min_bin..=max_bin].iter().enumerate() {
+                let value = (min_bin + i) as f64;
+                sum += value * count as f64;
+                sum2 += (value * value) * count as f64;
+            }
         }
         let mean = sum / pixel_count as f64;
-        let median = median_from_hist(&histogram, 0, 255, pixel_count);
+        let median = median_from_hist(&histogram, min_bin, max_bin, pixel_count);
         let area_fraction = area_fraction_from_histogram(&histogram, threshold);
+        let accept = |v: f64| v >= min_bin as f64 && v <= max_bin as f64;
         let (skewness, kurtosis, x_center_of_mass, y_center_of_mass) = self.raw_moments(
             rx,
             ry,
@@ -2434,11 +2498,11 @@ impl ImageDocument {
             mean,
             |idx| pixels[idx] as f64,
             true,
-            |_| true,
+            |v| accept(v),
             mask,
         );
         let (x_centroid, y_centroid) =
-            self.raw_centroid(rx, ry, rw, rh, |idx| pixels[idx] as f64, |_| true, mask);
+            self.raw_centroid(rx, ry, rw, rh, |idx| pixels[idx] as f64, |v| accept(v), mask);
 
         RawMeasurement {
             histogram,
@@ -2473,6 +2537,7 @@ impl ImageDocument {
         rh: u32,
         mask: Option<&RoiMask>,
         threshold: Option<ThresholdLevels>,
+        limit: Option<ThresholdLevels>,
     ) -> RawMeasurement {
         let mut histogram = vec![0u64; 65536];
         let mut bbox_max = 0u16;
@@ -2498,21 +2563,49 @@ impl ImageDocument {
         } else {
             65536
         };
-        let pixel_count: u64 = histogram.iter().sum();
-        let (min, max) = raw_min_max(&histogram, 0, hist_len - 1);
-        let (mode, _) = mode_from_hist(&histogram);
+        // ShortStatistics.java 30-39 truncates the threshold with `(int)` and
+        // clips only the upper bound to the histogram length.
+        let (min_threshold, max_threshold) = match limit {
+            None => (0i64, hist_len as i64 - 1),
+            Some(levels) => (
+                levels.lower as i64,
+                (levels.upper as i64).min(hist_len as i64 - 1),
+            ),
+        };
+        let (min_bin, max_bin) = short_raw_min_max(
+            &histogram,
+            min_threshold,
+            max_threshold,
+            hist_len,
+        );
+        let in_range = min_bin <= max_bin;
+        let pixel_count: u64 = if in_range {
+            histogram[min_bin..=max_bin].iter().sum()
+        } else {
+            0
+        };
+        let mode = mode_in_range(&histogram, min_bin, max_bin);
         let mut sum = 0.0;
         let mut sum2 = 0.0;
         // ShortStatistics.getStatistics accumulates over the occupied raw range.
-        for i in min as usize..=max as usize {
-            let value = i as f64;
-            let count = histogram[i] as f64;
-            sum += value * count;
-            sum2 += (value * value) * count;
+        if in_range {
+            for (i, &count) in histogram[min_bin..=max_bin].iter().enumerate() {
+                let value = (min_bin + i) as f64;
+                sum += value * count as f64;
+                sum2 += (value * value) * count as f64;
+            }
         }
         let mean = sum / pixel_count as f64;
-        let median = median_from_hist(&histogram, 0, 65535, pixel_count);
+        let median = median_from_hist(
+            &histogram,
+            min_threshold.max(0) as usize,
+            max_threshold.max(0) as usize,
+            pixel_count,
+        );
         let area_fraction = area_fraction_from_histogram(&histogram, threshold);
+        let accept = |v: f64| {
+            v >= min_threshold as f64 && v <= max_threshold as f64
+        };
         let (skewness, kurtosis, x_center_of_mass, y_center_of_mass) = self.raw_moments(
             rx,
             ry,
@@ -2521,12 +2614,15 @@ impl ImageDocument {
             mean,
             |idx| pixels[idx] as f64,
             false,
-            |_| true,
+            |v| accept(v),
             mask,
         );
         let (x_centroid, y_centroid) =
-            self.raw_centroid(rx, ry, rw, rh, |idx| pixels[idx] as f64, |_| true, mask);
+            self.raw_centroid(rx, ry, rw, rh, |idx| pixels[idx] as f64, |v| accept(v), mask);
 
+        // ShortStatistics reports the raw bin indices from getRawMinAndMax even
+        // when the threshold range is empty (min/max are not NaN there).
+        let (min, max) = (min_bin as f64, max_bin as f64);
         RawMeasurement {
             histogram,
             pixel_count,
@@ -2557,9 +2653,14 @@ impl ImageDocument {
         rh: u32,
         mask: Option<&RoiMask>,
         threshold: Option<ThresholdLevels>,
+        limit: Option<ThresholdLevels>,
     ) -> RawMeasurement {
-        let min_threshold = -(f32::MAX as f64);
-        let max_threshold = f32::MAX as f64;
+        // FloatStatistics.java 25-31: with LIMIT the stored double threshold is
+        // used verbatim; otherwise the full ±Float.MAX_VALUE range applies.
+        let (min_threshold, max_threshold) = limit.map_or(
+            (-(f32::MAX as f64), f32::MAX as f64),
+            |levels| (levels.lower, levels.upper),
+        );
 
         let mut roi_min = f64::MAX;
         let mut roi_max = -f64::MAX;
@@ -2998,6 +3099,47 @@ fn raw_min_max(histogram: &[u64], min_threshold: usize, max_threshold: usize) ->
         max -= 1;
     }
     (min as f64, max as f64)
+}
+
+/// `ShortStatistics.getRawMinAndMax` (ShortStatistics.java 66-77). The scan
+/// starts at the truncated threshold and, unlike `raw_min_max`, may walk the
+/// lower bound past the histogram length when the threshold excludes every
+/// pixel (the caller then reports an empty range).
+fn short_raw_min_max(
+    histogram: &[u64],
+    min_threshold: i64,
+    max_threshold: i64,
+    hist_len: usize,
+) -> (usize, usize) {
+    let hist_len = hist_len as i64;
+    let mut min = min_threshold;
+    if min >= 0 && min < hist_len {
+        while histogram[min as usize] == 0 && min < hist_len - 1 {
+            min += 1;
+        }
+    }
+    let mut max = max_threshold;
+    while max > 0 && histogram[max as usize] == 0 {
+        max -= 1;
+    }
+    (min.max(0) as usize, max.max(0) as usize)
+}
+
+/// `dmode` from the restricted `ImageStatistics` accumulation loop: the first
+/// value with the highest count, or 0 when the range is empty
+/// (ImageStatistics.java 129-132, ShortStatistics.java 101-106).
+fn mode_in_range(histogram: &[u64], min: usize, max: usize) -> usize {
+    let mut max_count = 0u64;
+    let mut mode = 0usize;
+    if min <= max && max < histogram.len() {
+        for (i, &count) in histogram[min..=max].iter().enumerate() {
+            if count > max_count {
+                max_count = count;
+                mode = min + i;
+            }
+        }
+    }
+    mode
 }
 
 fn mode_from_hist(histogram: &[u64]) -> (usize, u64) {
