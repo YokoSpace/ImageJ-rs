@@ -167,6 +167,8 @@ mod cocoa {
         unsafe {
             boolean1(item, c"setEnabled:", spec.enabled);
             integer1(item, c"setState:", isize::from(spec.checked));
+            object1(item, c"setToolTip:", spec.disabled_reason.as_ref()
+                .map(|reason| string(reason)).unwrap_or(std::ptr::null_mut()));
         }
     }
 
@@ -274,6 +276,9 @@ mod cocoa {
                 if state.target == 0 {
                     return false;
                 }
+            }
+            if state.menu == menu as usize && state.spec == spec {
+                return true;
             }
             if state.menu == menu as usize && same_structure(&state.spec, spec) {
                 let mut flat = Vec::new();

@@ -17,10 +17,12 @@ use ij_bridge::plugin_discovery::{
     DiscoveredPlugin, InspectionOptions, InspectionSummary, PluginCatalog, PluginDiscoveryError,
     ScanOptions,
 };
-use ij_core::{MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, Roi};
+use ij_core::{
+    MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, Roi,
+};
 use ij_session::{
-    Command, CommandOutcome, HistogramSummary, ImageId, PluginFilterOutcome, PluginFilterTicket, Session,
-    SessionError,
+    Command, CommandOutcome, HistogramSummary, ImageId, PluginFilterOutcome, PluginFilterTicket,
+    Session, SessionError,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -28,22 +30,27 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
-mod menu;
 mod adjust_dialogs;
+mod close_guard;
+mod histogram_window;
 mod image_window;
+mod menu;
 mod plugin_ops;
 mod plugins_ui;
-mod close_guard;
 mod shortcuts;
-mod histogram_window;
-pub use self::histogram_window::HistogramWindowState;
-pub use self::menu::scrollable_menu;
-pub use self::image_window::{animation_slider_axis, draw_ellipse_stroke};
 pub use self::adjust_dialogs::{
-    PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SetMeasurementsDialog, SetMeasurementsOption,
-    SET_MEASUREMENTS_FIRST_GROUP, SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS,
-    SET_MEASUREMENTS_OPTIONS, SET_MEASUREMENTS_SECOND_ROWS, clamp_set_measurements_precision,
-    plot_profile_runs, plot_profile_short_title, set_measurements_slot,
+    PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SET_MEASUREMENTS_FIRST_GROUP,
+    SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS, SET_MEASUREMENTS_OPTIONS,
+    SET_MEASUREMENTS_SECOND_ROWS, SetMeasurementsDialog, SetMeasurementsOption,
+    clamp_set_measurements_precision, plot_profile_runs, plot_profile_short_title,
+    set_measurements_slot,
+};
+pub use self::histogram_window::HistogramWindowState;
+pub use self::image_window::{animation_slider_axis, draw_ellipse_stroke};
+pub use self::menu::scrollable_menu;
+pub use self::plugin_ops::{
+    PluginCatalogCacheLoad, PluginCatalogCacheState, PluginMenuEntry,
+    default_plugin_catalog_cache_path, load_plugin_catalog_cache, save_plugin_catalog_cache,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +185,11 @@ pub struct ImageJApp {
     pub pending_plugin_catalog_job: Option<PendingPluginCatalogJob>,
     /// Invalidates late worker results after cancel, timeout or a newer scan.
     plugin_catalog_generation: u64,
+    /// JSON cache location. Tests replace this with a temp path so the
+    /// developer's platform config directory is never read or written.
+    pub plugin_catalog_cache_path: Option<PathBuf>,
+    /// Explicit result of the one-time startup cache load.
+    pub plugin_catalog_cache_state: PluginCatalogCacheState,
     pub quit_app: bool,
     pub animations: HashMap<ImageId, AnimationState>,
     texture_cache: HashMap<ImageId, (u64, egui::TextureHandle)>,
@@ -223,6 +235,8 @@ impl ImageJApp {
             plugins_browser: PluginBrowserState::default(),
             pending_plugin_catalog_job: None,
             plugin_catalog_generation: 0,
+            plugin_catalog_cache_path: default_plugin_catalog_cache_path(),
+            plugin_catalog_cache_state: PluginCatalogCacheState::NotLoaded,
             quit_app: false,
             animations: HashMap::new(),
             texture_cache: HashMap::new(),
@@ -949,7 +963,8 @@ impl ImageJApp {
     }
 
     pub fn advance_animations(&mut self, now_secs: f64) -> usize {
-        self.animations.retain(|id, _| self.session.get_image(*id).is_some());
+        self.animations
+            .retain(|id, _| self.session.get_image(*id).is_some());
 
         let mut to_advance = Vec::new();
         for (&id, state) in &mut self.animations {
@@ -1029,11 +1044,7 @@ impl ImageJApp {
         }
         true
     }
-
-
-
 }
-
 
 impl eframe::App for ImageJApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {

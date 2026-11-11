@@ -6,12 +6,51 @@ impl ImageJApp {
         egui::menu::bar(ui, |ui| {
             for node in MENU_TREE {
                 if let MenuKind::Submenu(children) = node.kind {
+                    // The Plugins menu appends the loaded catalog below the
+                    // fixed ImageJ items. Other menus stay table-driven.
+                    let is_plugins = node.label == "Plugins";
                     ui.menu_button(node.label, |ui| {
-                        scrollable_menu(ui, |ui| self.render_menu_nodes(ui, children));
+                        scrollable_menu(ui, |ui| {
+                            self.render_menu_nodes(ui, children);
+                            if is_plugins {
+                                self.render_plugin_catalog_menu(ui);
+                            }
+                        });
                     });
                 }
             }
         });
+    }
+
+    /// Dynamic rows for installed plugins that were scanned or restored from
+    /// the JSON cache. Disabled rows keep the concrete block reason visible.
+    fn render_plugin_catalog_menu(&mut self, ui: &mut egui::Ui) {
+        let entries = self.plugin_menu_entries();
+        if entries.is_empty() {
+            return;
+        }
+        ui.separator();
+        for PluginMenuEntry {
+            index,
+            label,
+            source,
+            enabled,
+            reason,
+        } in entries
+        {
+            let response = ui.add_enabled(enabled, egui::Button::new(label));
+            let response = response.on_hover_text(format!("Source: {source}"));
+            let response = match reason {
+                Some(reason) => response.on_disabled_hover_text(reason),
+                None => response,
+            };
+            if response.clicked() {
+                if let Err(error) = self.run_catalog_plugin_immediately(index) {
+                    self.status_message = format!("Cannot run plugin: {error}");
+                }
+                ui.close_menu();
+            }
+        }
     }
 
     fn render_menu_nodes(&mut self, ui: &mut egui::Ui, nodes: &[MenuNode]) {

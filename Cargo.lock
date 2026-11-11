@@ -1571,6 +1571,8 @@ dependencies = [
  "ij-io",
  "ij-session",
  "rfd",
+ "serde",
+ "serde_json",
  "tempfile",
  "zip",
 ]

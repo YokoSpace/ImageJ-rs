@@ -366,8 +366,8 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
 
 ## 5.5 ここまでの進捗（2026-11-11 時点）
 
-- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1–M7, S1–S2, N0–N1, 英語・日本語 README。
-- **残りの Phase 2 タスク**: P1（Plugins メニュー直結）。
+- **完了済み**: F0–F5, D1, D2a, D2b, A1–A4, R1–R5, M1–M7, S1–S2, N0–N1, P1, 英語・日本語 README。
+- **機能実装済み・監査の残り**: `Results... `（読込）と `Results...`（保存）の台帳分類の是正。メニュー網羅テストの空白除去は、この区別を隠すため除去予定。見た目の厳密な実機比較も未実施。
 
 以下では、残りのタスクを `deepseek-V4.1-flash` / `Gemini flash` / `Claude Sonnet` が迷わず1タスクずつ完結できるよう、サブタスク・型シグネチャ・Java 参照行・先に書くテスト・非ゴールまで具体化しています。
 
@@ -691,7 +691,7 @@ N0 実機スパイク（2026-11-11）: **Go**。`native_menu_spec_test::native_a
     - `menu.rs` の `Plugins` メニュー描画で、`MENU_TREE` の固定項目の下に、ロード済みカタログのエントリを並べる。
     - 互換性があり現在のアクティブ画像で実行可能なエントリ（`plugin_prefill_block_reason(idx).is_none()`）は有効ボタンとし、クリックされたら `run_catalog_plugin_immediately(idx)`（内部で `prefill_plugin_filter_from_catalog(idx)` と `start_plugin_filter_execution()` を続けて呼ぶ）を実行する。
     - ブロック理由があるエントリは無効ボタン（`add_enabled(false, ...)`）とし、`on_disabled_hover_text(reason)` で理由を表示する。
-- **編集してよいファイル**: `crates/ij-app/src/app/plugin_ops.rs`, `crates/ij-app/src/app/plugins_ui.rs`, `crates/ij-app/src/app/menu.rs`, `crates/ij-app/tests/plugin_menu_direct_run_test.rs`（新規）
+- **編集してよいファイル**: `crates/ij-app/src/app/plugin_ops.rs`, `crates/ij-app/src/app/plugins_ui.rs`, `crates/ij-app/src/app/menu.rs`, `crates/ij-app/tests/plugin_menu_direct_run_test.rs`（新規）。ユーザー承認済みの追加: `crates/ij-app/Cargo.toml`, `Cargo.lock`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/src/dialogs.rs`
 - **先に書くテスト**:
   - `plugin_menu_direct_run_test.rs`: (a) カタログキャッシュの保存→再読込の往復一致と破損 JSON 時の空フォールバック、(b) リファレンス `Invert8BitFilter` が入ったカタログと 8-bit アクティブ画像がある状態で、`run_catalog_plugin_immediately` を 1 回呼ぶだけでバックグラウンド実行が開始され、完了後に画素が反転すること、(c) 16-bit 画像がアクティブなときは同じエントリがブロック理由付きで拒否されること。
 - **受け入れ条件**: `./tools/verify.sh` が `VERIFY_ALL_OK`。

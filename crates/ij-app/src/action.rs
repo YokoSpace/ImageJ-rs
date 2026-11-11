@@ -43,6 +43,7 @@ pub enum AppAction {
     ClearResults,
     InstalledPlugins,
     RunPluginFilter,
+    RunCatalogPlugin { index: usize, generation: u64 },
     ToggleResults,
     ActivateImage(ImageId),
     About,
@@ -240,6 +241,7 @@ pub struct NativeMenuSpec {
     pub shortcut: Option<NativeShortcut>,
     pub action: Option<AppAction>,
     pub enabled: bool,
+    pub disabled_reason: Option<String>,
     pub checked: bool,
     pub is_separator: bool,
     pub children: Vec<NativeMenuSpec>,
@@ -268,7 +270,28 @@ impl ImageJApp {
     /// Converts the shared menu table into an OS-independent native menu tree.
     /// `WindowList` expands in place to one selectable entry per open image.
     pub fn build_native_menu_spec(&self) -> Vec<NativeMenuSpec> {
-        self.build_native_menu_nodes(MENU_TREE)
+        let mut spec = self.build_native_menu_nodes(MENU_TREE);
+        let entries = self.plugin_menu_entries();
+        if !entries.is_empty() {
+            if let Some(menu) = spec.iter_mut().find(|menu| menu.label == "Plugins") {
+                menu.children.push(NativeMenuSpec {
+                    label: String::new(), shortcut: None, action: None,
+                    enabled: false, disabled_reason: None, checked: false,
+                    is_separator: true, children: Vec::new(),
+                });
+                for entry in entries {
+                    menu.children.push(NativeMenuSpec {
+                        label: entry.label, shortcut: None,
+                        action: Some(AppAction::RunCatalogPlugin {
+                            index: entry.index, generation: self.plugin_menu_generation(),
+                        }),
+                        enabled: entry.enabled, disabled_reason: entry.reason,
+                        checked: false, is_separator: false, children: Vec::new(),
+                    });
+                }
+            }
+        }
+        spec
     }
 
     fn build_native_menu_nodes(&self, nodes: &[MenuNode]) -> Vec<NativeMenuSpec> {
@@ -286,6 +309,7 @@ impl ImageJApp {
                 shortcut: native_shortcut(node.shortcut),
                 action: Some(action),
                 enabled: self.action_enabled(action).is_ok(),
+                disabled_reason: self.action_enabled(action).err(),
                 checked: false,
                 is_separator: false,
                 children: Vec::new(),
@@ -295,6 +319,7 @@ impl ImageJApp {
                 shortcut: None,
                 action: None,
                 enabled: true,
+                disabled_reason: None,
                 checked: false,
                 is_separator: false,
                 children: self.build_native_menu_nodes(children),
@@ -304,6 +329,7 @@ impl ImageJApp {
                 shortcut: None,
                 action: None,
                 enabled: false,
+                disabled_reason: None,
                 checked: false,
                 is_separator: true,
                 children: Vec::new(),
@@ -313,6 +339,7 @@ impl ImageJApp {
                 shortcut: None,
                 action: None,
                 enabled: false,
+                disabled_reason: Some("Not implemented in ImageJ-rs yet".into()),
                 checked: false,
                 is_separator: false,
                 children: Vec::new(),
@@ -330,6 +357,7 @@ impl ImageJApp {
                         shortcut: None,
                         action: Some(action),
                         enabled: self.action_enabled(action).is_ok(),
+                        disabled_reason: self.action_enabled(action).err(),
                         checked: self.active_image_id() == Some(id),
                         is_separator: false,
                         children: Vec::new(),
@@ -344,6 +372,13 @@ impl ImageJApp {
     pub fn action_enabled(&self, action: AppAction) -> Result<(), String> {
         use AppAction::*;
         match action {
+            RunCatalogPlugin { index, generation } => {
+                if generation != self.plugin_menu_generation() {
+                    Err("Plugin catalog changed; select the current menu entry".into())
+                } else {
+                    self.plugin_prefill_block_reason(index).map_or(Ok(()), Err)
+                }
+            }
             // Set Measurements is a user-option dialog, not an image command:
             // ImageJ's Analyze menu enables it with no image open.
             NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
@@ -596,6 +631,11 @@ impl ImageJApp {
             }
             RunPluginFilter => {
                 self.open_plugin_filter_dialog();
+            }
+            RunCatalogPlugin { index, .. } => {
+                if let Err(error) = self.run_catalog_plugin_immediately(index) {
+                    self.dialogs.last_error = Some(error);
+                }
             }
             ToggleResults => {
                 self.show_results_window = !self.show_results_window;

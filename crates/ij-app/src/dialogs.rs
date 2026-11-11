@@ -1,4 +1,4 @@
-use ij_bridge::plugin_discovery::{DiscoveredPlugin, PluginCatalog, PluginKind};
+use ij_bridge::plugin_discovery::{DiscoveredPlugin, PluginCatalog, PluginKind, PluginSource};
 use ij_session::ImageId;
 use std::path::PathBuf;
 
@@ -123,6 +123,11 @@ pub struct PluginBrowserState {
     /// One-line user-facing status for the browser (scan/inspection/cancel).
     pub status: Option<String>,
     pub inspect_phase: PluginInspectPhase,
+    /// Per-entry source/classpath validation for a catalog restored from the
+    /// JSON cache. `None` means the source and classpath were present when the
+    /// cache was loaded; `Some(reason)` disables the entry without pretending
+    /// the inspection result is still executable.
+    pub source_block_reasons: Vec<Option<String>>,
 }
 
 impl PluginBrowserState {
@@ -245,6 +250,57 @@ pub fn split_plugin_class_spec(spec: &str) -> (String, Option<String>) {
         }
     }
     (trimmed.to_string(), None)
+}
+
+/// Validates that a catalog entry still has a real source file and that every
+/// classpath entry it was inspected with still exists.
+///
+/// A cached inspection only proves what the class was when it was inspected.
+/// After a reload the files may be gone, so the entry must stay visible but
+/// disabled instead of looking like a verified executable.
+pub fn plugin_source_block_reason(
+    plugin: &DiscoveredPlugin,
+    classpath: &[PathBuf],
+) -> Option<String> {
+    plugin_source_file_missing_reason(plugin).or_else(|| plugin_classpath_missing_reason(classpath))
+}
+
+/// Source-file half of [`plugin_source_block_reason`]. Split out so a cache
+/// load can validate the classpath once instead of once per entry.
+pub fn plugin_source_file_missing_reason(plugin: &DiscoveredPlugin) -> Option<String> {
+    match &plugin.source {
+        PluginSource::ClassFile { path } => {
+            if !path.is_file() {
+                return Some(format!(
+                    "Source class file no longer exists: {}. Re-scan the plugins directory.",
+                    path.display()
+                ));
+            }
+        }
+        PluginSource::Archive { archive, .. } => {
+            if !archive.is_file() {
+                return Some(format!(
+                    "Source archive no longer exists: {}. Re-scan the plugins directory.",
+                    archive.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Classpath half of [`plugin_source_block_reason`].
+pub fn plugin_classpath_missing_reason(classpath: &[PathBuf]) -> Option<String> {
+    if classpath.is_empty() {
+        return Some("The plugin classpath is empty. Re-scan the plugins directory.".to_string());
+    }
+    if let Some(missing) = classpath.iter().find(|path| !path.exists()) {
+        return Some(format!(
+            "Plugin classpath entry no longer exists: {}. Re-scan the plugins directory.",
+            missing.display()
+        ));
+    }
+    None
 }
 
 /// Returns why the narrow PlugInFilter dialog may not be prefilled from the

@@ -1,6 +1,14 @@
 use super::*;
+use serde::Serialize;
+use std::fs;
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 impl ImageJApp {
+    pub fn plugin_menu_generation(&self) -> u64 {
+        self.plugin_catalog_generation
+    }
+
     pub fn detect_repo_root() -> Option<PathBuf> {
         if let Ok(dir) = std::env::var("IJ_REPO_ROOT") {
             let p = PathBuf::from(dir);
@@ -146,6 +154,9 @@ impl ImageJApp {
         if self.is_plugin_catalog_busy() {
             return Err("A plugin scan or inspection is already running.".to_string());
         }
+        // Consume the one-time startup load before replacing the catalog. A
+        // later failed scan must not be followed by an old cache reappearing.
+        self.load_plugin_catalog_cache_at_startup();
         let directory = directory.into();
         let display = directory.display().to_string();
         self.plugins_browser.directory_input = display.clone();
@@ -154,6 +165,7 @@ impl ImageJApp {
         self.plugins_browser.phase = PluginCatalogPhase::Scanning;
         self.plugins_browser.inspect_phase = PluginInspectPhase::Idle;
         self.plugins_browser.catalog = None;
+        self.plugins_browser.source_block_reasons.clear();
         self.plugins_browser.selected = None;
         self.plugins_browser.scan_error = None;
         self.plugins_browser.status = Some(format!("Scanning {display}..."));
@@ -291,6 +303,12 @@ impl ImageJApp {
     /// Polls the background catalog job once. Returns `true` when visible state
     /// changed (so the caller can request a repaint).
     pub fn poll_plugin_catalog_job(&mut self) -> bool {
+        // The first UI frame performs the one-time startup load. Doing it here
+        // (instead of in `new`) keeps unit tests that never render from reading
+        // the developer's real config directory.
+        if self.load_plugin_catalog_cache_at_startup() {
+            return true;
+        }
         let Some(job) = self.pending_plugin_catalog_job.take() else {
             return false;
         };
@@ -308,17 +326,24 @@ impl ImageJApp {
                     let warnings = catalog.warnings.len();
                     let truncated = catalog.warnings_truncated;
                     self.plugins_browser.catalog = Some(catalog);
+                    self.plugins_browser.source_block_reasons = vec![None; entries];
                     self.plugins_browser.phase = PluginCatalogPhase::Ready;
                     self.plugins_browser.selected = None;
                     self.plugins_browser.scan_error = None;
                     self.plugins_browser.inspect_phase = PluginInspectPhase::Idle;
+                    // Only a completed scan is persisted. Canceled, timed-out
+                    // and failed jobs never reach this branch.
+                    let cache_error = self.save_current_plugin_catalog_cache().err();
                     self.plugins_browser.status = Some(format!(
-                        "Scan complete: {entries} entries, {warnings} warnings{}.",
+                        "Scan complete: {entries} entries, {warnings} warnings{}.{}",
                         if truncated {
                             " (warning limit reached)"
                         } else {
                             ""
-                        }
+                        },
+                        cache_error
+                            .map(|error| format!(" Cache save failed: {error}"))
+                            .unwrap_or_default()
                     ));
                     self.status_message = format!(
                         "Plugin scan complete: {entries} entries, {warnings} warnings{}",
@@ -335,6 +360,7 @@ impl ImageJApp {
                         return false;
                     }
                     self.plugins_browser.catalog = None;
+                    self.plugins_browser.source_block_reasons.clear();
                     self.plugins_browser.phase = PluginCatalogPhase::Failed;
                     self.plugins_browser.selected = None;
                     self.plugins_browser.inspect_phase = PluginInspectPhase::Idle;
@@ -349,6 +375,7 @@ impl ImageJApp {
                         self.plugin_catalog_generation =
                             self.plugin_catalog_generation.wrapping_add(1);
                         self.plugins_browser.catalog = None;
+                        self.plugins_browser.source_block_reasons.clear();
                         self.plugins_browser.phase = PluginCatalogPhase::Failed;
                         self.plugins_browser.selected = None;
                         self.plugins_browser.inspect_phase = PluginInspectPhase::Idle;
@@ -374,6 +401,7 @@ impl ImageJApp {
                         return false;
                     }
                     self.plugins_browser.catalog = None;
+                    self.plugins_browser.source_block_reasons.clear();
                     self.plugins_browser.phase = PluginCatalogPhase::Failed;
                     self.plugins_browser.selected = None;
                     self.plugins_browser.inspect_phase = PluginInspectPhase::Idle;
@@ -405,27 +433,35 @@ impl ImageJApp {
                     if generation != self.plugin_catalog_generation {
                         return false;
                     }
-                    let Some(catalog) = self.plugins_browser.catalog.as_mut() else {
-                        return false;
-                    };
-                    let Some(slot) = catalog.plugins.get_mut(index) else {
-                        return false;
-                    };
                     let label = inspected.label.clone();
                     let kind = inspected.kind;
-                    *slot = inspected;
+                    {
+                        let Some(catalog) = self.plugins_browser.catalog.as_mut() else {
+                            return false;
+                        };
+                        let Some(slot) = catalog.plugins.get_mut(index) else {
+                            return false;
+                        };
+                        *slot = inspected;
+                    }
                     if self.plugins_browser.selected.is_none() {
                         self.plugins_browser.selected = Some(index);
                     }
                     self.plugins_browser.inspect_phase = PluginInspectPhase::Done { index };
+                    // Persist only a completed inspection. Cancellation,
+                    // timeout and failure branches below never save.
+                    let cache_error = self.save_current_plugin_catalog_cache().err();
                     self.plugins_browser.status = Some(format!(
-                        "Inspected \"{label}\": {}. Inspected {}, supported {}, unsupported {}, internal {}, load-failed {}.",
+                        "Inspected \"{label}\": {}. Inspected {}, supported {}, unsupported {}, internal {}, load-failed {}.{}",
                         plugin_kind_badge(kind),
                         summary.inspected,
                         summary.supported,
                         summary.unsupported,
                         summary.internal,
-                        summary.load_failed
+                        summary.load_failed,
+                        cache_error
+                            .map(|error| format!(" Cache save failed: {error}"))
+                            .unwrap_or_default()
                     ));
                     self.status_message =
                         format!("Inspected \"{label}\": {}", plugin_kind_badge(kind));
@@ -507,6 +543,22 @@ impl ImageJApp {
     /// Why the selected entry may not prefill the narrow dialog (computed
     /// against the image active *now*), or `None` when prefill is allowed.
     pub fn plugin_prefill_block_reason(&self, index: usize) -> Option<String> {
+        // A close/quit confirmation owns document state. One-click runs must
+        // not be offered while that modal is unresolved.
+        if self.pending_close.is_some() || self.quit_app {
+            return Some("Resolve the close/quit confirmation first.".to_string());
+        }
+        // A cached inspection is not proof that the source still exists. The
+        // load step records this once so menu rendering does not stat every
+        // classpath entry on every frame.
+        if let Some(reason) = self
+            .plugins_browser
+            .source_block_reasons
+            .get(index)
+            .and_then(|reason| reason.clone())
+        {
+            return Some(reason);
+        }
         let plugin = self
             .plugins_browser
             .catalog
@@ -873,5 +925,465 @@ impl ImageJApp {
                 Err(err)
             }
         }
+    }
+}
+
+/// One dynamic row under the `Plugins` menu.
+///
+/// This is a plain data snapshot so headless tests can assert exactly what the
+/// menu would show without simulating OS-level menu clicks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginMenuEntry {
+    pub index: usize,
+    pub label: String,
+    pub source: String,
+    /// True only when `plugin_prefill_block_reason(index)` is `None`.
+    pub enabled: bool,
+    /// Concrete disabled-hover reason when `enabled` is false.
+    pub reason: Option<String>,
+}
+
+/// Schema version of the JSON plugin-catalog cache.
+///
+/// Bump this whenever `PluginCatalog`'s persisted shape changes so an old file
+/// is rejected as unsupported instead of being half-deserialized.
+pub const PLUGIN_CATALOG_CACHE_SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound on a cache file read. The interactive scan options already
+/// bound the catalog itself; this stops a corrupt or hostile file from being
+/// read into memory before JSON parsing can reject it.
+pub const PLUGIN_CATALOG_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Explicit result of the one-time startup cache load.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum PluginCatalogCacheState {
+    #[default]
+    NotLoaded,
+    /// No platform config path could be resolved.
+    Disabled,
+    Loaded {
+        entries: usize,
+    },
+    Missing,
+    Unreadable {
+        message: String,
+    },
+    Corrupt {
+        message: String,
+    },
+    TooLarge {
+        size: u64,
+        limit: u64,
+    },
+    UnsupportedSchema {
+        found: u32,
+        supported: u32,
+    },
+}
+
+/// Result of reading a cache file. `catalog` is `None` for every fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCatalogCacheLoad {
+    pub state: PluginCatalogCacheState,
+    pub catalog: Option<PluginCatalog>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginCatalogCacheEnvelopeRef<'a> {
+    schema_version: u32,
+    catalog: &'a PluginCatalog,
+}
+
+/// Stable per-user cache location. Never inside the repository and never next
+/// to `original_imagej/`.
+pub fn default_plugin_catalog_cache_path() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("IJ_PLUGIN_CATALOG_CACHE") {
+        let path = PathBuf::from(value);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    let base = if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+        })
+    } else if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }?;
+    Some(base.join("imagej-rs").join("plugin_catalog.json"))
+}
+
+/// Writes the complete catalog (entries, sources, classpath and inspection
+/// results) as a versioned JSON envelope.
+///
+/// The file is written to a temporary sibling and renamed into place so a
+/// crashed write cannot leave a half-valid cache.
+pub fn save_plugin_catalog_cache(path: &Path, catalog: &PluginCatalog) -> Result<(), String> {
+    let envelope = PluginCatalogCacheEnvelopeRef {
+        schema_version: PLUGIN_CATALOG_CACHE_SCHEMA_VERSION,
+        catalog,
+    };
+    let json = serde_json::to_vec_pretty(&envelope)
+        .map_err(|error| format!("serialize plugin catalog cache: {error}"))?;
+    if json.len() as u64 > PLUGIN_CATALOG_CACHE_MAX_BYTES {
+        return Err(format!(
+            "plugin catalog cache is {} bytes; the {} byte limit would make it unreadable",
+            json.len(),
+            PLUGIN_CATALOG_CACHE_MAX_BYTES
+        ));
+    }
+    write_plugin_catalog_cache_atomically(path, &json)
+        .map_err(|error| format!("write plugin catalog cache {}: {error}", path.display()))
+}
+
+/// Reads a cache file. Missing, unreadable, corrupt and unsupported-schema
+/// files all yield an empty fallback with an explicit state; none is an error
+/// that can break startup.
+pub fn load_plugin_catalog_cache(path: &Path) -> PluginCatalogCacheLoad {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return PluginCatalogCacheLoad {
+                state: PluginCatalogCacheState::Missing,
+                catalog: None,
+            };
+        }
+        Err(error) => {
+            return PluginCatalogCacheLoad {
+                state: PluginCatalogCacheState::Unreadable {
+                    message: error.to_string(),
+                },
+                catalog: None,
+            };
+        }
+    };
+    if metadata.len() > PLUGIN_CATALOG_CACHE_MAX_BYTES {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::TooLarge {
+                size: metadata.len(),
+                limit: PLUGIN_CATALOG_CACHE_MAX_BYTES,
+            },
+            catalog: None,
+        };
+    }
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            return PluginCatalogCacheLoad {
+                state: PluginCatalogCacheState::Unreadable {
+                    message: error.to_string(),
+                },
+                catalog: None,
+            };
+        }
+    };
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if let Err(error) = file
+        .take(PLUGIN_CATALOG_CACHE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+    {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::Unreadable {
+                message: error.to_string(),
+            },
+            catalog: None,
+        };
+    }
+    if bytes.len() as u64 > PLUGIN_CATALOG_CACHE_MAX_BYTES {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::TooLarge {
+                size: bytes.len() as u64,
+                limit: PLUGIN_CATALOG_CACHE_MAX_BYTES,
+            },
+            catalog: None,
+        };
+    }
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return PluginCatalogCacheLoad {
+                state: PluginCatalogCacheState::Corrupt {
+                    message: error.to_string(),
+                },
+                catalog: None,
+            };
+        }
+    };
+    let Some(found) = value.get("schema_version").and_then(|value| value.as_u64()) else {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::Corrupt {
+                message: "missing schema_version".to_string(),
+            },
+            catalog: None,
+        };
+    };
+    if found != u64::from(PLUGIN_CATALOG_CACHE_SCHEMA_VERSION) {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::UnsupportedSchema {
+                found: u32::try_from(found).unwrap_or(u32::MAX),
+                supported: PLUGIN_CATALOG_CACHE_SCHEMA_VERSION,
+            },
+            catalog: None,
+        };
+    }
+    let Some(catalog_value) = value.get("catalog") else {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::Corrupt {
+                message: "missing catalog".to_string(),
+            },
+            catalog: None,
+        };
+    };
+    let catalog: PluginCatalog = match serde_json::from_value(catalog_value.clone()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return PluginCatalogCacheLoad {
+                state: PluginCatalogCacheState::Corrupt {
+                    message: error.to_string(),
+                },
+                catalog: None,
+            };
+        }
+    };
+    let bounds = bounded_plugin_scan_options();
+    if catalog.plugins.len() > bounds.max_plugins || catalog.warnings.len() > bounds.max_warnings {
+        return PluginCatalogCacheLoad {
+            state: PluginCatalogCacheState::Corrupt {
+                message: format!(
+                    "cache exceeds scan bounds ({} entries, {} warnings; limits {} and {})",
+                    catalog.plugins.len(),
+                    catalog.warnings.len(),
+                    bounds.max_plugins,
+                    bounds.max_warnings
+                ),
+            },
+            catalog: None,
+        };
+    }
+    PluginCatalogCacheLoad {
+        state: PluginCatalogCacheState::Loaded {
+            entries: catalog.plugins.len(),
+        },
+        catalog: Some(catalog),
+    }
+}
+
+fn write_plugin_catalog_cache_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plugin catalog cache path has no file name",
+        )
+    })?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce
+    ));
+    let write_result = (|| {
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Windows cannot replace an existing file with rename. Fall back to
+            // remove+rename there; Unix keeps the atomic replace above.
+            #[cfg(windows)]
+            {
+                if path.exists() {
+                    let _ = fs::remove_file(path);
+                    if fs::rename(&temporary, path).is_ok() {
+                        return Ok(());
+                    }
+                }
+            }
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn plugin_catalog_cache_state_message(state: &PluginCatalogCacheState) -> Option<&str> {
+    match state {
+        PluginCatalogCacheState::Unreadable { message }
+        | PluginCatalogCacheState::Corrupt { message } => Some(message.as_str()),
+        PluginCatalogCacheState::TooLarge { .. } => Some("cache file is too large"),
+        PluginCatalogCacheState::UnsupportedSchema { .. } => {
+            Some("unsupported cache schema version")
+        }
+        _ => None,
+    }
+}
+
+impl ImageJApp {
+    /// Replaces the cache location and consumes the one-time load state.
+    pub fn set_plugin_catalog_cache_path(&mut self, path: Option<PathBuf>) {
+        self.plugin_catalog_cache_path = path;
+        self.plugin_catalog_cache_state = PluginCatalogCacheState::NotLoaded;
+    }
+
+    /// Loads the cache exactly once. Broken files leave an empty catalog and an
+    /// explicit state; they never abort startup.
+    pub fn load_plugin_catalog_cache_at_startup(&mut self) -> bool {
+        if self.plugin_catalog_cache_state != PluginCatalogCacheState::NotLoaded {
+            return false;
+        }
+        let Some(path) = self.plugin_catalog_cache_path.clone() else {
+            self.plugin_catalog_cache_state = PluginCatalogCacheState::Disabled;
+            return false;
+        };
+        if self.is_plugin_catalog_busy() {
+            return false;
+        }
+        let load = load_plugin_catalog_cache(&path);
+        self.plugin_catalog_cache_state = load.state.clone();
+        let Some(catalog) = load.catalog else {
+            if let Some(message) =
+                plugin_catalog_cache_state_message(&self.plugin_catalog_cache_state)
+            {
+                self.plugins_browser.status = Some(format!(
+                    "Ignored plugin catalog cache {}: {message}",
+                    path.display()
+                ));
+            }
+            return false;
+        };
+        if self.plugins_browser.catalog.is_some() {
+            return false;
+        }
+        let entries = catalog.plugins.len();
+        self.plugins_browser.directory_input = catalog.plugins_dir.display().to_string();
+        let classpath_reason = crate::dialogs::plugin_classpath_missing_reason(&catalog.classpath);
+        self.plugins_browser.source_block_reasons = catalog
+            .plugins
+            .iter()
+            .map(|plugin| {
+                crate::dialogs::plugin_source_file_missing_reason(plugin)
+                    .or_else(|| classpath_reason.clone())
+            })
+            .collect();
+        self.plugin_catalog_generation = self.plugin_catalog_generation.wrapping_add(1);
+        self.plugins_browser.catalog = Some(catalog);
+        self.plugins_browser.phase = PluginCatalogPhase::Ready;
+        self.plugins_browser.selected = None;
+        self.plugins_browser.scan_error = None;
+        self.plugins_browser.inspect_phase = PluginInspectPhase::Idle;
+        self.plugins_browser.status = Some(format!(
+            "Loaded {entries} cached plugin entries from {}.",
+            path.display()
+        ));
+        true
+    }
+
+    /// Starts a verified catalog entry with one click.
+    ///
+    /// This deliberately reuses the existing prefill + start path so the
+    /// narrow dialog's preflight, target pinning, background worker,
+    /// cancellation and stale-output validation are unchanged. The prefill
+    /// dialog is dismissed immediately; no extra confirmation is shown.
+    pub fn run_catalog_plugin_immediately(&mut self, index: usize) -> Result<(), String> {
+        if self.pending_close.is_some() || self.quit_app {
+            let reason =
+                "Cannot run a plugin while a close/quit confirmation is active.".to_string();
+            self.status_message = reason.clone();
+            return Err(reason);
+        }
+        if self.is_plugin_filter_running() {
+            let reason = "A Java PlugInFilter is already executing.".to_string();
+            self.status_message = reason.clone();
+            return Err(reason);
+        }
+        // Resolve the target once. The prefill step pins this exact image and
+        // the start step consumes the pin, so a window switch cannot retarget
+        // the run.
+        let target_id = self.active_image_id().ok_or_else(|| {
+            "Open and activate an image first; the plugin run pins that image as the target."
+                .to_string()
+        })?;
+        if let Some(reason) = self.plugin_prefill_block_reason(index) {
+            self.status_message = format!("Cannot run plugin: {reason}");
+            return Err(reason);
+        }
+        if let Err(error) = self.prefill_plugin_filter_from_catalog(index) {
+            self.dismiss_plugin_filter_dialog();
+            return Err(error);
+        }
+        if self.dialogs.plugin_filter_target_id != Some(target_id) {
+            self.dismiss_plugin_filter_dialog();
+            let reason = "The active image changed while starting the plugin; no run was started."
+                .to_string();
+            self.status_message = reason.clone();
+            return Err(reason);
+        }
+        let result = self.start_plugin_filter_from_dialog();
+        // The one-click path never leaves the prefill dialog open, including
+        // when the session rejects the request.
+        self.dismiss_plugin_filter_dialog();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let reason = error.to_string();
+                self.status_message = format!("Cannot run plugin: {reason}");
+                Err(reason)
+            }
+        }
+    }
+
+    fn save_current_plugin_catalog_cache(&mut self) -> Result<(), String> {
+        let Some(path) = self.plugin_catalog_cache_path.clone() else {
+            return Ok(());
+        };
+        let Some(catalog) = self.plugins_browser.catalog.as_ref() else {
+            return Ok(());
+        };
+        save_plugin_catalog_cache(&path, catalog)?;
+        self.plugin_catalog_cache_state = PluginCatalogCacheState::Loaded {
+            entries: catalog.plugins.len(),
+        };
+        Ok(())
+    }
+
+    /// Snapshot of the dynamic `Plugins` menu rows.
+    pub fn plugin_menu_entries(&self) -> Vec<PluginMenuEntry> {
+        let Some(catalog) = self.plugins_browser.catalog.as_ref() else {
+            return Vec::new();
+        };
+        catalog
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(index, plugin)| {
+                let reason = self.plugin_prefill_block_reason(index);
+                PluginMenuEntry {
+                    index,
+                    label: plugin.label.clone(),
+                    source: plugin.source.to_string(),
+                    enabled: reason.is_none(),
+                    reason,
+                }
+            })
+            .collect()
     }
 }
