@@ -464,3 +464,82 @@ fn convert_to_32bit_action_converts_and_records() {
         Some("run(\"32-bit\");")
     );
 }
+
+#[test]
+fn image_type_menu_wires_rgb_color() {
+    let image_menu = ij_app::action::MENU_TREE
+        .iter()
+        .find(|node| node.label == "Image")
+        .expect("Image menu");
+    let ij_app::action::MenuKind::Submenu(image_nodes) = image_menu.kind else {
+        panic!("Image must be a submenu");
+    };
+    let type_menu = image_nodes
+        .iter()
+        .find(|node| node.label == "Type")
+        .expect("Type submenu");
+    let ij_app::action::MenuKind::Submenu(type_nodes) = type_menu.kind else {
+        panic!("Type must be a submenu");
+    };
+    let rgb = type_nodes
+        .iter()
+        .find(|node| node.label == "RGB Color")
+        .expect("RGB Color item");
+    assert!(matches!(
+        rgb.kind,
+        ij_app::action::MenuKind::Item(AppAction::ConvertToRgb)
+    ));
+}
+
+#[test]
+fn convert_to_rgb_action_requires_an_image_and_accepts_every_type() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::ConvertToRgb).is_err());
+
+    for plane in [
+        PixelPlane::Gray8(vec![0, 1]),
+        PixelPlane::Gray16(vec![0, 1]),
+        PixelPlane::Gray32(vec![0.0, 1.0]),
+        PixelPlane::Color256 {
+            pixels: vec![0, 1],
+            lut: Box::new(ij_core::Lut256::default()),
+        },
+        PixelPlane::ColorRgb(vec![0xff00_0000, 0xffff_ffff]),
+    ] {
+        let id = app
+            .session
+            .insert_doc(ImageDocument::new("any", 2, 1, plane).unwrap());
+        app.set_active_window(id).unwrap();
+        assert!(app.action_enabled(AppAction::ConvertToRgb).is_ok());
+    }
+}
+
+#[test]
+fn convert_to_rgb_action_converts_with_display_range_and_records() {
+    let mut app = ImageJApp::new();
+    let doc = ImageDocument::new(
+        "gray16",
+        3,
+        1,
+        PixelPlane::Gray16(vec![100, 300, 500]),
+    )
+    .unwrap();
+    let id = app.session.insert_doc(doc);
+    app.session.get_image_mut(id).unwrap().display_range = ij_core::DisplayRange {
+        min: 100.0,
+        max: 500.0,
+    };
+
+    app.perform(AppAction::ConvertToRgb, &Context::default());
+
+    let doc = app.session.get_image(id).unwrap();
+    // TypeConverter.java 50-61: (300-100)*256/401 + 0.5 = 128.2, which truncates to 128.
+    assert_eq!(
+        doc.plane(),
+        &PixelPlane::ColorRgb(vec![0xff00_0000, 0xff80_8080, 0xffff_ffff])
+    );
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"RGB Color\");")
+    );
+}

@@ -10182,3 +10182,407 @@ fn session_convert_to_32bit_records_macro_and_clears_threshold() {
         vec!["run(\"32-bit\");".to_string()]
     );
 }
+
+/// 8-bit pixel pattern that hits both ends and every residue the
+/// ByteProcessor.setMinAndMax LUT (ByteProcessor.java 433-474) can bend.
+fn rgb_convert_gray8_pattern() -> Vec<u8> {
+    let mut pixels: Vec<u8> = (0..48).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+    pixels[0] = 0;
+    pixels[1] = 255;
+    pixels[2] = 1;
+    pixels[3] = 254;
+    pixels[4] = 128;
+    pixels[5] = 127;
+    pixels
+}
+
+fn custom_indexed_lut() -> Lut256 {
+    // A non-grayscale, non-monotonic palette so the display-range LUT and the
+    // RGB expansion cannot be confused with a gray ramp.
+    let mut lut = Lut256 {
+        r: Vec::with_capacity(256),
+        g: Vec::with_capacity(256),
+        b: Vec::with_capacity(256),
+    };
+    for i in 0..256u32 {
+        lut.r.push(((i * 3) % 256) as u8);
+        lut.g.push((255 - i) as u8);
+        lut.b.push(((i * i) % 251) as u8);
+    }
+    lut
+}
+
+fn inverted_gray_lut() -> Lut256 {
+    let mut lut = Lut256::default();
+    lut.r.reverse();
+    lut.g.reverse();
+    lut.b.reverse();
+    lut
+}
+
+fn assert_rgb_matches_oracle(doc: &ImageDocument, oracle_doc: &ImageDocument, context: &str) {
+    assert!(
+        doc.slices
+            .iter()
+            .all(|plane| matches!(plane, PixelPlane::ColorRgb(_))),
+        "{context}: expected RGB planes, got {:?}",
+        doc.slices
+            .iter()
+            .map(PixelPlane::bit_depth)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(doc.slices, oracle_doc.slices, "{context}: pixels differ");
+    assert_eq!(
+        doc.display_range, oracle_doc.display_range,
+        "{context}: display range differs"
+    );
+}
+
+#[test]
+fn parity_convert_to_rgb_gray8_display_ranges_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (min, max) in [
+        (0.0, 255.0),
+        (50.0, 200.0),
+        (10.4, 200.6),
+        (0.0, 128.0),
+        (128.0, 255.0),
+        (100.0, 100.0),
+        (0.0, 0.0),
+        (255.0, 255.0),
+    ] {
+        let mut doc = ImageDocument::new(
+            "rgb_gray8.tif",
+            8,
+            6,
+            PixelPlane::Gray8(rgb_convert_gray8_pattern()),
+        )
+        .unwrap();
+        // The ImageJ TIFF format cannot carry a 0/0 range, so the macro sets
+        // every range after opening the unscaled image.
+        let oracle = bridge
+            .run_macro_on_image(
+                &doc,
+                &format!("setMinAndMax({min},{max}); run(\"RGB Color\");"),
+            )
+            .unwrap();
+        doc.display_range = DisplayRange { min, max };
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_rgb();
+        assert_rgb_matches_oracle(&doc, &oracle_doc, &format!("gray8 range {min}..{max}"));
+    }
+}
+
+#[test]
+fn parity_convert_to_rgb_gray16_display_ranges_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (min, max) in [
+        (0.0, 65535.0),
+        (1000.0, 20000.0),
+        (1000.7, 20000.2),
+        (30000.0, 40000.0),
+    ] {
+        let mut doc = convert_gray16_pattern(8, 4);
+        doc.display_range = DisplayRange { min, max };
+        let oracle = bridge
+            .run_macro_on_image(&doc, "run(\"RGB Color\");")
+            .unwrap();
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_rgb();
+        assert_rgb_matches_oracle(&doc, &oracle_doc, &format!("gray16 range {min}..{max}"));
+    }
+}
+
+#[test]
+fn parity_convert_to_rgb_gray32_display_ranges_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0f32; 32];
+    for (i, value) in pixels.iter_mut().enumerate() {
+        *value = (i as f32 - 4.0) * 0.25;
+    }
+    pixels[0] = -100.0;
+    pixels[1] = 100.0;
+    pixels[2] = 0.0;
+    pixels[3] = 0.5;
+    for (min, max) in [
+        (-1.0, 1.0),
+        (0.0, 1.0),
+        (0.25, 0.75),
+        (0.1, 1.1),
+        (0.0, 0.0),
+        (0.5, 0.5),
+    ] {
+        let mut doc =
+            ImageDocument::new("rgb_gray32.tif", 8, 4, PixelPlane::Gray32(pixels.clone()))
+                .unwrap();
+        // 0/0 cannot be stored in an ImageJ TIFF; set it with the macro.
+        let oracle = bridge
+            .run_macro_on_image(
+                &doc,
+                &format!("setMinAndMax({min},{max}); run(\"RGB Color\");"),
+            )
+            .unwrap();
+        doc.display_range = DisplayRange { min, max };
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_rgb();
+        assert_rgb_matches_oracle(&doc, &oracle_doc, &format!("gray32 range {min}..{max}"));
+    }
+}
+
+#[test]
+fn parity_convert_to_rgb_indexed_color_luts_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (name, lut) in [
+        ("default pseudo-color", Lut256::default()),
+        ("3-3-2 RGB", rgb332_lut()),
+        ("custom palette", custom_indexed_lut()),
+        ("inverting gray", inverted_gray_lut()),
+    ] {
+        for (min, max) in [(0.0, 255.0), (50.0, 200.0), (10.4, 200.6)] {
+            let mut doc = ImageDocument::new(
+                format!("rgb_{name}.tif"),
+                8,
+                6,
+                PixelPlane::Color256 {
+                    pixels: rgb_convert_gray8_pattern(),
+                    lut: Box::new(lut.clone()),
+                },
+            )
+            .unwrap();
+            doc.display_range = DisplayRange { min, max };
+            let oracle = bridge
+                .run_macro_on_image(&doc, "run(\"RGB Color\");")
+                .unwrap();
+            let oracle_doc = oracle
+                .output_image
+                .expect("oracle must return saved TIFF");
+
+            doc.convert_to_rgb();
+            assert_rgb_matches_oracle(&doc, &oracle_doc, &format!("{name} range {min}..{max}"));
+        }
+    }
+}
+
+#[test]
+fn parity_convert_to_rgb_rgb_is_a_noop_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let pixels: Vec<u32> = (0..32u32)
+        .map(|i| {
+            0xff00_0000 | (((i * 37) % 256) << 16) | (((i * 53 + 7) % 256) << 8) | ((i * 97 + 11) % 256)
+        })
+        .collect();
+    let mut doc =
+        ImageDocument::new("rgb_noop.tif", 8, 4, PixelPlane::ColorRgb(pixels)).unwrap();
+    let before = doc.slices.clone();
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"RGB Color\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_rgb();
+    assert_eq!(doc.slices, before);
+    assert_rgb_matches_oracle(&doc, &oracle_doc, "rgb no-op");
+}
+
+fn rgb_conversion_stack(planes: Vec<PixelPlane>) -> ImageDocument {
+    let mut doc = ImageDocument::new_stack("rgb_stack.tif", 8, 6, planes).unwrap();
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    doc.slice_labels = vec![
+        Some("first".into()),
+        Some("second".into()),
+        Some("third".into()),
+    ];
+    doc
+}
+
+fn rgb_stack_macro(range: DisplayRange) -> String {
+    // The ImageJ TIFF format cannot carry a 0/0 range, so every range is set
+    // with the macro on the current slice (slice 2) after opening.
+    format!(
+        "Property.setSliceLabel(\"first\",1); Property.setSliceLabel(\"second\",2); \
+         Property.setSliceLabel(\"third\",3); setSlice(2); setMinAndMax({},{}); \
+         run(\"RGB Color\");",
+        range.min, range.max
+    )
+}
+
+#[test]
+fn parity_convert_to_rgb_stacks_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let gray8_planes = |shift: usize| {
+        (0..3)
+            .map(|s| {
+                PixelPlane::Gray8(
+                    (0..48)
+                        .map(|i| ((i * 37 + s * 91 + shift * 5 + 11) % 256) as u8)
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let gray32_planes = (0..3)
+        .map(|s| {
+            PixelPlane::Gray32(
+                (0..48)
+                    .map(|i| ((i as f32) - 10.0) * 0.125 + s as f32)
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let indexed_planes = (0..3)
+        .map(|s| PixelPlane::Color256 {
+            pixels: (0..48).map(|i| ((i * 37 + s * 91 + 11) % 256) as u8).collect(),
+            lut: Box::new(custom_indexed_lut()),
+        })
+        .collect::<Vec<_>>();
+    let gray16_planes = distinct_stack_16bit(8, 6, 3).slices;
+
+    let cases: Vec<(&str, Vec<PixelPlane>, DisplayRange)> = vec![
+        (
+            "gray8 stack",
+            gray8_planes(0),
+            DisplayRange { min: 40.0, max: 210.0 },
+        ),
+        (
+            "gray8 stack fractional range",
+            gray8_planes(1),
+            DisplayRange { min: 40.4, max: 210.6 },
+        ),
+        (
+            "gray16 stack",
+            gray16_planes,
+            DisplayRange { min: 500.0, max: 40000.0 },
+        ),
+        (
+            "gray32 stack",
+            gray32_planes.clone(),
+            DisplayRange { min: -0.5, max: 4.0 },
+        ),
+        (
+            "gray32 stack zero range",
+            gray32_planes,
+            DisplayRange { min: 0.0, max: 0.0 },
+        ),
+        (
+            "color256 stack",
+            indexed_planes,
+            DisplayRange { min: 30.0, max: 220.0 },
+        ),
+    ];
+    for (name, planes, range) in cases {
+        let mut doc = rgb_conversion_stack(planes);
+        let oracle = bridge
+            .run_macro_on_image(&doc, &rgb_stack_macro(range))
+            .unwrap();
+        doc.display_range = range;
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_rgb();
+        assert_rgb_matches_oracle(&doc, &oracle_doc, name);
+        assert_eq!(doc.slice_labels, oracle_doc.slice_labels, "{name}: labels");
+        assert_eq!(doc.current_slice, 2, "{name}: current slice");
+    }
+}
+
+#[test]
+fn convert_to_rgb_preserves_roi_and_undo_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new(
+        "rgb_undo.tif",
+        8,
+        6,
+        PixelPlane::Gray8(rgb_convert_gray8_pattern()),
+    )
+    .unwrap();
+    doc.display_range = DisplayRange { min: 50.0, max: 200.0 };
+    doc.set_rect_roi(1, 1, 3, 2).unwrap();
+    let original_slices = doc.slices.clone();
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(1,1,3,2); run(\"RGB Color\"); run(\"Undo\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_rgb();
+    assert!(
+        matches!(doc.plane(), PixelPlane::ColorRgb(_)),
+        "RGB Color must change the pixel type"
+    );
+    assert!(doc.roi.is_some(), "Converter.java 143-144 restores the ROI");
+    assert!(doc.undo());
+    assert_eq!(doc.slices, original_slices);
+    assert_eq!(doc.slices, oracle_doc.slices, "undo pixels");
+    assert_eq!(doc.display_range, oracle_doc.display_range, "undo range");
+    assert_eq!(
+        doc.display_range,
+        DisplayRange { min: 50.0, max: 200.0 },
+        "TYPE_CONVERSION undo restores the 8-bit display range"
+    );
+}
+
+#[test]
+fn convert_to_rgb_of_a_stack_has_no_undo() {
+    let mut doc = rgb_conversion_stack(vec![
+        PixelPlane::Gray8(vec![1; 48]),
+        PixelPlane::Gray8(vec![2; 48]),
+        PixelPlane::Gray8(vec![3; 48]),
+    ]);
+    doc.convert_to_rgb();
+    assert!(
+        matches!(doc.plane(), PixelPlane::ColorRgb(_)),
+        "stack conversion must produce RGB"
+    );
+    assert!(!doc.undo(), "whole-stack type conversions have no Undo buffer");
+}
+
+#[test]
+fn session_convert_to_rgb_records_macro_and_clears_threshold() {
+    let mut doc = ImageDocument::new(
+        "rgb_session.tif",
+        8,
+        6,
+        PixelPlane::Gray8(rgb_convert_gray8_pattern()),
+    )
+    .unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 10.0,
+        upper: 20.0,
+    });
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.macro_recorder.clear();
+
+    session.dispatch(Command::ConvertToRgb).unwrap();
+
+    let doc = session.active_doc().unwrap();
+    assert!(matches!(doc.plane(), PixelPlane::ColorRgb(_)));
+    assert_eq!(doc.display_range, DisplayRange { min: 0.0, max: 255.0 });
+    assert_eq!(
+        doc.threshold, None,
+        "Converter.java 55-56 resets the threshold before converting"
+    );
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"RGB Color\");".to_string()],
+        "RGB Color must record exactly one macro line without a trailing newline"
+    );
+}

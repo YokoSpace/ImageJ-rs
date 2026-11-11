@@ -18,6 +18,7 @@ pub enum AppAction {
     ConvertTo8Bit,
     ConvertTo16Bit,
     ConvertTo32Bit,
+    ConvertToRgb,
     SelectNone,
     BrightnessContrast,
     Threshold,
@@ -135,7 +136,7 @@ const IMAGE_TYPE: &[MenuNode] = &[
     item("8-bit", None, AppAction::ConvertTo8Bit),
     item("16-bit", None, AppAction::ConvertTo16Bit),
     item("32-bit", None, AppAction::ConvertTo32Bit),
-    unsupported("RGB Color", None),
+    item("RGB Color", None, AppAction::ConvertToRgb),
 ];
 const IMAGE_MENU: &[MenuNode] = &[
     submenu("Adjust", IMAGE_ADJUST),
@@ -353,6 +354,9 @@ impl ImageJApp {
             }
             ConvertTo32Bit => {
                 let _ = self.convert_to_32bit_active();
+            }
+            ConvertToRgb => {
+                let _ = self.convert_to_rgb_active();
             }
             SelectNone => {
                 let _ = self.clear_roi();

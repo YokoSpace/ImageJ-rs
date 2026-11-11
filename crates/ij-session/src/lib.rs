@@ -148,6 +148,9 @@ pub enum Command {
     /// `run("32-bit")` (Converter.java 38-39). Converts every slice to 32-bit
     /// grayscale with scaling enabled and records `run("32-bit");`.
     ConvertTo32Bit,
+    /// `run("RGB Color")` (Converter.java 38-39). Converts every slice to RGB
+    /// through the displayed 8-bit image and records `run("RGB Color");`.
+    ConvertToRgb,
     Smooth,
     Sharpen,
     FindEdges,
@@ -751,6 +754,12 @@ impl Session {
                 self.active_doc_mut()?.convert_to_32bit()?;
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"32-bit\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::ConvertToRgb => {
+                self.active_doc_mut()?.convert_to_rgb();
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"RGB Color\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Smooth => {

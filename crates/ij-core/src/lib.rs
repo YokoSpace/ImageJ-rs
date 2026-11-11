@@ -724,6 +724,84 @@ fn lut_rgb(lut: &Lut256, index: u8) -> u32 {
     (u32::from(lut.r[i]) << 16) | (u32::from(lut.g[i]) << 8) | u32::from(lut.b[i])
 }
 
+/// ByteProcessor.setMinAndMax (ByteProcessor.java 433-474): the display range
+/// of an 8-bit image is baked into a copy of its LUT, indexed by pixel value.
+/// `max < min` is ignored by Java and leaves the base LUT in place. Values are
+/// opaque ARGB like every `ColorRgb` plane loaded from ImageJ.
+fn byte_display_rgb_table(lut: &Lut256, min: f64, max: f64) -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let rounded_min = java_round_to_i32(min);
+    for (i, entry) in table.iter_mut().enumerate() {
+        let index = if max < min {
+            i
+        } else if (i as f64) < min {
+            0
+        } else if (i as f64) > max {
+            255
+        } else {
+            let offset = i as i32 - rounded_min;
+            // Java's double-to-int cast saturates and maps NaN to 0, as Rust's does.
+            ((256.0 * f64::from(offset) / (max - min)) as i32).clamp(0, 255) as usize
+        };
+        *entry = 0xff00_0000 | lut_rgb(lut, index as u8);
+    }
+    table
+}
+
+/// `ImageProcessor.convertToRGB` (TypeConverter.java 248-255): convert to the
+/// displayed 8-bit image with scaling, then read it back through its color
+/// model. 8-bit planes display through their LUT with the range baked in; a
+/// stack's slices take that range from the current processor, which has
+/// already rounded it (ImageStack.java 205-208, 330-331).
+fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) -> PixelPlane {
+    let gray = |value: u8| 0xff00_0000 | u32::from(value) * 0x0001_0101;
+    match plane {
+        PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => {
+            let default_lut = Lut256::default();
+            let lut = match plane {
+                PixelPlane::Color256 { lut, .. } => lut.as_ref(),
+                _ => &default_lut,
+            };
+            let (min, max) = if stack {
+                (
+                    f64::from(java_round_to_i32(range.min)),
+                    f64::from(java_round_to_i32(range.max)),
+                )
+            } else {
+                (range.min, range.max)
+            };
+            let table = byte_display_rgb_table(lut, min, max);
+            PixelPlane::ColorRgb(pixels.iter().map(|&px| table[usize::from(px)]).collect())
+        }
+        PixelPlane::Gray16(pixels) => {
+            // convertShortToByte (TypeConverter.java 49-63); the resulting
+            // ByteProcessor keeps ImageJ's default grayscale LUT.
+            let min = java_round_to_i32(range.min);
+            let max = java_round_to_i32(range.max);
+            let scale = 256.0 / f64::from(max.wrapping_sub(min).wrapping_add(1));
+            PixelPlane::ColorRgb(
+                pixels
+                    .iter()
+                    .map(|&px| gray(short_to_byte(px, min, scale)))
+                    .collect(),
+            )
+        }
+        PixelPlane::Gray32(pixels) => {
+            // FloatProcessor.create8BitImage (FloatProcessor.java 190-208).
+            let min = f64::from(range.min as f32);
+            let max = f64::from(range.max as f32);
+            let scale = 255.0 / (max - min);
+            PixelPlane::ColorRgb(
+                pixels
+                    .iter()
+                    .map(|&px| gray(float_to_byte(px, min, scale)))
+                    .collect(),
+            )
+        }
+        PixelPlane::ColorRgb(pixels) => PixelPlane::ColorRgb(pixels.clone()),
+    }
+}
+
 /// ImageProcessor.isPseudoColorLut (ImageProcessor.java 351-386). The active
 /// threshold case cannot occur because `Converter.java 55-56` resets it first.
 fn is_pseudo_color_lut(lut: &Lut256) -> bool {
@@ -1792,6 +1870,65 @@ impl ImageDocument {
             self.display_range,
         );
         Ok(())
+    }
+
+    /// Converts every plane to RGB, matching `Image > Type > RGB Color` with
+    /// `doScaling = true`. Single images go through
+    /// `ImageConverter.convertToRGB` (ImageConverter.java 192-202); stacks go
+    /// through `StackConverter.convertToRGB` (StackConverter.java 226-261).
+    /// Both call `ImageProcessor.convertToRGB`, which renders the processor
+    /// as its displayed 8-bit image (TypeConverter.java 248-255).
+    ///
+    /// Gray16/Gray32/Gray8 planes carry no LUT in this model, so ImageJ's
+    /// default non-inverting grayscale LUT is the only one that can be
+    /// reproduced; an inverting LUT on those types is not representable. An
+    /// inverting LUT on a `Color256` plane is representable and honored.
+    pub fn convert_to_rgb(&mut self) {
+        // Converter.java 55-56 resets the threshold before converting.
+        self.threshold = None;
+        let is_stack = self.slices.len() > 1;
+        if is_stack {
+            // A whole-stack type conversion does not create an Undo buffer.
+            self.snapshot = None;
+            self.snapshot_dimensions = None;
+            self.snapshot_display_range = None;
+        } else {
+            // Undo.setup(Undo.TYPE_CONVERSION, imp) runs for single images
+            // only (Converter.java 100-101), even when the conversion is a
+            // no-op.
+            self.save_snapshot();
+        }
+        // ImageConverter.java 193-194 and ImageProcessor.convertToRGB leave
+        // RGB planes alone.
+        if self
+            .slices
+            .iter()
+            .all(|plane| matches!(plane, PixelPlane::ColorRgb(_)))
+        {
+            return;
+        }
+
+        let current = self.current_slice_index();
+        let mut range = self.display_range;
+        if let PixelPlane::Gray32(pixels) = &self.slices[current] {
+            // FloatProcessor.setMinAndMax treats 0/0 as resetMinAndMax
+            // (FloatProcessor.java 124-129); the stack reads the range from the
+            // current slice's processor (ImageStack.java 205-208).
+            if range.min == 0.0 && range.max == 0.0 {
+                range = float_processor_range(pixels);
+            }
+        }
+        for plane in &mut self.slices {
+            *plane = plane_to_displayed_rgb(plane, range, is_stack);
+        }
+        if !is_stack {
+            self.snapshot_display_range = Some(self.display_range);
+        }
+        // A new ColorProcessor starts with the default 0..255 range.
+        self.display_range = DisplayRange {
+            min: 0.0,
+            max: 255.0,
+        };
     }
 
     pub fn save_snapshot(&mut self) {
@@ -3139,6 +3276,70 @@ mod tests {
         .unwrap();
         stack.convert_to_32bit().unwrap();
         assert!(!stack.undo(), "stack type conversions have no undo");
+    }
+
+    #[test]
+    fn undo_after_rgb_conversion_restores_original_display_range() {
+        // TYPE_CONVERSION saves the original processor, including its min/max
+        // (Undo.java 149-160, Converter.java 100-101).
+        let mut doc = ImageDocument::new(
+            "conversion-rgb-undo",
+            3,
+            1,
+            PixelPlane::Gray16(vec![100, 250, 500]),
+        )
+        .unwrap();
+        let original = doc.plane().clone();
+        doc.display_range = DisplayRange { min: 100.0, max: 500.0 };
+        doc.convert_to_rgb();
+        assert!(matches!(doc.plane(), PixelPlane::ColorRgb(_)));
+        assert_eq!(doc.display_range, DisplayRange { min: 0.0, max: 255.0 });
+        assert!(doc.undo());
+        assert_eq!(doc.plane(), &original);
+        assert_eq!(doc.display_range, DisplayRange { min: 100.0, max: 500.0 });
+
+        let mut stack = ImageDocument::new_stack(
+            "conversion-rgb-stack",
+            2,
+            1,
+            vec![
+                PixelPlane::Gray8(vec![10, 20]),
+                PixelPlane::Gray8(vec![30, 40]),
+            ],
+        )
+        .unwrap();
+        stack.convert_to_rgb();
+        assert!(!stack.undo(), "stack type conversions have no undo");
+    }
+
+    #[test]
+    fn rgb_conversion_expands_gray_and_indexed_planes_through_their_luts() {
+        let mut gray = ImageDocument::new("rgb-gray", 2, 1, PixelPlane::Gray8(vec![0, 255])).unwrap();
+        gray.convert_to_rgb();
+        assert_eq!(
+            gray.plane(),
+            &PixelPlane::ColorRgb(vec![0xff00_0000, 0xffff_ffff])
+        );
+
+        let mut lut = Lut256::default();
+        lut.r.reverse();
+        lut.g.reverse();
+        lut.b.reverse();
+        let mut inverted = ImageDocument::new(
+            "rgb-inverted",
+            2,
+            1,
+            PixelPlane::Color256 {
+                pixels: vec![0, 255],
+                lut: Box::new(lut),
+            },
+        )
+        .unwrap();
+        inverted.convert_to_rgb();
+        assert_eq!(
+            inverted.plane(),
+            &PixelPlane::ColorRgb(vec![0xffff_ffff, 0xff00_0000])
+        );
     }
 
     #[test]

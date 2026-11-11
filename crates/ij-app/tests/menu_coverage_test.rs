@@ -3,7 +3,6 @@ use ij_session::generated_commands::{COMMAND_SPECS, ExecutionTier};
 use std::collections::BTreeSet;
 
 const KNOWN_UNWIRED: &[&str] = &[
-    "RGB Color",
     "Duplicate...",
     "Histogram",
     "Set Measurements...",
