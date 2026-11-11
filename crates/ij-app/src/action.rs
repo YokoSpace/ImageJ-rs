@@ -540,12 +540,11 @@ impl ImageJApp {
                         _ => Ok(()),
                     },
                     Median if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)) => Err("Median requires a grayscale image".into()),
-                    // ProfilePlot.java 53-62: only a line or rectangular
-                    // selection produces a profile, and the two rejection
-                    // messages are the ones the constructor prints.
+                    // ProfilePlot.java 53-62 accepts lines (including
+                    // segmented/freehand lines) and rectangular selections.
                     PlotProfile => match doc.roi.as_ref() {
                         None => Err("Selection required.".into()),
-                        Some(ij_core::Roi::Rect(_) | ij_core::Roi::Line(_)) => Ok(()),
+                        Some(ij_core::Roi::Rect(_) | ij_core::Roi::Line(_) | ij_core::Roi::Polyline(_)) => Ok(()),
                         Some(_) => Err("Line or rectangular selection required.".into()),
                     },
                     AddToRoiManager if doc.roi.is_none() => Err("Selection required".into()),

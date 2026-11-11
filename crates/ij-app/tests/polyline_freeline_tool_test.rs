@@ -4,9 +4,11 @@
 
 use egui::{CentralPanel, Context, Event, Modifiers, PointerButton, Pos2, RawInput, Rect, Vec2};
 use ij_app::tool::polyline_is_valid;
+use ij_app::action::AppAction;
 use ij_app::{ImageJApp, Tool};
 use ij_bridge::JavaOracleBridge;
 use ij_core::{format_ij_num, Roi};
+use ij_session::Command;
 use std::path::PathBuf;
 
 fn repo_root() -> PathBuf {
@@ -15,6 +17,22 @@ fn repo_root() -> PathBuf {
         .and_then(|p| p.parent())
         .unwrap()
         .to_path_buf()
+}
+
+#[test]
+fn plot_profile_action_accepts_segmented_and_freehand_lines() {
+    let mut app = ImageJApp::new();
+    app.open_ramp_8bit("profile-lines", 16, 16).unwrap();
+    let points = vec![(1, 1), (6, 4), (12, 8)];
+    for command in [
+        Command::MakePolylineRoi { points: points.clone() },
+        Command::MakeFreelineRoi { points: points.clone() },
+    ] {
+        app.session.dispatch(command).unwrap();
+        assert!(app.action_enabled(AppAction::PlotProfile).is_ok());
+        app.perform(AppAction::PlotProfile, &egui::Context::default());
+        assert!(app.plot_profile_window.is_some());
+    }
 }
 
 fn frame(
