@@ -17,6 +17,54 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+#[test]
+fn parity_roi_manager_add_select_measure_and_delete() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new_ramp_8bit("roi-manager", 4, 4).unwrap();
+    let java = bridge
+        .run_macro_on_image(
+            &doc,
+            "makeRectangle(1,1,2,2); roiManager(\"Add\"); \
+             makeRectangle(0,0,1,1); roiManager(\"Add\"); \
+             print(\"RM_COUNT:\"+roiManager(\"count\")); \
+             print(\"RM_NAME0:\"+RoiManager.getName(0)); \
+             roiManager(\"Select\",0); getSelectionBounds(x,y,w,h); \
+             print(\"RM_BOUNDS:\"+x+\",\"+y+\",\"+w+\",\"+h); \
+             roiManager(\"Measure\"); \
+             print(\"RM_AREA:\"+getResult(\"Area\",0)); \
+             print(\"RM_MEAN:\"+getResult(\"Mean\",0)); \
+             roiManager(\"Delete\"); print(\"RM_AFTER_DELETE:\"+roiManager(\"count\")); \
+             run(\"Select None\");",
+        )
+        .unwrap();
+    let lines = java.stdout.lines().collect::<Vec<_>>();
+    let value = |prefix: &str| {
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix} in {}", java.stdout))
+    };
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 2, height: 2 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    session.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 1, height: 1 }).unwrap();
+    session.dispatch(Command::RoiManagerAdd).unwrap();
+    assert_eq!(session.roi_manager.len().to_string(), value("RM_COUNT:"));
+    assert_eq!(session.roi_manager[0].name, value("RM_NAME0:"));
+
+    session.dispatch(Command::RoiManagerSelect { index: 0 }).unwrap();
+    let (x, y, w, h) = session.active_doc().unwrap().roi.as_ref().unwrap().bounds();
+    assert_eq!(format!("{x},{y},{w},{h}"), value("RM_BOUNDS:"));
+    session.dispatch(Command::RoiManagerMeasure { indices: vec![0] }).unwrap();
+    let row = session.results.rows.last().unwrap();
+    assert_eq!(row.area, value("RM_AREA:").parse::<f64>().unwrap());
+    assert_eq!(row.mean, value("RM_MEAN:").parse::<f64>().unwrap());
+    session.dispatch(Command::RoiManagerDelete { indices: vec![0] }).unwrap();
+    assert_eq!(session.roi_manager.len().to_string(), value("RM_AFTER_DELETE:"));
+}
+
 fn oracle_wand_points(doc: &ImageDocument, prelude: &str, x: i32, y: i32) -> Vec<(i32, i32)> {
     oracle_wand_points_with_options(doc, prelude, x, y, 0.0, "Legacy")
 }

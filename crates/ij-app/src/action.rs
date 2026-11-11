@@ -30,6 +30,8 @@ pub enum AppAction {
     SelectAll,
     SelectNone,
     RestoreSelection,
+    AddToRoiManager,
+    RoiManager,
     BrightnessContrast,
     Threshold,
     InvertStack,
@@ -134,6 +136,7 @@ const EDIT_SELECTION: &[MenuNode] = &[
     item("Select All", Some("Cmd+A"), AppAction::SelectAll),
     item("Select None", Some("Shift+A"), AppAction::SelectNone),
     item("Restore Selection", Some("Shift+E"), AppAction::RestoreSelection),
+    item("Add to Manager", Some("T"), AppAction::AddToRoiManager),
 ];
 const EDIT_MENU: &[MenuNode] = &[
     item("Undo", Some("Z"), AppAction::Undo),
@@ -192,6 +195,9 @@ const PROCESS_MENU: &[MenuNode] = &[
     unsupported("FFT", None),
 ];
 
+const ANALYZE_TOOLS: &[MenuNode] = &[
+    item("ROI Manager...", None, AppAction::RoiManager),
+];
 const ANALYZE_MENU: &[MenuNode] = &[
     item("Measure", Some("M"), AppAction::Measure),
     item("Histogram", Some("H"), AppAction::Histogram),
@@ -199,6 +205,7 @@ const ANALYZE_MENU: &[MenuNode] = &[
     item("Set Measurements...", None, AppAction::SetMeasurements),
     item("Set Scale...", None, AppAction::SetScale),
     item("Plot Profile", Some("K"), AppAction::PlotProfile),
+    submenu("Tools", ANALYZE_TOOLS),
     unsupported("Calibrate...", None),
 ];
 
@@ -397,7 +404,7 @@ impl ImageJApp {
             // Set Measurements is a user-option dialog, not an image command:
             // ImageJ's Analyze menu enables it with no image open.
             NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
-            | SetMeasurements => Ok(()),
+            | SetMeasurements | RoiManager => Ok(()),
             SaveResults | ClearResults => {
                 if self.session.results.rows.is_empty() {
                     Err("No results to save or clear".into())
@@ -486,6 +493,7 @@ impl ImageJApp {
                         Some(ij_core::Roi::Rect(_) | ij_core::Roi::Line(_)) => Ok(()),
                         Some(_) => Err("Line or rectangular selection required.".into()),
                     },
+                    AddToRoiManager if doc.roi.is_none() => Err("Selection required".into()),
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
                     _ => Ok(()),
                 }
@@ -608,6 +616,14 @@ impl ImageJApp {
             }
             RestoreSelection => {
                 let _ = self.restore_selection();
+            }
+            AddToRoiManager => {
+                if self.session.dispatch(Command::RoiManagerAdd).is_ok() {
+                    self.show_roi_manager_window = true;
+                }
+            }
+            RoiManager => {
+                self.show_roi_manager_window = true;
             }
             BrightnessContrast => {
                 if let Ok(doc) = self.session.active_doc() {

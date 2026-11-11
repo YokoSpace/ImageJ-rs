@@ -21,6 +21,14 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ImageId(pub u32);
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NamedRoi {
+    pub name: String,
+    pub roi: Roi,
+    pub source_image: ImageId,
+    pub slice: u32,
+}
+
 // PlugInFilter.NO_CHANGES and PlugInFilter.NO_UNDO
 // (original_imagej/ij/plugin/filter/PlugInFilter.java lines 58-60).
 const PLUGIN_NO_CHANGES: i32 = 128;
@@ -36,6 +44,8 @@ pub enum SessionError {
     File(#[from] std::io::Error),
     #[error("no active image in session")]
     NoActiveImage,
+    #[error("active image has no selection")]
+    NoActiveRoi,
     #[error("active image has no saved file path")]
     NoSavedTiffPath,
     #[error("unknown command label: {0}")]
@@ -135,6 +145,10 @@ pub enum Command {
     SelectAll,
     ClearRoi,
     RestoreSelection,
+    RoiManagerAdd,
+    RoiManagerSelect { index: usize },
+    RoiManagerDelete { indices: Vec<usize> },
+    RoiManagerMeasure { indices: Vec<usize> },
     SetDimensions {
         channels: u32,
         slices: u32,
@@ -353,6 +367,22 @@ fn format_scale_number(value: f64) -> String {
     }
 }
 
+fn roi_manager_label(doc: &ImageDocument, roi: &Roi) -> String {
+    let (x, y, width, height) = roi.bounds();
+    let center_x = (x + width / 2).max(0);
+    let center_y = (y + height / 2).max(0);
+    let digits = 4_usize
+        .max(center_x.to_string().len())
+        .max(center_y.to_string().len())
+        .max(usize::from(doc.stack_size() >= 10_000 || doc.height >= 10_000) * 5);
+    let location = format!("{center_y:0digits$}-{center_x:0digits$}");
+    if doc.stack_size() > 1 {
+        format!("{:0digits$}-{location}", doc.current_slice)
+    } else {
+        location
+    }
+}
+
 fn measurement_macro_options(config: MeasurementConfig) -> String {
     // Analyzer.java 28-33: checkbox order in the Set Measurements dialog.
     const CHECKBOXES: &[(u32, &str)] = &[
@@ -480,6 +510,8 @@ pub struct Session {
     /// implicitly by a repository checkout.
     plugin_bridge: Option<Arc<PluginBridge>>,
     pub previous_roi: Option<Roi>,
+    pub roi_manager: Vec<NamedRoi>,
+    pub roi_manager_selected: Vec<usize>,
 }
 
 impl Session {
@@ -948,6 +980,88 @@ impl Session {
                     self.mark_active_dirty();
                 }
                 self.macro_recorder.push("run(\"Restore Selection\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::RoiManagerAdd => {
+                let image_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let doc = self.active_doc()?;
+                let roi = doc.roi.clone().ok_or(SessionError::NoActiveRoi)?;
+                let entry = NamedRoi {
+                    name: roi_manager_label(doc, &roi),
+                    roi,
+                    source_image: image_id,
+                    slice: doc.current_slice,
+                };
+                self.roi_manager.push(entry);
+                self.roi_manager_selected.clear();
+                self.macro_recorder.push("roiManager(\"Add\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::RoiManagerSelect { index } => {
+                let Some(entry) = self.roi_manager.get(index).cloned() else {
+                    return Ok(CommandOutcome::Updated);
+                };
+                let doc = self.active_doc_mut()?;
+                let mut roi = entry.roi;
+                let (x, y, width, height) = roi.bounds();
+                if x >= doc.width as i32
+                    || y >= doc.height as i32
+                    || x.saturating_add(width) < 0
+                    || y.saturating_add(height) < 0
+                {
+                    roi.set_location((doc.width as i32 - width) / 2, (doc.height as i32 - height) / 2);
+                }
+                let changed = doc.roi.as_ref() != Some(&roi);
+                doc.roi = Some(roi);
+                if changed {
+                    self.mark_active_dirty();
+                }
+                self.roi_manager_selected = vec![index];
+                self.macro_recorder
+                    .push(format!("roiManager(\"Select\", {index});"));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::RoiManagerDelete { indices } => {
+                let mut selected = if indices.is_empty() {
+                    (0..self.roi_manager.len()).collect::<Vec<_>>()
+                } else {
+                    indices
+                };
+                selected.sort_unstable();
+                selected.dedup();
+                for index in selected.into_iter().rev() {
+                    if index < self.roi_manager.len() {
+                        self.roi_manager.remove(index);
+                    }
+                }
+                self.roi_manager_selected.clear();
+                self.macro_recorder.push("roiManager(\"Delete\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::RoiManagerMeasure { indices } => {
+                let selected = if indices.is_empty() {
+                    (0..self.roi_manager.len()).collect::<Vec<_>>()
+                } else {
+                    indices
+                };
+                let entries = selected
+                    .into_iter()
+                    .filter_map(|index| self.roi_manager.get(index).cloned())
+                    .collect::<Vec<_>>();
+                let config = self.results.config;
+                let mut doc = self.active_doc()?.clone();
+                for entry in &entries {
+                    doc.roi = Some(entry.roi.clone());
+                    self.results.push(doc.measure_with_config(config)?);
+                }
+                if entries.len() > 1 {
+                    self.active_doc_mut()?.clear_roi();
+                } else if let Some(entry) = entries.first() {
+                    self.active_doc_mut()?.roi = Some(entry.roi.clone());
+                }
+                if !entries.is_empty() {
+                    self.macro_recorder.push("roiManager(\"Measure\");".into());
+                }
                 Ok(CommandOutcome::Updated)
             }
             Command::SetDimensions {

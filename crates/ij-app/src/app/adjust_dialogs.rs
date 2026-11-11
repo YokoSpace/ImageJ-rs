@@ -317,6 +317,10 @@ impl ImageJApp {
             self.render_set_scale_dialog(ctx);
         }
 
+        if self.show_roi_manager_window {
+            self.render_roi_manager_window(ctx);
+        }
+
         self.render_histogram_window(ctx);
 
         self.render_plot_profile_window(ctx);
@@ -1802,6 +1806,115 @@ impl ImageJApp {
             self.plot_profile_window = None;
         } else if let Some(state) = self.plot_profile_window.as_mut() {
             state.show_list = show_list;
+        }
+    }
+}
+
+impl ImageJApp {
+    pub fn roi_manager_button_rect(ctx: &egui::Context, label: &str) -> Option<egui::Rect> {
+        ctx.data(|data| data.get_temp(egui::Id::new(("ij_roi_manager_button", label))))
+    }
+
+    pub fn render_roi_manager_content(&mut self, ui: &mut egui::Ui) {
+        let can_add = self.session.active_doc().ok().is_some_and(|doc| doc.roi.is_some());
+        let has_entries = !self.session.roi_manager.is_empty();
+        let has_image = self.session.active_image_id().is_some();
+
+        ui.horizontal(|ui| {
+            let add = ui.add_enabled(can_add, egui::Button::new("Add"));
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("ij_roi_manager_button", "Add")), add.rect));
+            if add.clicked() {
+                if let Err(error) = self.session.dispatch(Command::RoiManagerAdd) {
+                    self.dialogs.last_error = Some(error.to_string());
+                }
+            }
+            let delete = ui.add_enabled(has_entries, egui::Button::new("Delete"));
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("ij_roi_manager_button", "Delete")), delete.rect));
+            if delete.clicked() {
+                if self.session.roi_manager_selected.is_empty() {
+                    self.pending_roi_manager_delete_all = true;
+                } else {
+                    let indices = self.session.roi_manager_selected.clone();
+                    let _ = self.session.dispatch(Command::RoiManagerDelete { indices });
+                }
+            }
+            let measure = ui.add_enabled(has_entries && has_image, egui::Button::new("Measure"));
+            ui.ctx().data_mut(|data| data.insert_temp(egui::Id::new(("ij_roi_manager_button", "Measure")), measure.rect));
+            if measure.clicked() {
+                let indices = self.session.roi_manager_selected.clone();
+                match self.session.dispatch(Command::RoiManagerMeasure { indices }) {
+                    Ok(_) => self.show_results_window = true,
+                    Err(error) => self.dialogs.last_error = Some(error.to_string()),
+                }
+            }
+        });
+
+        if self.pending_roi_manager_delete_all {
+            ui.separator();
+            ui.label("Delete all items on the list?");
+            ui.horizontal(|ui| {
+                if ui.button("Yes").clicked() {
+                    let _ = self.session.dispatch(Command::RoiManagerDelete { indices: Vec::new() });
+                    self.pending_roi_manager_delete_all = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.pending_roi_manager_delete_all = false;
+                }
+            });
+        }
+
+        ui.separator();
+        let entries = self
+            .session
+            .roi_manager
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (index, name) in entries.iter().enumerate() {
+                let selected = self.session.roi_manager_selected.contains(&index);
+                if ui.selectable_label(selected, name).clicked() {
+                    let multi = ui.input(|input| input.modifiers.command || input.modifiers.shift);
+                    let mut selected_indices = self.session.roi_manager_selected.clone();
+                    if multi {
+                        if let Some(position) = selected_indices.iter().position(|&item| item == index) {
+                            selected_indices.remove(position);
+                        } else {
+                            selected_indices.push(index);
+                            selected_indices.sort_unstable();
+                        }
+                    } else {
+                        selected_indices = vec![index];
+                    }
+                    if !selected_indices.is_empty() {
+                        let _ = self.session.dispatch(Command::RoiManagerSelect { index });
+                    }
+                    self.session.roi_manager_selected = selected_indices;
+                }
+            }
+        });
+    }
+
+    fn render_roi_manager_window(&mut self, ctx: &egui::Context) {
+        let mut is_open = true;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_roi_manager_window"),
+            egui::ViewportBuilder::default()
+                .with_title("ROI Manager")
+                .with_inner_size([300.0, 360.0])
+                .with_min_inner_size([220.0, 200.0]),
+            |ctx, class| {
+                if !matches!(class, egui::ViewportClass::Embedded)
+                    && ctx.input(|input| input.viewport().close_requested())
+                {
+                    is_open = false;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| self.render_roi_manager_content(ui));
+            },
+        );
+        if !is_open {
+            self.show_roi_manager_window = false;
+            self.pending_roi_manager_delete_all = false;
         }
     }
 }

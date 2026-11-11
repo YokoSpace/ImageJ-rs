@@ -171,6 +171,8 @@ pub struct ImageJApp {
     pub progress: Option<f32>,
     pub image_views: BTreeMap<ImageId, ImageView>,
     pub show_results_window: bool,
+    pub show_roi_manager_window: bool,
+    pub pending_roi_manager_delete_all: bool,
     pub histogram_window: Option<HistogramWindowState>,
     /// `Analyze > Plot Profile` window; one snapshot per command.
     pub plot_profile_window: Option<PlotProfileWindowState>,
@@ -230,6 +232,8 @@ impl ImageJApp {
             progress: None,
             image_views: BTreeMap::new(),
             show_results_window: false,
+            show_roi_manager_window: false,
+            pending_roi_manager_delete_all: false,
             histogram_window: None,
             plot_profile_window: None,
             dialogs: DialogState::new(),

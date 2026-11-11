@@ -170,6 +170,13 @@ impl ImageJApp {
             return;
         }
 
+        // Selection > Add to Manager uses ImageJ's unmodified T shortcut.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T)) {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::AddToRoiManager, ctx);
+            return;
+        }
+
         // Zoom In: '+' or '='
         let zoom_in = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
