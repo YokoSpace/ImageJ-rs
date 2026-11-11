@@ -602,6 +602,40 @@ fn short_to_byte(pixel: u16, min: i32, scale: f64) -> u8 {
     }
 }
 
+/// TypeConverter.convertFloatToShort (TypeConverter.java 178-199) with
+/// scaling. Java clamps before adding 0.5 and casting through a short, which
+/// keeps 65535 representable as the unsigned value.
+fn float_to_short(pixel: f32, min: f64, scale: f64) -> u16 {
+    let mut value = (f64::from(pixel) - min) * scale;
+    if value < 0.0 {
+        value = 0.0;
+    }
+    if value > 65535.0 {
+        value = 65535.0;
+    }
+    (value + 0.5) as u16
+}
+
+/// ShortProcessor.findMinAndMax (ShortProcessor.java 70-87) over a converted
+/// 16-bit plane. ImageJ never stores NaN in a ShortProcessor, so the lazy
+/// processor range is just the pixel minimum and maximum.
+fn gray16_display_range(pixels: &[u16]) -> DisplayRange {
+    let mut min = u16::MAX;
+    let mut max = 0u16;
+    for &value in pixels {
+        if value < min {
+            min = value;
+        }
+        if value > max {
+            max = value;
+        }
+    }
+    DisplayRange {
+        min: f64::from(min),
+        max: f64::from(max),
+    }
+}
+
 /// FloatProcessor.create8BitImage (FloatProcessor.java 190-208).
 fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
     let mut value = f64::from(pixel) - min;
@@ -1435,6 +1469,153 @@ impl ImageDocument {
                 max: 255.0,
             };
         }
+    }
+
+    /// Converts every plane to 16-bit grayscale, matching `Image > Type >
+    /// 16-bit` with `doScaling = true` and `Prefs.calibrateConversions = false`.
+    /// Single images go through `ImageConverter.convertToGray16`
+    /// (ImageConverter.java 58-77); stacks go through
+    /// `StackConverter.convertToGray16` (StackConverter.java 144-180).
+    ///
+    /// `COLOR_256` images throw `IllegalArgumentException` in Java
+    /// (ImageConverter.java 59-62), and stacks of any type other than GRAY8 or
+    /// GRAY32 throw from the stack converter (StackConverter.java 145-148).
+    pub fn convert_to_16bit(&mut self) -> Result<(), CoreError> {
+        // Converter.java 55-56 resets the threshold before the type checks, and
+        // the catch block (Converter.java 136-143) does not restore it.
+        self.threshold = None;
+        if self.slices.len() > 1 {
+            return self.convert_stack_to_16bit();
+        }
+        if matches!(self.slices[0], PixelPlane::Color256 { .. }) {
+            // ImageConverter.java 59-62 rejects COLOR_256 even for a
+            // pseudo-color LUT. Converter.java 136-143 only aborts the macro.
+            return Err(CoreError::InvalidOperation("Unsupported conversion"));
+        }
+        // Undo.setup(Undo.TYPE_CONVERSION, imp) runs for single images only
+        // (Converter.java 100-101); a GRAY16 no-op also replaces the buffer.
+        self.save_snapshot();
+        let converted = match self.slices[0].clone() {
+            // ImageConverter.java 59-60 returns without touching anything.
+            PixelPlane::Gray16(_) => return Ok(()),
+            // convertByteToShort (TypeConverter.java 149-160).
+            PixelPlane::Gray8(pixels) => {
+                PixelPlane::Gray16(pixels.into_iter().map(u16::from).collect())
+            }
+            PixelPlane::Gray32(pixels) => {
+                // FloatProcessor.setMinAndMax stores the bounds as float
+                // (FloatProcessor.java 123-133).
+                let min = f64::from(self.display_range.min as f32);
+                let max = f64::from(self.display_range.max as f32);
+                let scale = if (max - min) == 0.0 {
+                    1.0
+                } else {
+                    65535.0 / (max - min)
+                };
+                PixelPlane::Gray16(
+                    pixels
+                        .iter()
+                        .map(|&px| float_to_short(px, min, scale))
+                        .collect(),
+                )
+            }
+            // convertToShort sends RGB through convertRGBToByte
+            // (TypeConverter.java 149-160); the ByteProcessor levels become
+            // u16 values unchanged.
+            PixelPlane::ColorRgb(pixels) => PixelPlane::Gray16(
+                pixels.iter().map(|&px| u16::from(rgb_to_byte(px))).collect(),
+            ),
+            PixelPlane::Color256 { .. } => unreachable!("COLOR_256 was rejected above"),
+        };
+        self.slices[0] = converted;
+        // `imp.setProcessor` installs a fresh ShortProcessor whose range is
+        // computed lazily from the new pixels (ShortProcessor.java 70-87), so
+        // any custom display range is replaced by the data range.
+        self.snapshot_display_range = Some(self.display_range);
+        let PixelPlane::Gray16(pixels) = &self.slices[0] else {
+            unreachable!("conversion always produces Gray16")
+        };
+        self.display_range = gray16_display_range(pixels);
+        Ok(())
+    }
+
+    fn convert_stack_to_16bit(&mut self) -> Result<(), CoreError> {
+        let current = self.current_slice_index();
+        // StackConverter.java 145-148 only accepts GRAY8 and GRAY32; GRAY16 is
+        // a silent no-op on line 146.
+        match self.slices[current] {
+            PixelPlane::Gray16(_) => return Ok(()),
+            PixelPlane::Gray8(_) | PixelPlane::Gray32(_) => {}
+            _ => return Err(CoreError::InvalidOperation("Unsupported conversion")),
+        }
+        // ImageJ stacks share one type, so a mixed Rust stack has no Java
+        // equivalent; reject it rather than convert some planes silently.
+        if self.slices.iter().any(|plane| {
+            matches!(
+                plane,
+                PixelPlane::ColorRgb(_) | PixelPlane::Color256 { .. }
+            )
+        }) {
+            return Err(CoreError::InvalidOperation("Unsupported conversion"));
+        }
+        // A whole-stack type conversion does not create an Undo buffer.
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
+
+        // StackConverter.java 167 only scales a GRAY32 stack; GRAY8 stacks
+        // keep their 0..=255 values (convertByteToShort ignores the scale).
+        let source_is_32 = matches!(self.slices[current], PixelPlane::Gray32(_));
+        let min = f64::from(self.display_range.min as f32);
+        let max = f64::from(self.display_range.max as f32);
+        let scale = if (max - min) == 0.0 {
+            1.0
+        } else {
+            65535.0 / (max - min)
+        };
+        self.slices = self
+            .slices
+            .iter()
+            .map(|plane| match plane {
+                // convertByteToShort keeps the 8-bit value (TypeConverter.java
+                // 149-160).
+                PixelPlane::Gray8(pixels) => {
+                    PixelPlane::Gray16(pixels.iter().map(|&px| u16::from(px)).collect())
+                }
+                // convertToShort returns the ShortProcessor itself
+                // (TypeConverter.java 151).
+                PixelPlane::Gray16(pixels) => PixelPlane::Gray16(pixels.clone()),
+                // Every slice is converted with the current processor's range
+                // (StackConverter.java 167-171).
+                PixelPlane::Gray32(pixels) => PixelPlane::Gray16(
+                    pixels
+                        .iter()
+                        .map(|&px| float_to_short(px, min, scale))
+                        .collect(),
+                ),
+                PixelPlane::ColorRgb(_) | PixelPlane::Color256 { .. } => {
+                    unreachable!("color stacks were rejected above")
+                }
+            })
+            .collect();
+        if source_is_32 {
+            // StackConverter.java 178-179 resets the display range.
+            self.display_range = DisplayRange {
+                min: 0.0,
+                max: 65535.0,
+            };
+        } else {
+            // A GRAY8 stack leaves every new ShortProcessor with the range
+            // ImageStack.addSlice captured from the first added slice
+            // (ImageStack.java 116-119); getProcessor then applies that stack
+            // range to every slice (ImageStack.java 330-331). This is the
+            // first slice, not the current one.
+            let PixelPlane::Gray16(pixels) = &self.slices[0] else {
+                unreachable!("conversion always produces Gray16")
+            };
+            self.display_range = gray16_display_range(pixels);
+        }
+        Ok(())
     }
 
     pub fn save_snapshot(&mut self) {
@@ -2682,6 +2863,42 @@ mod tests {
         assert!(doc.undo());
         assert_eq!(doc.plane(), &converted);
         assert_eq!(doc.display_range, DisplayRange { min: 0.0, max: 255.0 });
+    }
+
+    #[test]
+    fn undo_after_16bit_conversion_restores_original_display_range() {
+        // Undo.TYPE_CONVERSION snapshots the processor before the swap
+        // (Converter.java 100-101, Undo.java 149-160).
+        let mut doc = ImageDocument::new(
+            "conversion-16-undo",
+            3,
+            1,
+            PixelPlane::Gray32(vec![0.25, 0.5, 0.75]),
+        )
+        .unwrap();
+        let original = doc.plane().clone();
+        doc.display_range = DisplayRange {
+            min: 0.0,
+            max: 1.0,
+        };
+        doc.convert_to_16bit().unwrap();
+        assert_eq!(doc.plane(), &PixelPlane::Gray16(vec![16384, 32768, 49151]));
+        assert_eq!(
+            doc.display_range,
+            DisplayRange {
+                min: 16384.0,
+                max: 49151.0
+            }
+        );
+        assert!(doc.undo());
+        assert_eq!(doc.plane(), &original);
+        assert_eq!(
+            doc.display_range,
+            DisplayRange {
+                min: 0.0,
+                max: 1.0
+            }
+        );
     }
 
     #[test]

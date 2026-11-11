@@ -142,6 +142,9 @@ pub enum Command {
     /// `run("8-bit")` (Converter.java 38-39). Converts every slice to 8-bit
     /// grayscale with scaling enabled and records `run("8-bit");`.
     ConvertTo8Bit,
+    /// `run("16-bit")` (Converter.java 38-39). Converts every slice to 16-bit
+    /// grayscale with scaling enabled and records `run("16-bit");`.
+    ConvertTo16Bit,
     Smooth,
     Sharpen,
     FindEdges,
@@ -733,6 +736,12 @@ impl Session {
                 self.active_doc_mut()?.convert_to_8bit();
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"8-bit\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::ConvertTo16Bit => {
+                self.active_doc_mut()?.convert_to_16bit()?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"16-bit\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Smooth => {

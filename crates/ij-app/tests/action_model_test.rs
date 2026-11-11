@@ -240,3 +240,115 @@ fn convert_to_8bit_action_requires_an_image_and_converts_it() {
         Some("run(\"8-bit\");")
     );
 }
+
+#[test]
+fn image_type_menu_wires_16bit() {
+    let image = MENU_TREE
+        .iter()
+        .find(|node| node.label == "Image")
+        .expect("Image menu");
+    let ij_app::action::MenuKind::Submenu(nodes) = image.kind else {
+        panic!("Image must be a submenu");
+    };
+    let type_menu = nodes
+        .iter()
+        .find(|node| node.label == "Type")
+        .expect("Type submenu");
+    let ij_app::action::MenuKind::Submenu(type_nodes) = type_menu.kind else {
+        panic!("Type must be a submenu");
+    };
+    let sixteen_bit = type_nodes
+        .iter()
+        .find(|node| node.label == "16-bit")
+        .expect("16-bit item");
+    assert!(matches!(
+        sixteen_bit.kind,
+        ij_app::action::MenuKind::Item(AppAction::ConvertTo16Bit)
+    ));
+}
+
+#[test]
+fn convert_to_16bit_action_requires_a_supported_image() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::ConvertTo16Bit).is_err());
+
+    let indexed = ImageDocument::new(
+        "indexed",
+        2,
+        1,
+        PixelPlane::Color256 {
+            pixels: vec![0, 1],
+            lut: Box::new(ij_core::Lut256::default()),
+        },
+    )
+    .unwrap();
+    let indexed_id = app.session.insert_doc(indexed);
+    app.set_active_window(indexed_id).unwrap();
+    assert!(
+        app.action_enabled(AppAction::ConvertTo16Bit).is_err(),
+        "ImageConverter.java 59-62 rejects COLOR_256"
+    );
+
+    let rgb = ImageDocument::new(
+        "rgb",
+        2,
+        1,
+        PixelPlane::ColorRgb(vec![0x00ff_0000, 0x0000_00ff]),
+    )
+    .unwrap();
+    let rgb_id = app.session.insert_doc(rgb);
+    app.set_active_window(rgb_id).unwrap();
+    assert!(app.action_enabled(AppAction::ConvertTo16Bit).is_ok());
+
+    let rgb_stack = ImageDocument::new_stack(
+        "rgb-stack",
+        2,
+        1,
+        vec![
+            PixelPlane::ColorRgb(vec![0x00ff_0000, 0x0000_00ff]),
+            PixelPlane::ColorRgb(vec![0x0000_ff00, 0x00ff_ffff]),
+        ],
+    )
+    .unwrap();
+    let stack_id = app.session.insert_doc(rgb_stack);
+    app.set_active_window(stack_id).unwrap();
+    assert!(
+        app.action_enabled(AppAction::ConvertTo16Bit).is_err(),
+        "StackConverter.java 145-148 rejects RGB stacks"
+    );
+}
+
+#[test]
+fn convert_to_16bit_action_converts_and_records() {
+    let mut app = ImageJApp::new();
+    let doc = ImageDocument::new(
+        "gray8",
+        3,
+        1,
+        PixelPlane::Gray8(vec![0, 100, 250]),
+    )
+    .unwrap();
+    let id = app.session.insert_doc(doc);
+    app.session.get_image_mut(id).unwrap().display_range = ij_core::DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    assert!(app.action_enabled(AppAction::ConvertTo16Bit).is_ok());
+
+    app.perform(AppAction::ConvertTo16Bit, &Context::default());
+
+    let doc = app.session.get_image(id).unwrap();
+    assert_eq!(doc.plane(), &PixelPlane::Gray16(vec![0, 100, 250]));
+    assert_eq!(
+        doc.display_range,
+        ij_core::DisplayRange {
+            min: 0.0,
+            max: 250.0
+        },
+        "a new ShortProcessor reports its own data range (ShortProcessor.java 70-87)"
+    );
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"16-bit\");")
+    );
+}

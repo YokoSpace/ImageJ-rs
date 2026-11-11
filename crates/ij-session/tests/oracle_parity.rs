@@ -9573,3 +9573,269 @@ fn convert_to_8bit_is_a_noop_for_gray8() {
         "ImageConverter.java 42-45 only swaps the LUT for 8-bit images"
     );
 }
+
+/// ImageConverter.convertToGray16 (ImageConverter.java 58-77) for single
+/// images: 8-bit pixels are copied unchanged (TypeConverter.java 149-160) and
+/// the new ShortProcessor reports its own lazily computed min/max.
+#[test]
+fn parity_convert_to_16bit_gray8_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0u8; 32];
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        *pixel = ((i * 37 + 11) % 251) as u8;
+    }
+    let mut doc =
+        ImageDocument::new("convert_to_16.tif", 8, 4, PixelPlane::Gray8(pixels)).unwrap();
+    doc.display_range = DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"16-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_16bit().unwrap();
+    let PixelPlane::Gray16(out) = doc.plane() else {
+        panic!("expected Gray16 after conversion, got {:?}", doc.plane());
+    };
+    let oracle_pixels = match oracle_doc.plane() {
+        PixelPlane::Gray16(v) => v.clone(),
+        other => panic!("unexpected oracle plane {other:?}"),
+    };
+    assert_eq!(out, &oracle_pixels, "8-bit -> 16-bit pixels differ");
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+/// TypeConverter.convertFloatToShort (TypeConverter.java 178-199) scales by
+/// 65535/(max-min), clamps to 0..=65535 and rounds with +0.5, including the
+/// max==min fallback scale of 1.0.
+#[test]
+fn parity_convert_to_16bit_gray32_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0f32; 32];
+    for (i, value) in pixels.iter_mut().enumerate() {
+        *value = (i as f32 - 4.0) * 0.25;
+    }
+    pixels[0] = -100.0;
+    pixels[1] = 100.0;
+    pixels[2] = 0.0;
+    pixels[3] = 0.5;
+    pixels[4] = f32::NAN;
+    pixels[5] = f32::INFINITY;
+    pixels[6] = f32::NEG_INFINITY;
+    for (min, max) in [
+        (-1.0, 1.0),
+        (0.0, 1.0),
+        (0.25, 0.75),
+        (0.1, 1.1),
+        (5.0, 5.0),
+        (2.0, 1.0),
+    ] {
+        let mut doc = ImageDocument::new(
+            "convert_to_16_from_32.tif",
+            8,
+            4,
+            PixelPlane::Gray32(pixels.clone()),
+        )
+        .unwrap();
+        doc.display_range = DisplayRange { min, max };
+        let oracle = bridge
+            .run_macro_on_image(&doc, "run(\"16-bit\");")
+            .unwrap();
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_16bit().unwrap();
+        assert_eq!(
+            doc.slices, oracle_doc.slices,
+            "32-bit -> 16-bit pixels differ for display range {min}..{max}"
+        );
+        assert_eq!(
+            doc.display_range, oracle_doc.display_range,
+            "32-bit -> 16-bit display range differs for {min}..{max}"
+        );
+    }
+}
+
+/// TypeConverter.convertToShort (TypeConverter.java 149-160) sends RGB through
+/// convertRGBToByte (equal 1/3 weights, TypeConverter.java 95-117) and then
+/// convertByteToShort, so the result is the 0..=255 gray level as a u16.
+#[test]
+fn parity_convert_to_16bit_rgb_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0u32; 32];
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        let r = (i * 37) % 256;
+        let g = (i * 53 + 7) % 256;
+        let b = (i * 97 + 11) % 256;
+        *pixel = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+    }
+    pixels[0] = 0x00ff_0000;
+    pixels[1] = 0x0000_ff00;
+    pixels[2] = 0x0000_00ff;
+    pixels[3] = 0x00ff_ffff;
+    let mut doc =
+        ImageDocument::new("convert_rgb_to_16.tif", 8, 4, PixelPlane::ColorRgb(pixels)).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"16-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_16bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+/// StackConverter.convertToGray16 (StackConverter.java 144-180) applies the
+/// current processor's display range to every slice but only scales when the
+/// source stack is 32-bit; a GRAY32 stack also gets setDisplayRange(0,65535).
+#[test]
+fn parity_convert_to_16bit_gray8_stack_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = distinct_stack_8bit(8, 6, 3);
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    doc.display_range = DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    doc.slice_labels = vec![
+        Some("first".into()),
+        Some("second".into()),
+        Some("third".into()),
+    ];
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "Property.setSliceLabel(\"first\",1); Property.setSliceLabel(\"second\",2); \
+             Property.setSliceLabel(\"third\",3); setSlice(2); run(\"16-bit\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_16bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+    assert_eq!(doc.slice_labels, oracle_doc.slice_labels);
+    // The TIFF format does not persist the current slice, so compare it to the
+    // pre-conversion position instead of the reloaded oracle document.
+    assert_eq!(doc.current_slice, 2);
+}
+
+#[test]
+fn parity_convert_to_16bit_gray32_stack_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = distinct_stack_gray32(8, 6, 3);
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+
+    let oracle = bridge
+        .run_macro_on_image(&doc, "setSlice(2); run(\"16-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_16bit().unwrap();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(
+        doc.display_range,
+        DisplayRange {
+            min: 0.0,
+            max: 65535.0
+        },
+        "StackConverter.java 178-179 sets the display range to 0..65535 for 32-bit stacks"
+    );
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+    // The TIFF format does not persist the current slice.
+    assert_eq!(doc.current_slice, 2);
+}
+
+/// ImageConverter.convertToGray16 throws IllegalArgumentException for
+/// COLOR_256 images (ImageConverter.java 59-62); Converter.java 136-143 turns
+/// that into an aborted macro instead of a converted image.
+#[test]
+fn convert_to_16bit_rejects_color256_like_java() {
+    let mut doc = ImageDocument::new(
+        "indexed.tif",
+        4,
+        2,
+        PixelPlane::Color256 {
+            pixels: (0..8).collect(),
+            lut: Box::new(Lut256::default()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        doc.convert_to_16bit(),
+        Err(CoreError::InvalidOperation("Unsupported conversion"))
+    );
+    assert!(
+        matches!(doc.plane(), PixelPlane::Color256 { .. }),
+        "a rejected conversion must not modify the pixels"
+    );
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.macro_recorder.clear();
+    assert!(session.dispatch(Command::ConvertTo16Bit).is_err());
+}
+
+/// StackConverter.convertToGray16 rejects any stack that is not GRAY8/GRAY32
+/// (StackConverter.java 145-148), so RGB stacks cannot become 16-bit even
+/// though single RGB images can (ImageConverter.java 59-62 only admits
+/// GRAY8, GRAY32 and COLOR_RGB before the stack branch).
+#[test]
+fn convert_to_16bit_rejects_rgb_stacks_like_java() {
+    let stack = ImageDocument::new_stack(
+        "rgb_stack.tif",
+        2,
+        1,
+        vec![
+            PixelPlane::ColorRgb(vec![0x00ff_0000, 0x0000_ff00]),
+            PixelPlane::ColorRgb(vec![0x0000_00ff, 0x00ff_ffff]),
+        ],
+    )
+    .unwrap();
+    let mut doc = stack;
+    assert_eq!(
+        doc.convert_to_16bit(),
+        Err(CoreError::InvalidOperation("Unsupported conversion"))
+    );
+    assert!(matches!(doc.plane(), PixelPlane::ColorRgb(_)));
+}
+
+#[test]
+fn session_convert_to_16bit_records_macro_and_clears_threshold() {
+    let mut doc = convert_gray16_pattern(4, 2);
+    doc.display_range = DisplayRange {
+        min: 0.0,
+        max: 65535.0,
+    };
+    doc.threshold = Some(ThresholdLevels {
+        lower: 10.0,
+        upper: 20.0,
+    });
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.macro_recorder.clear();
+
+    session.dispatch(Command::ConvertTo16Bit).unwrap();
+
+    let doc = session.active_doc().unwrap();
+    assert!(matches!(doc.plane(), PixelPlane::Gray16(_)));
+    assert_eq!(doc.threshold, None);
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"16-bit\");".to_string()]
+    );
+}

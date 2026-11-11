@@ -495,6 +495,23 @@ impl ImageJApp {
         }
     }
 
+    pub fn convert_to_16bit_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("16-bit") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::ConvertTo16Bit) {
+            Ok(_) => {
+                self.status_message = "Converting to 16-bit...".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("16-bit conversion failed: {e}");
+                self.dialogs.last_error = Some(format!("16-bit conversion failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     /// Starts a filter or, for a multi-slice image, opens the ImageJ
     /// "Process Stack?" decision. A pending question deliberately performs no
     /// pixel work, so Cancel cannot dirty the document.

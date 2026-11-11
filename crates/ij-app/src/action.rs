@@ -16,6 +16,7 @@ pub enum AppAction {
     Invert,
     Crop,
     ConvertTo8Bit,
+    ConvertTo16Bit,
     SelectNone,
     BrightnessContrast,
     Threshold,
@@ -131,7 +132,7 @@ const IMAGE_ADJUST: &[MenuNode] = &[
 const IMAGE_STACKS: &[MenuNode] = &[item("Invert Stack", None, AppAction::InvertStack)];
 const IMAGE_TYPE: &[MenuNode] = &[
     item("8-bit", None, AppAction::ConvertTo8Bit),
-    unsupported("16-bit", None),
+    item("16-bit", None, AppAction::ConvertTo16Bit),
     unsupported("32-bit", None),
     unsupported("RGB Color", None),
 ];
@@ -267,6 +268,13 @@ impl ImageJApp {
                         _ => Err("Area selection required".into()),
                     },
                     Threshold if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_)) || doc.stack_size() != 1 => Err("Threshold is only supported on single-slice 8-bit or 16-bit grayscale images".into()),
+                    ConvertTo16Bit => match doc.plane() {
+                        // ImageConverter.java 59-62 rejects COLOR_256.
+                        PixelPlane::Color256 { .. } => Err("16-bit conversion is not supported for 8-bit color images".into()),
+                        // StackConverter.java 145-148 rejects non-GRAY8/GRAY32 stacks.
+                        PixelPlane::ColorRgb(_) if doc.stack_size() > 1 => Err("16-bit conversion is not supported for RGB stacks".into()),
+                        _ => Ok(()),
+                    },
                     Median if !matches!(doc.plane(), PixelPlane::Gray8(_)) => Err("Median requires an 8-bit image".into()),
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
                     _ => Ok(()),
@@ -333,6 +341,9 @@ impl ImageJApp {
             }
             ConvertTo8Bit => {
                 let _ = self.convert_to_8bit_active();
+            }
+            ConvertTo16Bit => {
+                let _ = self.convert_to_16bit_active();
             }
             SelectNone => {
                 let _ = self.clear_roi();
