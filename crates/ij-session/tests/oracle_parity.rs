@@ -1,8 +1,9 @@
 use ij_bridge::JavaOracleBridge;
 use ij_core::{
-    display_histogram, format_ij_num, CoreError, DisplayHistogram, DisplayRange, ImageDocument,
-    LineRoi, Lut256, MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane,
-    PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition, ThresholdLevels, Wand, WandMode,
+    default_duplicate_title, display_histogram, format_ij_num, CoreError, DisplayHistogram,
+    DisplayRange, ImageDocument, LineRoi, Lut256, MeasurementConfig, MeasurementFlags,
+    MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
+    ThresholdLevels, Wand, WandMode,
 };
 use ij_io::{load_tiff, save_tiff};
 use ij_session::{Command, CommandOutcome, Session};
@@ -10076,6 +10077,302 @@ fn crop_rejects_missing_line_and_outside_selections() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// M2 Image > Duplicate... (original_imagej/ij/plugin/Duplicator.java 36-135,
+// 230-355 and WindowManager.java 357-385). Duplicator keeps the source
+// calibration/display range through ImagePlus.createImagePlus (ImagePlus.java
+// 2649-2654) and ImageProcessor.createProcessor, copies stack labels, and
+// relocates non-rectangular ROIs to (0,0).
+// ---------------------------------------------------------------------------
+
+/// Runs Duplicate... against the real 1.54u oracle. `prelude` executes while
+/// the source image is current; the helper then reselects the source by title
+/// so a prelude may create extra windows (for the unique-title cases).
+fn oracle_duplicate(
+    doc: &ImageDocument,
+    prelude: &str,
+    options: &str,
+) -> (ImageDocument, String) {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let title = doc.title.replace('"', "'");
+    // GenericDialog only enters macro mode when Macro.getOptions() is
+    // non-null, so the default dialog fields need a " " options string.
+    let options = if options.is_empty() { " " } else { options };
+    let macro_text = format!(
+        "rename(\"{title}\"); {prelude} selectWindow(\"{title}\"); \
+         run(\"Duplicate...\", \"{options}\"); \
+         print(\"DUP_TITLE:\"+getTitle()); print(\"DUP_SLICE:\"+getSliceNumber()); \
+         getDimensions(dw,dh,dc,dw2,df); \
+         print(\"DUP_DIMS:\"+dw+\",\"+dh+\",\"+dc+\",\"+dw2+\",\"+df); \
+         Property.set(\"UniqueName\",\"\"); Property.set(\"Slice_Label\",\"\");"
+    );
+    let output = bridge.run_macro_on_image(doc, &macro_text).unwrap();
+    (
+        output.output_image.expect("oracle must return saved TIFF"),
+        output.stdout,
+    )
+}
+
+fn oracle_duplicate_field<'a>(stdout: &'a str, prefix: &str) -> &'a str {
+    oracle_line(stdout, prefix)
+        .strip_prefix(prefix)
+        .unwrap_or_else(|| panic!("missing {prefix} in oracle output:\n{stdout}"))
+}
+
+fn duplicate_stack_input() -> ImageDocument {
+    let mut doc = distinct_stack_16bit(8, 6, 4);
+    doc.title = "dupe16.tif".to_string();
+    doc.slice_labels = vec![
+        Some("L1".into()),
+        Some("L2".into()),
+        Some("L3".into()),
+        Some("L4".into()),
+    ];
+    doc.display_range = DisplayRange { min: 100.0, max: 500.0 };
+    doc
+}
+
+fn assert_duplicate_matches_oracle(
+    actual: &ImageDocument,
+    oracle_doc: &ImageDocument,
+    oracle_stdout: &str,
+    context: &str,
+) {
+    assert_eq!(
+        actual.title,
+        oracle_duplicate_field(oracle_stdout, "DUP_TITLE:"),
+        "{context}: title"
+    );
+    assert_eq!(
+        actual.current_slice,
+        oracle_duplicate_field(oracle_stdout, "DUP_SLICE:")
+            .parse::<u32>()
+            .unwrap(),
+        "{context}: current slice"
+    );
+    let dims: Vec<u32> = oracle_duplicate_field(oracle_stdout, "DUP_DIMS:")
+        .split(',')
+        .map(|value| value.parse::<u32>().unwrap())
+        .collect();
+    assert_eq!(
+        actual.get_dimensions().to_vec(),
+        dims,
+        "{context}: dimensions"
+    );
+    assert_eq!(actual.slices, oracle_doc.slices, "{context}: pixels");
+    assert_eq!(
+        (actual.width, actual.height),
+        (oracle_doc.width, oracle_doc.height),
+        "{context}: size"
+    );
+    assert_eq!(
+        actual.slice_labels, oracle_doc.slice_labels,
+        "{context}: slice labels"
+    );
+    assert_eq!(
+        actual.calibration, oracle_doc.calibration,
+        "{context}: calibration"
+    );
+    assert_eq!(
+        actual.display_range, oracle_doc.display_range,
+        "{context}: display range"
+    );
+    assert_eq!(actual.roi, oracle_doc.roi, "{context}: ROI");
+}
+
+/// WindowManager.getUniqueName String overload (WindowManager.java 357-385):
+/// the extension is split only when shorter than six characters, a trailing
+/// -N with fewer than four characters remaining is stripped, digits count
+/// only when the first one is not '0', and the first free -1..-99 wins.
+#[test]
+fn default_duplicate_title_matches_window_manager_rules() {
+    assert_eq!(default_duplicate_title(&[], "blobs.tif"), "blobs-1.tif");
+    assert_eq!(
+        default_duplicate_title(&["blobs-1.tif"], "blobs.tif"),
+        "blobs-2.tif"
+    );
+    assert_eq!(default_duplicate_title(&[], "ramp"), "ramp-1");
+    // WindowManager.java 364: len-lastDot < 6, so ".jpeg" is an extension.
+    assert_eq!(
+        default_duplicate_title(&[], "blobs.jpeg"),
+        "blobs-1.jpeg"
+    );
+    assert_eq!(
+        default_duplicate_title(&[], "archive.tar.gz"),
+        "archive.tar-1.gz"
+    );
+    // WindowManager.java 371-373: source "blobs-1.tif" loses "-1" first.
+    assert_eq!(
+        default_duplicate_title(&[], "blobs-1.tif"),
+        "blobs-1.tif"
+    );
+    assert_eq!(
+        default_duplicate_title(&["blobs-1.tif"], "blobs-1.tif"),
+        "blobs-2.tif"
+    );
+    // A dot six or more characters from the end is not treated as an
+    // extension (WindowManager.java 364).
+    assert_eq!(
+        default_duplicate_title(&[], "data.backup1"),
+        "data.backup1-1"
+    );
+}
+
+#[test]
+fn parity_duplicate_single_image_matches_java_oracle() {
+    let mut doc = ImageDocument::new_ramp_8bit("blobs.tif", 10, 8).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.25;
+    doc.calibration.unit = "mm".to_string();
+    doc.display_range = DisplayRange { min: 10.0, max: 200.0 };
+
+    let (oracle_doc, stdout) = oracle_duplicate(&doc, "", "");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, false, None).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "single");
+}
+
+#[test]
+fn parity_duplicate_rect_roi_matches_java_oracle() {
+    let mut doc = ImageDocument::new_ramp_8bit("blobs.tif", 10, 8).unwrap();
+    doc.set_rect_roi(2, 1, 4, 3).unwrap();
+
+    let (oracle_doc, stdout) =
+        oracle_duplicate(&doc, "makeRectangle(2,1,4,3);", "");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, false, None).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "rect");
+    // Duplicator.java 121-123 only re-installs non-rectangular area ROIs.
+    assert_eq!(actual.roi, None);
+}
+
+#[test]
+fn parity_duplicate_oval_and_polygon_rois_are_relocated() {
+    let mut oval = ImageDocument::new_ramp_8bit("oval.tif", 10, 8).unwrap();
+    oval.set_oval_roi(2, 1, 4, 3).unwrap();
+    let (oracle_oval, oval_stdout) =
+        oracle_duplicate(&oval, "makeOval(2,1,4,3);", "");
+    let oval_title = default_duplicate_title(&[oval.title.as_str()], &oval.title);
+    let actual_oval = oval.duplicate(oval_title, false, None).unwrap();
+    assert_duplicate_matches_oracle(&actual_oval, &oracle_oval, &oval_stdout, "oval");
+    assert_eq!(
+        actual_oval.roi,
+        Some(Roi::Oval(RectRoi {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 3
+        }))
+    );
+
+    let mut polygon = ImageDocument::new_ramp_8bit("polygon.tif", 10, 8).unwrap();
+    polygon
+        .set_polygon_roi(&[(3, 2), (7, 2), (7, 6), (3, 6)])
+        .unwrap();
+    let (oracle_polygon, polygon_stdout) =
+        oracle_duplicate(&polygon, "makePolygon(3,2,7,2,7,6,3,6);", "");
+    let polygon_title = default_duplicate_title(&[polygon.title.as_str()], &polygon.title);
+    let actual_polygon = polygon.duplicate(polygon_title, false, None).unwrap();
+    assert_duplicate_matches_oracle(
+        &actual_polygon,
+        &oracle_polygon,
+        &polygon_stdout,
+        "polygon",
+    );
+    assert_eq!(
+        actual_polygon.roi,
+        Some(Roi::Polygon(PolygonRoi {
+            xpoints: vec![0, 4, 4, 0],
+            ypoints: vec![0, 0, 4, 4],
+        }))
+    );
+}
+
+#[test]
+fn parity_duplicate_ignores_line_roi() {
+    let mut doc = ImageDocument::new_ramp_8bit("line.tif", 10, 8).unwrap();
+    doc.set_line_roi(2, 3, 8, 6);
+    let (oracle_doc, stdout) =
+        oracle_duplicate(&doc, "makeLine(2,3,8,6);", "");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, false, None).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "line");
+    assert_eq!(actual.roi, None);
+    assert_eq!((actual.width, actual.height), (10, 8));
+}
+
+#[test]
+fn parity_duplicate_current_slice_only_matches_java_oracle() {
+    let mut doc = duplicate_stack_input();
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+
+    let prelude = "Property.setSliceLabel(\"L1\",1); Property.setSliceLabel(\"L2\",2); \
+                   Property.setSliceLabel(\"L3\",3); Property.setSliceLabel(\"L4\",4); \
+                   setSlice(2);";
+    let (oracle_doc, stdout) = oracle_duplicate(&doc, prelude, "");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, false, None).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "current slice");
+    assert_eq!(actual.get_dimensions(), [8, 6, 1, 1, 1]);
+    assert_eq!(actual.current_slice, 1);
+    assert_eq!(actual.slices[0], doc.slices[1]);
+}
+
+#[test]
+fn parity_duplicate_full_stack_matches_java_oracle() {
+    let mut doc = duplicate_stack_input();
+    doc.current_slice = 3;
+    doc.position = [1, 3, 1];
+
+    let prelude = "Property.setSliceLabel(\"L1\",1); Property.setSliceLabel(\"L2\",2); \
+                   Property.setSliceLabel(\"L3\",3); Property.setSliceLabel(\"L4\",4); \
+                   setSlice(3);";
+    let (oracle_doc, stdout) = oracle_duplicate(&doc, prelude, "duplicate");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, true, None).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "full stack");
+    assert_eq!(actual.get_dimensions(), [8, 6, 1, 4, 1]);
+    // Duplicator.java 114 restores the source slice only for a full copy.
+    assert_eq!(actual.current_slice, 3);
+}
+
+#[test]
+fn parity_duplicate_range_2_3_matches_java_oracle() {
+    let mut doc = duplicate_stack_input();
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+
+    let prelude = "Property.setSliceLabel(\"L1\",1); Property.setSliceLabel(\"L2\",2); \
+                   Property.setSliceLabel(\"L3\",3); Property.setSliceLabel(\"L4\",4); \
+                   setSlice(2);";
+    let (oracle_doc, stdout) =
+        oracle_duplicate(&doc, prelude, "duplicate range=2-3");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, true, Some((2, 3))).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "range 2-3");
+    assert_eq!(actual.get_dimensions(), [8, 6, 1, 2, 1]);
+    assert_eq!(actual.current_slice, 1);
+    assert_eq!(actual.slices, doc.slices[1..3].to_vec());
+    assert_eq!(actual.slice_labels, doc.slice_labels[1..3].to_vec());
+}
+
+#[test]
+fn parity_duplicate_default_title_matches_java_oracle() {
+    let doc = ImageDocument::new_ramp_8bit("blobs.tif", 10, 8).unwrap();
+    let (_, stdout) = oracle_duplicate(&doc, "", "");
+    let oracle_title = oracle_duplicate_field(&stdout, "DUP_TITLE:");
+    assert_eq!(oracle_title, "blobs-1.tif");
+    assert_eq!(
+        default_duplicate_title(&[doc.title.as_str()], &doc.title),
+        oracle_title
+    );
+
+    let ramp = ImageDocument::new_ramp_8bit("ramp", 10, 8).unwrap();
+    let (_, stdout) = oracle_duplicate(&ramp, "", "");
+    assert_eq!(oracle_duplicate_field(&stdout, "DUP_TITLE:"), "ramp-1");
+}
+
 /// ImageJ's ShortProcessor.setMinAndMax rounds the display range to integers
 /// (original_imagej/ij/process/ShortProcessor.java 267-277), so a 16-bit
 /// conversion sees rounded bounds even when the model stores fractions.
@@ -11890,3 +12187,4 @@ fn session_set_measurements_is_global_and_clamps_decimal_places() {
     session.dispatch(Command::ClearResults).unwrap();
     assert_eq!(session.results.config.precision, 9);
 }
+

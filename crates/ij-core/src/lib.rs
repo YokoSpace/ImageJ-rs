@@ -1025,6 +1025,45 @@ pub struct ThresholdLevels {
     pub upper: f64,
 }
 
+/// Returns ImageJ's unique window title for a duplicate
+/// (`WindowManager.getUniqueName(String)`, original_imagej/ij/WindowManager.java
+/// 357-385).
+///
+/// The extension is split off only when it is shorter than six characters,
+/// a trailing `-N` is stripped when fewer than four characters remain and the
+/// first digit is not `0`, then the first free `-1`..`-99` suffix is used.
+pub fn default_duplicate_title(existing_titles: &[&str], source_title: &str) -> String {
+    let mut name = source_title;
+    let mut extension = "";
+    // WindowManager.java 362-367.
+    if let Some(last_dot) = name.rfind('.') {
+        if name.len() - last_dot < 6 && last_dot != name.len() - 1 {
+            extension = &name[last_dot..];
+            name = &name[..last_dot];
+        }
+    }
+    // WindowManager.java 369-373: only a short trailing -digit token is
+    // replaced; "blobs-10" and "blobs-0" therefore keep their suffix.
+    if let Some(last_dash) = name.rfind('-') {
+        let suffix = &name.as_bytes()[last_dash + 1..];
+        if name.len() - last_dash < 4
+            && last_dash < name.len() - 1
+            && suffix[0].is_ascii_digit()
+            && suffix[0] != b'0'
+        {
+            name = &name[..last_dash];
+        }
+    }
+    // WindowManager.java 375-379.
+    for i in 1..=99 {
+        let candidate = format!("{name}-{i}{extension}");
+        if !existing_titles.iter().any(|title| *title == candidate) {
+            return candidate;
+        }
+    }
+    source_title.to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageDocument {
     pub title: String,
@@ -1622,6 +1661,156 @@ impl ImageDocument {
             Roi::Line(_) => unreachable!("line ROIs are rejected above"),
         };
         Ok(())
+    }
+
+    /// Returns a copy of the image, current slice, or a stack range, matching
+    /// `Duplicator.run(imp)` / `Duplicator.crop(imp)` / `Duplicator.run(imp,
+    /// firstSlice, lastSlice)` (original_imagej/ij/plugin/Duplicator.java
+    /// 230-401).
+    ///
+    /// An area selection is cropped to its clipped bounds; oval and polygon
+    /// selections move to `(0, 0)` in the copy while a rectangle is cleared
+    /// (Duplicator.java 121-123). A line selection is not an area, so it is
+    /// ignored and the whole image is copied. With `duplicate_stack == false`
+    /// only `current_slice` is copied; with `duplicate_stack == true` the
+    /// requested range (or every slice) and its labels are copied.
+    pub fn duplicate(
+        &self,
+        new_title: String,
+        duplicate_stack: bool,
+        slice_range: Option<(u32, u32)>,
+    ) -> Result<ImageDocument, CoreError> {
+        let stack_size = self.stack_size() as u32;
+
+        // Duplicator.cropRoi (Duplicator.java 675-693) intersects an
+        // out-of-bounds selection with the image; a non-rectangular result
+        // becomes a ShapeRoi that the Rust ROI model cannot represent.
+        let mut crop_rect: Option<(u32, u32, u32, u32)> = None;
+        let mut relocated_roi: Option<Roi> = None;
+        if let Some(roi) = &self.roi {
+            if roi.is_area() {
+                let (x, y, width, height) = roi
+                    .clipped_bounds(self.width, self.height)
+                    .map_err(|_| CoreError::InvalidOperation("Selection is outside image"))?;
+                if width == 0 || height == 0 {
+                    return Err(CoreError::InvalidOperation("Selection is outside image"));
+                }
+                let (bx, by, bw, bh) = roi.bounds();
+                let clipped = (i64::from(bx), i64::from(by), i64::from(bw), i64::from(bh))
+                    != (
+                        i64::from(x),
+                        i64::from(y),
+                        i64::from(width),
+                        i64::from(height),
+                    );
+                if !matches!(roi, Roi::Rect(_)) && clipped {
+                    return Err(CoreError::InvalidOperation(
+                        "Duplicate of clipped non-rectangular ROI requires ShapeRoi",
+                    ));
+                }
+                crop_rect = Some((x, y, width, height));
+                // Duplicator.java 121-123 calls roi.setLocation(0, 0) for
+                // non-rectangular area selections.
+                relocated_roi = match roi {
+                    Roi::Rect(_) | Roi::Line(_) => None,
+                    Roi::Oval(r) => Some(Roi::Oval(RectRoi {
+                        x: 0,
+                        y: 0,
+                        width: r.width,
+                        height: r.height,
+                    })),
+                    Roi::Polygon(p) => Some(Roi::Polygon(PolygonRoi {
+                        xpoints: p.xpoints.iter().map(|px| px - x as i32).collect(),
+                        ypoints: p.ypoints.iter().map(|py| py - y as i32).collect(),
+                    })),
+                };
+            }
+        }
+        let crop = |plane: &PixelPlane| match crop_rect {
+            Some((x, y, width, height)) => {
+                crop_plane(plane, self.width, x, y, width, height)
+            }
+            None => plane.clone(),
+        };
+
+        let (planes, labels, n_channels, n_slices, n_frames, current_slice) =
+            if duplicate_stack && stack_size > 1 {
+                // Duplicator.showDialog clamps the Range field to the stack
+                // (Duplicator.java 530-558): first < 1 becomes 1, last past
+                // the end becomes stackSize, and first > last falls back to
+                // the whole stack.
+                let (mut first, mut last) = slice_range.unwrap_or((1, stack_size));
+                first = first.max(1);
+                last = last.min(stack_size);
+                if first > last {
+                    first = 1;
+                    last = stack_size;
+                }
+                let start = (first - 1) as usize;
+                let end = last as usize;
+                let planes = self.slices[start..end].iter().map(&crop).collect();
+                let labels = (start..end)
+                    .map(|index| self.slice_labels.get(index).cloned().unwrap_or(None))
+                    .collect();
+                let count = last - first + 1;
+                if first == 1 && last == stack_size {
+                    // Duplicator.java 284-290 copies the source C/Z/T shape
+                    // and line 114 restores the source current slice.
+                    (
+                        planes,
+                        labels,
+                        self.n_channels,
+                        self.n_slices,
+                        self.n_frames,
+                        self.current_slice.clamp(1, count),
+                    )
+                } else if self.n_frames == stack_size {
+                    // Duplicator.java 384-387: a T-series keeps size in the
+                    // frame dimension.
+                    (planes, labels, 1, 1, count, 1)
+                } else {
+                    (planes, labels, 1, count, 1, 1)
+                }
+            } else {
+                // Duplicator.crop(imp) uses imp.getProcessor(), i.e. the
+                // current stack slice, and stores no Slice_Label on the new
+                // single-plane image (Duplicator.java 316-355).
+                let index = self.current_slice_index();
+                (
+                    vec![crop(&self.slices[index])],
+                    vec![None],
+                    1,
+                    1,
+                    1,
+                    1,
+                )
+            };
+
+        let (width, height) = match crop_rect {
+            Some((_, _, width, height)) => (width, height),
+            None => (self.width, self.height),
+        };
+        let mut doc = ImageDocument::new_hyperstack(
+            new_title,
+            width,
+            height,
+            planes,
+            n_channels,
+            n_slices,
+            n_frames,
+        )?;
+        doc.slice_labels = labels;
+        // ImagePlus.createImagePlus copies the calibration and the cropped
+        // processors keep their min/max display range (ImagePlus.java
+        // 2649-2654, ByteProcessor.java 136-143, ShortProcessor.java 183-188).
+        doc.calibration = self.calibration.clone();
+        doc.display_range = self.display_range;
+        doc.roi = relocated_roi;
+        doc.threshold = None;
+        if current_slice != 1 {
+            doc.set_slice(current_slice as i32)?;
+        }
+        Ok(doc)
     }
 
     /// Converts every plane to 8-bit grayscale, matching `Image > Type > 8-bit`
