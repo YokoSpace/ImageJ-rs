@@ -63,6 +63,7 @@ fn invoke(app: &mut ImageJApp, operation: &StackOperation) -> Result<(), Session
         StackOperation::Minimum { radius } => app.minimum_active(*radius),
         StackOperation::Maximum { radius } => app.maximum_active(*radius),
         StackOperation::Despeckle => app.despeckle_active(),
+        StackOperation::Math(operation) => app.math_active(*operation),
     }
 }
 

@@ -217,6 +217,21 @@ const BUTTON_RECT_ID: &str = "ij_set_measurements_button_rect";
 
 impl ImageJApp {
     pub fn render_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(dialog) = self.dialogs.math.as_ref() {
+            let title = dialog.operation.name();
+            let mut cancel = false;
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("ij_math_dialog"),
+                egui::ViewportBuilder::default().with_title(title)
+                    .with_inner_size([300.0, 125.0]).with_resizable(false),
+                |ctx, class| {
+                    if !matches!(class, egui::ViewportClass::Embedded)
+                        && ctx.input(|i| i.viewport().close_requested()) { cancel = true; }
+                    egui::CentralPanel::default().show(ctx, |ui| self.render_math_content(ui));
+                },
+            );
+            if cancel { let _ = self.resolve_math_dialog(false); }
+        }
         if self.dialogs.show_about {
             let mut is_open = true;
             ctx.show_viewport_immediate(
@@ -2207,5 +2222,167 @@ mod duplicate_dialog_tests {
         assert!(app.session.image_ids().is_empty());
         assert!(app.session.macro_recorder.is_empty());
         assert!(app.status_message.contains("no longer open"));
+    }
+}
+
+#[cfg(test)]
+mod math_dialog_tests {
+    use super::*;
+    use crate::action::AppAction;
+    use ij_core::{ImageDocument, math::MathOperation};
+
+    fn fixture(stack: bool) -> ImageJApp {
+        let mut app = ImageJApp::new();
+        let doc = ImageDocument::new_stack(
+            "math",
+            2,
+            2,
+            vec![PixelPlane::Gray8(vec![1, 2, 3, 4]); if stack { 3 } else { 1 }],
+        )
+        .unwrap();
+        app.session.insert_doc(doc);
+        app
+    }
+
+    #[test]
+    fn math_parameter_dialog_cancel_validation_and_stale_target() {
+        let mut app = fixture(false);
+        let ctx = egui::Context::default();
+        app.perform(AppAction::MathAdd, &ctx);
+        assert_eq!(
+            app.dialogs.math.as_ref().unwrap().operation,
+            MathOperation::Add(25.0)
+        );
+        let before = app.session.active_doc().unwrap().clone();
+        app.resolve_math_dialog(false).unwrap();
+        assert_eq!(app.session.active_doc().unwrap(), &before);
+        app.perform(AppAction::MathGamma, &ctx);
+        app.dialogs.math.as_mut().unwrap().operation = MathOperation::Gamma(0.01);
+        assert!(app.resolve_math_dialog(true).is_err());
+        assert!(app.dialogs.math.is_some());
+        assert_eq!(app.session.active_doc().unwrap(), &before);
+        app.resolve_math_dialog(false).unwrap();
+        app.perform(AppAction::MathSet, &ctx);
+        app.session
+            .insert_doc(ImageDocument::new_ramp_8bit("other", 2, 2).unwrap());
+        assert!(app.resolve_math_dialog(true).is_err());
+        assert!(app.dialogs.math.is_none());
+    }
+
+    #[test]
+    fn math_headless_enter_and_stack_choices_dispatch() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(false);
+        app.perform(AppAction::MathAdd, &ctx);
+        app.dialogs.math.as_mut().unwrap().operation = MathOperation::Add(2.9);
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.render_math_content(ui));
+        });
+        assert!(app.dialogs.math.is_none());
+        assert_eq!(
+            app.session.active_doc().unwrap().plane(),
+            &PixelPlane::Gray8(vec![3, 4, 5, 6])
+        );
+        app.undo_active().unwrap();
+        assert_eq!(
+            app.session.active_doc().unwrap().plane(),
+            &PixelPlane::Gray8(vec![1, 2, 3, 4])
+        );
+        for choice in [
+            StackProcessChoice::Cancel,
+            StackProcessChoice::Current,
+            StackProcessChoice::All,
+        ] {
+            let mut app = fixture(true);
+            app.perform(AppAction::MathSquare, &ctx);
+            assert!(app.pending_stack_process.is_some());
+            app.resolve_stack_process(choice).unwrap();
+            let expected = PixelPlane::Gray8(vec![1, 4, 9, 16]);
+            let source = PixelPlane::Gray8(vec![1, 2, 3, 4]);
+            let doc = app.session.active_doc().unwrap();
+            for (index, plane) in doc.slices.iter().enumerate() {
+                assert_eq!(
+                    plane,
+                    if choice == StackProcessChoice::All
+                        || (choice == StackProcessChoice::Current && index == 0)
+                    {
+                        &expected
+                    } else {
+                        &source
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn math_menu_has_all_operations_and_requires_an_image() {
+        let mut app = ImageJApp::new();
+        for action in [
+            AppAction::MathAdd,
+            AppAction::MathSubtract,
+            AppAction::MathMultiply,
+            AppAction::MathDivide,
+            AppAction::MathMin,
+            AppAction::MathMax,
+            AppAction::MathGamma,
+            AppAction::MathLog,
+            AppAction::MathExp,
+            AppAction::MathSquare,
+            AppAction::MathSquareRoot,
+            AppAction::MathReciprocal,
+            AppAction::MathAbs,
+            AppAction::MathSet,
+        ] {
+            assert!(app.action_enabled(action).is_err());
+        }
+        app.session
+            .insert_doc(ImageDocument::new_ramp_8bit("math", 2, 2).unwrap());
+        assert!(app.action_enabled(AppAction::MathAdd).is_ok());
+    }
+}
+
+impl ImageJApp {
+    fn render_math_content(&mut self, ui: &mut egui::Ui) {
+        let Some(dialog) = self.dialogs.math.as_mut() else {
+            return;
+        };
+        let mut value = dialog.operation.value().unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label("Value:");
+            ui.add(egui::DragValue::new(&mut value).speed(0.1));
+        });
+        dialog.operation = dialog.operation.with_value(value);
+        if matches!(dialog.operation, ij_core::math::MathOperation::Gamma(_)) {
+            ui.label("Gamma must be between 0.05 and 5.0");
+        }
+        let mut answer = None;
+        ui.horizontal(|ui| {
+            if ui.button("OK").clicked() {
+                answer = Some(true);
+            }
+            if ui.button("Cancel").clicked() {
+                answer = Some(false);
+            }
+        });
+        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            answer = Some(true);
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            answer = Some(false);
+        }
+        if let Some(apply) = answer {
+            if let Err(error) = self.resolve_math_dialog(apply) {
+                self.dialogs.last_error = Some(error.to_string());
+            }
+        }
     }
 }

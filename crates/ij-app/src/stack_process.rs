@@ -21,6 +21,7 @@ pub enum StackOperation {
     Minimum { radius: f64 },
     Maximum { radius: f64 },
     Despeckle,
+    Math(ij_core::math::MathOperation),
 }
 
 impl StackOperation {
@@ -35,6 +36,7 @@ impl StackOperation {
             Self::Minimum { .. } => "Minimum",
             Self::Maximum { .. } => "Maximum",
             Self::Despeckle => "Despeckle",
+            Self::Math(operation) => operation.name(),
         }
     }
 
@@ -50,6 +52,7 @@ impl StackOperation {
             Self::Minimum { .. } => "Minimum filter",
             Self::Maximum { .. } => "Maximum filter",
             Self::Despeckle => "Despeckle",
+            Self::Math(operation) => operation.name(),
         }
     }
 
@@ -66,6 +69,7 @@ impl StackOperation {
                 | Self::Minimum { .. }
                 | Self::Maximum { .. }
                 | Self::Despeckle
+                | Self::Math(_)
         )
     }
 
@@ -94,6 +98,10 @@ impl StackOperation {
             Self::Minimum { radius } => Command::Minimum { radius: *radius },
             Self::Maximum { radius } => Command::Maximum { radius: *radius },
             Self::Despeckle => Command::Despeckle,
+            Self::Math(operation) => Command::Math {
+                operation: *operation,
+                whole_stack: false,
+            },
         }
     }
 
@@ -109,6 +117,10 @@ impl StackOperation {
             Self::Minimum { radius } => Some(Command::MinimumStack { radius: *radius }),
             Self::Maximum { radius } => Some(Command::MaximumStack { radius: *radius }),
             Self::Despeckle => Some(Command::DespeckleStack),
+            Self::Math(operation) => Some(Command::Math {
+                operation: *operation,
+                whole_stack: true,
+            }),
         }
     }
 
@@ -125,6 +137,7 @@ impl StackOperation {
             Self::Minimum { radius } => format!("Minimum filter (radius={radius}) applied"),
             Self::Maximum { radius } => format!("Maximum filter (radius={radius}) applied"),
             Self::Despeckle => "Despeckle applied".to_string(),
+            Self::Math(operation) => format!("{} applied", operation.name()),
         }
     }
 

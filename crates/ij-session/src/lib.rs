@@ -184,6 +184,10 @@ pub enum Command {
         frame: i32,
     },
     Invert,
+    Math {
+        operation: ij_core::math::MathOperation,
+        whole_stack: bool,
+    },
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
@@ -1124,6 +1128,47 @@ impl Session {
                 // ImagePlus.setPosition is the interactive hyperstack display path;
                 // discards the processor snapshot but records no macro.
                 doc.set_position(channel, slice, frame);
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Math {
+                operation,
+                whole_stack,
+            } => {
+                let doc = self.active_doc_mut()?;
+                let is_stack = doc.stack_size() > 1;
+                doc.apply_math(operation, whole_stack)?;
+                let mut options = operation
+                    .value()
+                    .map(|v| {
+                        let value = if v == f64::INFINITY {
+                            "Infinity".to_string()
+                        } else if v == f64::NEG_INFINITY {
+                            "-Infinity".to_string()
+                        } else {
+                            v.to_string()
+                        };
+                        format!("value={value}")
+                    })
+                    .unwrap_or_default();
+                if is_stack {
+                    if !options.is_empty() {
+                        options.push(' ');
+                    }
+                    options.push_str(if whole_stack { "stack" } else { "slice" });
+                }
+                let suffix = if operation.value().is_some() {
+                    "..."
+                } else {
+                    ""
+                };
+                let name = operation.name();
+                let recorded = if options.is_empty() {
+                    format!("run(\"{name}{suffix}\");")
+                } else {
+                    format!("run(\"{name}{suffix}\", \"{options}\");")
+                };
+                self.macro_recorder.push(recorded);
+                self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
             Command::Invert => {

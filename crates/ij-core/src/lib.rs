@@ -1,6 +1,7 @@
 pub mod contrast;
 pub mod filters;
 pub mod histogram;
+pub mod math;
 pub mod threshold_palette;
 pub mod wand;
 

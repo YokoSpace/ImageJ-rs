@@ -720,6 +720,66 @@ impl ImageJApp {
         }
     }
 
+    pub fn math_active(
+        &mut self,
+        operation: ij_core::math::MathOperation,
+    ) -> Result<(), SessionError> {
+        use ij_core::math::MathOperation::*;
+        if let Some(error) = self.reject_while_closing(operation.name()) {
+            return Err(error);
+        }
+        if operation.value().is_none() {
+            return self.begin_stack_aware(StackOperation::Math(operation));
+        }
+        let source = self.active_image_id().ok_or(SessionError::NoActiveImage)?;
+        let defaults = &self.dialogs.math_defaults;
+        let value = match operation {
+            Add(_) | Subtract(_) | Set(_) => defaults.add,
+            Multiply(_) | Divide(_) => defaults.multiply,
+            Min(_) => defaults.min,
+            Max(_) => defaults.max,
+            Gamma(_) => defaults.gamma,
+            _ => unreachable!(),
+        };
+        self.dialogs.math = Some(crate::dialogs::MathDialog {
+            source,
+            operation: operation.with_value(value),
+        });
+        Ok(())
+    }
+
+    pub fn resolve_math_dialog(&mut self, apply: bool) -> Result<(), SessionError> {
+        use ij_core::math::MathOperation::*;
+        let Some(dialog) = self.dialogs.math.clone() else {
+            return Ok(());
+        };
+        if !apply {
+            self.dialogs.math = None;
+            return Ok(());
+        }
+        if self.active_image_id() != Some(dialog.source) {
+            self.dialogs.math = None;
+            return Err(SessionError::Core(ij_core::CoreError::InvalidOperation(
+                "Math canceled: active image changed",
+            )));
+        }
+        dialog.operation.validate()?;
+        if let Some(error) = self.reject_while_closing(dialog.operation.name()) {
+            return Err(error);
+        }
+        let defaults = &mut self.dialogs.math_defaults;
+        match dialog.operation {
+            Add(v) | Subtract(v) | Set(v) => defaults.add = v,
+            Multiply(v) | Divide(v) => defaults.multiply = v,
+            Min(v) => defaults.min = v,
+            Max(v) => defaults.max = v,
+            Gamma(v) => defaults.gamma = v,
+            _ => {}
+        }
+        self.dialogs.math = None;
+        self.begin_stack_aware(StackOperation::Math(dialog.operation))
+    }
+
     /// Starts a filter or, for a multi-slice image, opens the ImageJ
     /// "Process Stack?" decision. A pending question deliberately performs no
     /// pixel work, so Cancel cannot dirty the document.

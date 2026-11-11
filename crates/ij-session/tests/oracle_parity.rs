@@ -14280,3 +14280,403 @@ fn parity_set_scale_single_image_tiff_omits_z_spacing_like_java() {
     assert_eq!(rust_saved.calibration, java_saved.calibration);
     assert_eq!(rust_saved.calibration.pixel_depth, 1.0);
 }
+
+fn math_cases() -> Vec<(ij_core::math::MathOperation, &'static str)> {
+    use ij_core::math::MathOperation::*;
+    vec![
+        (Add(2.9), "run(\"Add...\", \"value=2.9\");"),
+        (Subtract(3.9), "run(\"Subtract...\", \"value=3.9\");"),
+        (Multiply(1.5), "run(\"Multiply...\", \"value=1.5\");"),
+        (Divide(2.0), "run(\"Divide...\", \"value=2\");"),
+        (Min(32.9), "run(\"Min...\", \"value=32.9\");"),
+        (Max(127.9), "run(\"Max...\", \"value=127.9\");"),
+        (Gamma(0.7), "run(\"Gamma...\", \"value=0.7\");"),
+        (Log, "run(\"Log\");"),
+        (Exp, "run(\"Exp\");"),
+        (Square, "run(\"Square\");"),
+        (SquareRoot, "run(\"Square Root\");"),
+        (Reciprocal, "run(\"Reciprocal\");"),
+        (Abs, "run(\"Abs\");"),
+        (Set(300.9), "run(\"Set...\", \"value=300.9\");"),
+    ]
+}
+
+fn math_planes() -> Vec<PixelPlane> {
+    let bytes = vec![
+        0, 1, 2, 3, 4, 7, 15, 16, 31, 63, 127, 128, 129, 200, 254, 255,
+    ];
+    vec![
+        PixelPlane::Gray8(bytes.clone()),
+        PixelPlane::Color256 {
+            pixels: bytes.clone(),
+            lut: Box::new(Lut256 {
+                r: (0..=255).collect(),
+                g: vec![0; 256],
+                b: (0..=255).rev().collect(),
+            }),
+        },
+        PixelPlane::Gray16(vec![
+            0, 1, 2, 3, 4, 15, 127, 255, 256, 257, 1000, 32767, 32768, 60000, 65534, 65535,
+        ]),
+        PixelPlane::Gray32(vec![
+            0.0,
+            -0.0,
+            -4.0,
+            -1.5,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            3.0,
+            10.0,
+            90.0,
+            255.0,
+            1.0e10,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ]),
+        PixelPlane::ColorRgb(
+            bytes
+                .iter()
+                .map(|&v| {
+                    0xff00_0000 | ((v as u32) << 16) | (((255 - v) as u32) << 8) | (v / 2) as u32
+                })
+                .collect(),
+        ),
+    ]
+}
+
+fn assert_math_pixels(actual: &ImageDocument, expected: &ImageDocument, context: &str) {
+    assert_eq!(actual.slices.len(), expected.slices.len(), "{context}");
+    for (a, b) in actual.slices.iter().zip(&expected.slices) {
+        match (a, b) {
+            (PixelPlane::Gray32(a), PixelPlane::Gray32(b)) => {
+                for (index, (&a, &b)) in a.iter().zip(b).enumerate() {
+                    assert!(
+                        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                        "{context}, pixel {index}: {a:?} != {b:?}"
+                    );
+                }
+            }
+            // TIFF normalizes the unused alpha byte of packed RGB pixels.
+            (PixelPlane::ColorRgb(a), PixelPlane::ColorRgb(b)) => {
+                assert_eq!(
+                    a.iter().map(|v| v & 0xffffff).collect::<Vec<_>>(),
+                    b.iter().map(|v| v & 0xffffff).collect::<Vec<_>>(),
+                    "{context}"
+                );
+            }
+            (PixelPlane::Color256 { pixels: a, .. }, PixelPlane::Gray8(b)) => {
+                assert_eq!(a, b, "{context}")
+            }
+            _ => assert_eq!(a, b, "{context}"),
+        }
+    }
+}
+
+#[test]
+fn parity_math_all_types_operations_and_undo() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (kind, plane) in math_planes().into_iter().enumerate() {
+        for (operation, java) in math_cases() {
+            let source = ImageDocument::new("math", 4, 4, plane.clone()).unwrap();
+            let oracle = bridge
+                .run_macro_on_image(&source, java)
+                .unwrap()
+                .output_image
+                .unwrap();
+            let mut session = Session::new();
+            let id = session.insert_doc(source.clone());
+            session
+                .dispatch(Command::Math {
+                    operation,
+                    whole_stack: false,
+                })
+                .unwrap();
+            assert_math_pixels(
+                session.active_doc().unwrap(),
+                &oracle,
+                &format!("type {kind} {operation:?}"),
+            );
+            assert!(session.is_dirty(id));
+            let recorded = session.macro_recorder.last().unwrap();
+            let replay = bridge
+                .run_macro_on_image(&source, recorded)
+                .unwrap()
+                .output_image
+                .unwrap();
+            assert_math_pixels(session.active_doc().unwrap(), &replay, "recorded math");
+            let undone = bridge
+                .run_macro_on_image(&source, &format!("{java} run(\"Undo\");"))
+                .unwrap()
+                .output_image
+                .unwrap();
+            assert_eq!(
+                session.dispatch(Command::Undo).unwrap(),
+                CommandOutcome::Undone
+            );
+            assert_math_pixels(session.active_doc().unwrap(), &undone, "math Undo");
+        }
+    }
+}
+
+fn check_math_roi_and_stack_current_all_undo(kind: usize) {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let plane = math_planes().remove(kind);
+    for (operation, java) in math_cases() {
+        for (roi, prelude) in [
+            (None, ""),
+            (
+                Some(Roi::Rect(RectRoi::new(1, 1, 2, 2).unwrap())),
+                "makeRectangle(1,1,2,2);",
+            ),
+            (
+                Some(Roi::Oval(RectRoi::new(-1, 0, 4, 3).unwrap())),
+                "makeOval(-1,0,4,3);",
+            ),
+            (
+                Some(Roi::Polygon(
+                    PolygonRoi::new(&[(0, 0), (4, 1), (1, 4)]).unwrap(),
+                )),
+                "makePolygon(0,0,4,1,1,4);",
+            ),
+            (
+                Some(Roi::Line(LineRoi {
+                    x1: 1,
+                    y1: 1,
+                    x2: 3,
+                    y2: 2,
+                })),
+                "makeLine(1,1,3,2);",
+            ),
+        ] {
+            for whole_stack in [false, true] {
+                let planes = (0..3)
+                    .map(|offset| {
+                        let mut plane = plane.clone();
+                        match &mut plane {
+                            PixelPlane::Gray8(v) | PixelPlane::Color256 { pixels: v, .. } => {
+                                v.rotate_left(offset)
+                            }
+                            PixelPlane::Gray16(v) => v.rotate_left(offset),
+                            PixelPlane::Gray32(v) => v.rotate_left(offset),
+                            PixelPlane::ColorRgb(v) => v.rotate_left(offset),
+                        }
+                        plane
+                    })
+                    .collect();
+                let mut source = ImageDocument::new_stack("math-stack", 4, 4, planes).unwrap();
+                source.set_slice(2).unwrap();
+                source.roi = roi.clone();
+                let option = if whole_stack { "stack" } else { "slice" };
+                let command = if java.contains("value=") {
+                    java.replace("value=", &format!("{option} value="))
+                } else {
+                    java.replace("\");", &format!("\", \"{option}\");"))
+                };
+                // ImagePlus.getMask mutates the shared display processor (1021-1022).
+                // Parallel clipped-mask installation can throw in ImageProcessor.setRoi(878).
+                let undo = if whole_stack { "run(\"Undo\");" } else { "" };
+                let java = format!(
+                    "call(\"ij.Prefs.setThreads\",\"1\"); setSlice(2); {prelude} {command} {undo}"
+                );
+                let oracle = bridge
+                    .run_macro_on_image(&source, &java)
+                    .unwrap()
+                    .output_image
+                    .unwrap();
+                let mut session = Session::new();
+                session.insert_doc(source.clone());
+                session
+                    .dispatch(Command::Math {
+                        operation,
+                        whole_stack,
+                    })
+                    .unwrap();
+                assert_math_pixels(
+                    session.active_doc().unwrap(),
+                    &oracle,
+                    &format!("type {kind} {operation:?} {option} {prelude}"),
+                );
+                assert_eq!(session.active_doc().unwrap().current_slice, 2);
+                assert_eq!(session.active_doc().unwrap().roi, roi);
+                let undo = session.dispatch(Command::Undo).unwrap();
+                if whole_stack {
+                    assert_eq!(undo, CommandOutcome::NothingToUndo);
+                } else {
+                    assert_eq!(undo, CommandOutcome::Undone);
+                    assert_math_pixels(
+                        session.active_doc().unwrap(),
+                        &source,
+                        "current-slice Undo",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_math_gray8_roi_and_stack_current_all_undo() {
+    check_math_roi_and_stack_current_all_undo(0);
+}
+
+#[test]
+fn parity_math_indexed_roi_and_stack_current_all_undo() {
+    check_math_roi_and_stack_current_all_undo(1);
+}
+
+#[test]
+fn parity_math_gray16_roi_and_stack_current_all_undo() {
+    check_math_roi_and_stack_current_all_undo(2);
+}
+
+#[test]
+fn parity_math_gray32_roi_and_stack_current_all_undo() {
+    check_math_roi_and_stack_current_all_undo(3);
+}
+
+#[test]
+fn parity_math_rgb_roi_and_stack_current_all_undo() {
+    check_math_roi_and_stack_current_all_undo(4);
+}
+
+#[test]
+fn parity_math_numeric_edges_and_display_range() {
+    use ij_core::math::MathOperation::*;
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for plane in math_planes() {
+        for (operation, java) in [
+            (
+                Multiply(f64::from_bits(0.5_f64.to_bits() - 1)),
+                "run(\"Multiply...\", \"value=0.49999999999999994\");",
+            ),
+            (Add(f64::INFINITY), "run(\"Add...\", \"value=Infinity\");"),
+            (
+                Multiply(f64::NEG_INFINITY),
+                "run(\"Multiply...\", \"value=-Infinity\");",
+            ),
+            (Set(f64::NAN), "run(\"Set...\", \"value=NaN\");"),
+            (Add(-2.9), "run(\"Add...\", \"value=-2.9\");"),
+            (Subtract(-2.9), "run(\"Subtract...\", \"value=-2.9\");"),
+            (Multiply(-0.5), "run(\"Multiply...\", \"value=-0.5\");"),
+            (Divide(0.0), "run(\"Divide...\", \"value=0\");"),
+            (Multiply(1e20), "run(\"Multiply...\", \"value=1e20\");"),
+            (Set(-1.9), "run(\"Set...\", \"value=-1.9\");"),
+            (Min(-0.5), "run(\"Min...\", \"value=-0.5\");"),
+            (Max(1.5), "run(\"Max...\", \"value=1.5\");"),
+            (Gamma(0.05), "run(\"Gamma...\", \"value=0.05\");"),
+            (Gamma(5.0), "run(\"Gamma...\", \"value=5\");"),
+            (Log, "run(\"Log\");"),
+            (Exp, "run(\"Exp\");"),
+        ] {
+            let mut source = ImageDocument::new("math-range", 4, 4, plane.clone()).unwrap();
+            let prelude = if matches!(plane, PixelPlane::ColorRgb(_)) {
+                ""
+            } else {
+                source.display_range = DisplayRange {
+                    min: 15.0,
+                    max: 200.0,
+                };
+                "setMinAndMax(15,200);"
+            };
+            let oracle = bridge
+                .run_macro_on_image(&source, &format!("{prelude} {java}"))
+                .unwrap()
+                .output_image
+                .unwrap();
+            let mut session = Session::new();
+            session.insert_doc(source);
+            session
+                .dispatch(Command::Math {
+                    operation,
+                    whole_stack: false,
+                })
+                .unwrap();
+            assert_math_pixels(
+                session.active_doc().unwrap(),
+                &oracle,
+                &format!("custom range {operation:?}"),
+            );
+            assert_eq!(
+                session.active_doc().unwrap().display_range,
+                oracle.display_range,
+                "range {operation:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn parity_math_clipped_oval_gamma_stack_regression() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let plane = math_planes().remove(2);
+    let mut source = ImageDocument::new_stack("math-stack", 4, 4, vec![plane; 3]).unwrap();
+    source.set_slice(2).unwrap();
+    source.set_oval_roi(-1, 0, 4, 3).unwrap();
+    for _ in 0..3 {
+        let out = bridge.run_macro_on_image(&source, "call(\"ij.Prefs.setThreads\",\"1\"); setSlice(2); makeOval(-1,0,4,3); run(\"Gamma...\", \"stack value=0.7\");").unwrap();
+        let oracle = out.output_image.unwrap();
+        let mut session = Session::new();
+        session.insert_doc(source.clone());
+        session
+            .dispatch(Command::Math {
+                operation: ij_core::math::MathOperation::Gamma(0.7),
+                whole_stack: true,
+            })
+            .unwrap();
+        assert_math_pixels(
+            session.active_doc().unwrap(),
+            &oracle,
+            &format!(
+                "clipped oval gamma: stdout={} stderr={}",
+                out.stdout, out.stderr
+            ),
+        );
+    }
+}
+
+#[test]
+fn parity_math_short_processor_fractional_and_automatic_display_bounds() {
+    use ij_core::math::MathOperation::*;
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (min, max) in [(15.5, 200.5), (-1.5, 127.5), (0.0, 0.0)] {
+        for (operation, java) in [
+            (Gamma(0.7), "run(\"Gamma...\", \"value=0.7\");"),
+            (Log, "run(\"Log\");"),
+            (Exp, "run(\"Exp\");"),
+        ] {
+            let source = ImageDocument::new(
+                "short-bounds",
+                4,
+                4,
+                PixelPlane::Gray16(vec![
+                    0, 1, 2, 3, 4, 15, 31, 63, 127, 128, 129, 150, 180, 200, 254, 255,
+                ]),
+            )
+            .unwrap();
+            let oracle = bridge
+                .run_macro_on_image(&source, &format!("setMinAndMax({min},{max}); {java}"))
+                .unwrap()
+                .output_image
+                .unwrap();
+            let mut session = Session::new();
+            session.insert_doc(source);
+            session
+                .dispatch(Command::SetDisplayRange { min, max })
+                .unwrap();
+            session
+                .dispatch(Command::Math {
+                    operation,
+                    whole_stack: false,
+                })
+                .unwrap();
+            assert_math_pixels(
+                session.active_doc().unwrap(),
+                &oracle,
+                &format!("{operation:?} {min}..{max}"),
+            );
+        }
+    }
+}

@@ -52,6 +52,33 @@ impl Default for SetScaleDialog {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MathDialog {
+    pub source: ImageId,
+    pub operation: ij_core::math::MathOperation,
+}
+
+#[derive(Debug, Clone)]
+pub struct MathDefaults {
+    pub add: f64,
+    pub multiply: f64,
+    pub min: f64,
+    pub max: f64,
+    pub gamma: f64,
+}
+
+impl Default for MathDefaults {
+    fn default() -> Self {
+        Self {
+            add: 25.0,
+            multiply: 1.25,
+            min: 0.0,
+            max: 255.0,
+            gamma: 0.5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DialogState {
     pub show_about: bool,
@@ -74,6 +101,8 @@ pub struct DialogState {
     pub plugin_filter_classpath_input: String,
     pub plugin_filter_target_id: Option<ImageId>,
     pub duplicate: DuplicateDialog,
+    pub math: Option<MathDialog>,
+    pub math_defaults: MathDefaults,
     /// Duplicator's `staticDuplicateStack`: the checkbox starts checked again
     /// on the next stack duplicate (Duplicator.java 56, 528).
     pub duplicate_stack_default: bool,
@@ -100,6 +129,8 @@ impl DialogState {
             plugin_filter_classpath_input: String::new(),
             plugin_filter_target_id: None,
             duplicate: DuplicateDialog::default(),
+            math: None,
+            math_defaults: MathDefaults::default(),
             duplicate_stack_default: false,
         }
     }

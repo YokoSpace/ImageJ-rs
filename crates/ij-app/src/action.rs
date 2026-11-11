@@ -43,6 +43,20 @@ pub enum AppAction {
     Minimum,
     Maximum,
     Despeckle,
+    MathAdd,
+    MathSubtract,
+    MathMultiply,
+    MathDivide,
+    MathMin,
+    MathMax,
+    MathGamma,
+    MathLog,
+    MathExp,
+    MathSquare,
+    MathSquareRoot,
+    MathReciprocal,
+    MathAbs,
+    MathSet,
     Measure,
     Histogram,
     PlotProfile,
@@ -183,6 +197,22 @@ const PROCESS_FILTERS: &[MenuNode] = &[
     item("Maximum (radius 2)", None, AppAction::Maximum),
 ];
 const PROCESS_NOISE: &[MenuNode] = &[item("Despeckle", None, AppAction::Despeckle)];
+const PROCESS_MATH: &[MenuNode] = &[
+    item("Add...", None, AppAction::MathAdd),
+    item("Subtract...", None, AppAction::MathSubtract),
+    item("Multiply...", None, AppAction::MathMultiply),
+    item("Divide...", None, AppAction::MathDivide),
+    item("Min...", None, AppAction::MathMin),
+    item("Max...", None, AppAction::MathMax),
+    item("Gamma...", None, AppAction::MathGamma),
+    item("Log", None, AppAction::MathLog),
+    item("Exp", None, AppAction::MathExp),
+    item("Square", None, AppAction::MathSquare),
+    item("Square Root", None, AppAction::MathSquareRoot),
+    item("Reciprocal", None, AppAction::MathReciprocal),
+    item("Abs", None, AppAction::MathAbs),
+    item("Set...", None, AppAction::MathSet),
+];
 const PROCESS_MENU: &[MenuNode] = &[
     item("Smooth", None, AppAction::Smooth),
     item("Sharpen", None, AppAction::Sharpen),
@@ -191,7 +221,7 @@ const PROCESS_MENU: &[MenuNode] = &[
     submenu("Filters", PROCESS_FILTERS),
     submenu("Noise", PROCESS_NOISE),
     unsupported("Binary", None),
-    unsupported("Math", None),
+    submenu("Math", PROCESS_MATH),
     unsupported("FFT", None),
 ];
 
@@ -661,6 +691,48 @@ impl ImageJApp {
             }
             Despeckle => {
                 let _ = self.despeckle_active();
+            }
+            MathAdd => {
+                let _ = self.math_active(ij_core::math::MathOperation::Add(25.0));
+            }
+            MathSubtract => {
+                let _ = self.math_active(ij_core::math::MathOperation::Subtract(25.0));
+            }
+            MathMultiply => {
+                let _ = self.math_active(ij_core::math::MathOperation::Multiply(1.25));
+            }
+            MathDivide => {
+                let _ = self.math_active(ij_core::math::MathOperation::Divide(1.25));
+            }
+            MathMin => {
+                let _ = self.math_active(ij_core::math::MathOperation::Min(0.0));
+            }
+            MathMax => {
+                let _ = self.math_active(ij_core::math::MathOperation::Max(255.0));
+            }
+            MathGamma => {
+                let _ = self.math_active(ij_core::math::MathOperation::Gamma(0.5));
+            }
+            MathLog => {
+                let _ = self.math_active(ij_core::math::MathOperation::Log);
+            }
+            MathExp => {
+                let _ = self.math_active(ij_core::math::MathOperation::Exp);
+            }
+            MathSquare => {
+                let _ = self.math_active(ij_core::math::MathOperation::Square);
+            }
+            MathSquareRoot => {
+                let _ = self.math_active(ij_core::math::MathOperation::SquareRoot);
+            }
+            MathReciprocal => {
+                let _ = self.math_active(ij_core::math::MathOperation::Reciprocal);
+            }
+            MathAbs => {
+                let _ = self.math_active(ij_core::math::MathOperation::Abs);
+            }
+            MathSet => {
+                let _ = self.math_active(ij_core::math::MathOperation::Set(25.0));
             }
             Measure => {
                 let _ = self.measure_active();
