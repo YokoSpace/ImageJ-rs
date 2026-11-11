@@ -19,6 +19,39 @@ pub struct DuplicateDialog {
     pub stack_size: u32,
 }
 
+/// Editable state of `Analyze > Set Scale...`.
+///
+/// The numeric fields mirror ScaleDialog's four `GenericDialog` inputs
+/// (original_imagej/ij/plugin/filter/ScaleDialog.java 66-71). `raw_length` is
+/// the uncalibrated line length or largest rectangle side used by the
+/// "Click to Remove Scale" button (ScaleDialog.java 38-48, 182-203), and
+/// `removed` suppresses a redundant Set Scale command when OK follows that
+/// button without further edits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetScaleDialog {
+    pub open: bool,
+    pub distance: f64,
+    pub known: f64,
+    pub aspect: f64,
+    pub unit: String,
+    pub raw_length: f64,
+    pub removed: bool,
+}
+
+impl Default for SetScaleDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            distance: 0.0,
+            known: 0.0,
+            aspect: 1.0,
+            unit: "pixel".to_string(),
+            raw_length: 0.0,
+            removed: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DialogState {
     pub show_about: bool,

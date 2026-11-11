@@ -257,6 +257,19 @@ pub enum Command {
     Undo,
     /// `Analyze > Set Measurements...` updates session measurement options.
     SetMeasurements { flags: u32, precision: u8 },
+    /// `Analyze > Set Scale...` (ScaleDialog.java 80-108). The dialog fields
+    /// become `Calibration.pixelWidth = known/distance`,
+    /// `pixelHeight = pixelWidth*aspect` and `unit`; a non-positive distance or
+    /// known distance resets the calibration to pixels.
+    SetScale {
+        distance: f64,
+        known: f64,
+        aspect: f64,
+        unit: String,
+    },
+    /// The Set Scale dialog's "Click to Remove Scale" button and the macro
+    /// statement `Image.removeScale` (ImagePlus.java 2206-2216).
+    RemoveScale,
     Measure,
     Histogram,
     /// `Analyze > Plot Profile` (`K`). The document is unchanged; only the
@@ -324,6 +337,16 @@ fn macro_option_value(value: &str) -> String {
         format!("[{value}]")
     } else {
         value.to_string()
+    }
+}
+
+/// Numeric dialog text as Recorder records it: GenericDialog.trim removes a
+/// trailing ".0"/".00" from the field text (GenericDialog.java 1238-1242).
+fn format_scale_number(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value.abs() < 1.0e15 {
+        format!("{value:.0}")
+    } else {
+        format!("{value}")
     }
 }
 
@@ -1368,6 +1391,47 @@ impl Session {
                     "run(\"Set Measurements...\", \"{}\");",
                     measurement_macro_options(config)
                 ));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::SetScale {
+                distance,
+                known,
+                aspect,
+                unit,
+            } => {
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let previous = doc.calibration.clone();
+                    doc.calibration.apply_scale(distance, known, aspect, &unit);
+                    doc.calibration != previous
+                };
+                // ScaleDialog.java 109-112 sets imp.changes only when the
+                // calibration actually differs from its previous value.
+                if changed {
+                    self.mark_active_dirty();
+                }
+                // Recorder.recordOption lowercases the first label word and
+                // GenericDialog.trim drops a trailing ".0" (Recorder.java
+                // 472-481, GenericDialog.java 1238-1242). The aspect field is
+                // always recorded here so the macro does not depend on the
+                // dialog's smart-recording state.
+                let recorded_unit = if unit.is_empty() {
+                    "[]".to_string()
+                } else {
+                    unit
+                };
+                self.macro_recorder.push(format!(
+                    "run(\"Set Scale...\", \"distance={} known={} pixel={} unit={}\");",
+                    format_scale_number(distance),
+                    format_scale_number(known),
+                    format_scale_number(aspect),
+                    recorded_unit
+                ));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::RemoveScale => {
+                self.active_doc_mut()?.calibration.remove_scale();
+                self.macro_recorder.push("Image.removeScale;".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Measure => {

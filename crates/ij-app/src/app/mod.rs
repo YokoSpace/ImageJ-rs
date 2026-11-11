@@ -1,7 +1,7 @@
 use crate::dialogs::{
-    DialogState, PluginBrowserState, PluginCatalogPhase, PluginInspectPhase, plugin_kind_badge,
-    plugin_kind_support_note, plugin_label_counts, plugin_prefill_block_reason, plugin_row_text,
-    split_plugin_class_spec,
+    DialogState, PluginBrowserState, PluginCatalogPhase, PluginInspectPhase, SetScaleDialog,
+    plugin_kind_badge, plugin_kind_support_note, plugin_label_counts, plugin_prefill_block_reason,
+    plugin_row_text, split_plugin_class_spec,
 };
 use crate::image_view::ImageView;
 use crate::pixel_render::plane_to_rgba;
@@ -42,8 +42,9 @@ pub use self::adjust_dialogs::{
     PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SET_MEASUREMENTS_FIRST_GROUP,
     SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS, SET_MEASUREMENTS_OPTIONS,
     SET_MEASUREMENTS_SECOND_ROWS, SetMeasurementsDialog, SetMeasurementsOption,
-    clamp_set_measurements_precision, plot_profile_runs, plot_profile_short_title,
-    set_measurements_slot,
+    SetScaleDefaults, clamp_set_measurements_precision, plot_profile_runs,
+    plot_profile_short_title, set_measurements_slot, set_scale_defaults,
+    set_scale_input_is_valid, set_scale_label,
 };
 pub use self::histogram_window::HistogramWindowState;
 pub use self::image_window::{animation_slider_axis, draw_ellipse_stroke};
@@ -176,6 +177,8 @@ pub struct ImageJApp {
     pub dialogs: DialogState,
     /// `Analyze > Set Measurements...` window and its uncommitted options.
     pub set_measurements: SetMeasurementsDialog,
+    /// `Analyze > Set Scale...` window and its uncommitted values.
+    pub set_scale: SetScaleDialog,
     pub pending_close: Option<PendingClose>,
     pub pending_revert: Option<ImageId>,
     pub pending_stack_process: Option<PendingStackProcess>,
@@ -231,6 +234,7 @@ impl ImageJApp {
             plot_profile_window: None,
             dialogs: DialogState::new(),
             set_measurements: SetMeasurementsDialog::default(),
+            set_scale: SetScaleDialog::default(),
             pending_close: None,
             pending_revert: None,
             pending_stack_process: None,

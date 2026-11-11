@@ -750,8 +750,6 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
 ///
 /// Unsupported non-default state is rejected instead of dropped silently:
 ///
-/// - a non-default `pixel_depth` on a single-plane image (ImageJ never writes
-///   `spacing=` for single images);
 /// - a non-default `display_range` on RGB images (ImageJ does not persist a
 ///   range for `COLOR_RGB`);
 /// - a `0/0` display range unless the image-derived range is also `0/0`
@@ -759,6 +757,7 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
 /// - non-finite or non-positive scales while calibration is active;
 /// - an ROI whose integer coordinates are outside the exact range of ImageJ's
 ///   signed-short header and 32-bit float subpixel encoding.
+/// Single-plane z-spacing is omitted, matching FileSaver.java 763-772.
 ///
 /// Not part of the Rust model and therefore not written: x/y/z origins, time
 /// units/frame interval/fps/loop, y/z units, density calibration (`cf`/
@@ -1352,13 +1351,6 @@ fn format_java_double(value: f64) -> String {
 fn image_description(doc: &ImageDocument) -> Result<Option<String>, IoError> {
     let stack_size = doc.slices.len();
     let first_plane = &doc.slices[0];
-    if stack_size == 1 && doc.calibration.pixel_depth != 1.0 {
-        return Err(IoError::UnsupportedFormat(
-            "ImageJ TIFF cannot store a non-default pixel depth (z-spacing) for a single-plane image; \
-             ImageJ only writes `spacing=` for stacks (FileSaver.java 763-772)"
-                .into(),
-        ));
-    }
     if matches!(first_plane, PixelPlane::ColorRgb(_))
         && (doc.display_range.min != 0.0 || doc.display_range.max != 255.0)
     {
@@ -4697,18 +4689,16 @@ mod tests {
     }
 
     #[test]
-    fn tiff_save_rejects_pixel_depth_it_cannot_persist_for_a_single_image() {
-        // ImageJ only writes `spacing=` when nImages>1 (FileSaver.java
-        // 763-772), so a single-plane z-spacing would silently disappear.
+    fn tiff_save_omits_single_image_pixel_depth_like_imagej() {
+        // FileSaver.java 763-772 writes `spacing=` only when nImages>1.
         let mut doc = ImageDocument::new_ramp_8bit("depth.tif", 2, 2).unwrap();
         doc.calibration.pixel_depth = 2.0;
         let path = tmp_tiff("single_pixel_depth");
-        let err = save_tiff(&path, &doc).unwrap_err();
+        save_tiff(&path, &doc).unwrap();
+        let loaded = load_tiff(&path).unwrap();
         let _ = fs::remove_file(&path);
-        assert!(
-            err.to_string().contains("pixel depth"),
-            "unexpected error: {err}"
-        );
+        assert_eq!(loaded.slices, doc.slices);
+        assert_eq!(loaded.calibration.pixel_depth, 1.0);
     }
 
     #[test]

@@ -200,6 +200,18 @@ impl Default for Calibration {
     }
 }
 
+/// `Calibration.setUnit` (original_imagej/ij/measure/Calibration.java 128-137):
+/// an empty unit becomes "pixel", "um" becomes the micro sign and "A" becomes
+/// the angstrom sign.
+fn sanitize_calibration_unit(unit: &str) -> String {
+    match unit {
+        "" => "pixel".to_string(),
+        "um" => "\u{00b5}m".to_string(),
+        "A" => "\u{00C5}".to_string(),
+        other => other.to_string(),
+    }
+}
+
 impl Calibration {
     pub fn transform_x(&self, x: f64) -> f64 {
         x * self.pixel_width
@@ -211,6 +223,69 @@ impl Calibration {
         } else {
             y * self.pixel_height
         }
+    }
+
+    /// `Calibration.scaled()` (Calibration.java 92-94).
+    pub fn scaled(&self) -> bool {
+        self.pixel_width != 1.0
+            || self.pixel_height != 1.0
+            || self.pixel_depth != 1.0
+            || self.unit != "pixel"
+    }
+
+    /// `Calibration.setUnit` with its unit canonicalization
+    /// (Calibration.java 103-136).
+    pub fn set_unit(&mut self, unit: &str) {
+        self.unit = sanitize_calibration_unit(unit);
+    }
+
+    /// Applies the values read from `Analyze > Set Scale...`
+    /// (ScaleDialog.java 90-108).
+    ///
+    /// `distance` and `known` are the dialog's "Distance in pixels" and "Known
+    /// distance" fields, `aspect` its "Pixel aspect ratio" and `unit` its
+    /// "Unit of length". A non-positive distance/known or a pixel/empty unit
+    /// resets spatial scaling; otherwise pixelDepth follows pixelWidth while it
+    /// is still 1.0.
+    pub fn apply_scale(&mut self, distance: f64, known: f64, aspect: f64, unit: &str) {
+        // ScaleDialog.java 90-91: typing "unit" with equal distances means the
+        // user did not choose a real unit.
+        let unit = if distance == known && unit == "unit" {
+            "pixel"
+        } else {
+            unit
+        };
+        let no_scale = distance <= 0.0
+            || known <= 0.0
+            || unit.starts_with("pixel")
+            || unit.starts_with("Pixel")
+            || unit.is_empty();
+        if no_scale {
+            self.pixel_width = 1.0;
+            self.pixel_height = 1.0;
+            self.pixel_depth = 1.0;
+            self.set_unit("pixel");
+        } else {
+            self.pixel_width = known / distance;
+            if self.pixel_depth == 1.0 {
+                self.pixel_depth = self.pixel_width;
+            }
+            // ScaleDialog.java 103-106: zero aspect also means square pixels.
+            self.pixel_height = if aspect != 0.0 {
+                self.pixel_width * aspect
+            } else {
+                self.pixel_width
+            };
+            self.set_unit(unit);
+        }
+    }
+
+    /// `ImagePlus.removeScale` (ImagePlus.java 2206-2216).
+    pub fn remove_scale(&mut self) {
+        self.pixel_width = 1.0;
+        self.pixel_height = 1.0;
+        self.pixel_depth = 1.0;
+        self.set_unit("pixel");
     }
 }
 
@@ -298,6 +373,15 @@ impl LineRoi {
             (self.x2 - self.x1).abs(),
             (self.y2 - self.y1).abs(),
         )
+    }
+
+    /// `Line.getRawLength` (original_imagej/ij/gui/Line.java 440-442): the
+    /// uncalibrated endpoint distance used as Set Scale's initial "Distance in
+    /// pixels" value (ScaleDialog.java 40-42).
+    pub fn raw_length(&self) -> f64 {
+        let dx = f64::from(self.x2 - self.x1);
+        let dy = f64::from(self.y2 - self.y1);
+        (dx * dx + dy * dy).sqrt()
     }
 }
 
@@ -2668,7 +2752,12 @@ impl ImageDocument {
             None
         };
         if let Some(Roi::Line(line)) = &self.roi {
-            let mut summary = self.measure_line(*line, config.contains(MeasurementFlags::LIMIT), limit);
+            let mut summary = self.measure_line(
+                *line,
+                config.contains(MeasurementFlags::LIMIT),
+                limit,
+                config.contains(MeasurementFlags::CENTROID),
+            );
             summary.threshold_range = self.measurement_threshold_range(config);
             self.populate_shape_descriptors(&mut summary, config);
             return Ok(summary);
@@ -2903,6 +2992,7 @@ impl ImageDocument {
         line: LineRoi,
         limit_enabled: bool,
         limit: Option<ThresholdLevels>,
+        centroid: bool,
     ) -> MeasurementSummary {
         let x1 = line.x1 as f64;
         let y1 = line.y1 as f64;
@@ -2950,6 +3040,24 @@ impl ImageDocument {
             _ => self.measure_float(&profile, 0, 0, samples, 1, None, None, limit),
         };
         let mut summary = self.finish_measurement(0, 0, samples, 1, raw);
+
+        // Analyzer.measureLine calls ImageStatistics with
+        // AREA+MEAN+STD_DEV+MODE+MIN_MAX+MEDIAN (Analyzer.java 512), so
+        // xCenterOfMass/yCenterOfMass stay at zero even when CENTER_OF_MASS is
+        // selected; the ResultsTable still prints those zero cells.
+        summary.x_center_of_mass = 0.0;
+        summary.y_center_of_mass = 0.0;
+
+        // Analyzer.measureLine (Analyzer.java 515-524) replaces the synthetic
+        // profile centroid with the line's endpoint midpoint for CENTROID.
+        if centroid {
+            summary.x_centroid = self
+                .calibration
+                .transform_x(x1 + (x2 - x1) / 2.0);
+            summary.y_centroid = self
+                .calibration
+                .transform_y(y1 + (y2 - y1) / 2.0, self.height);
+        }
 
         // Analyzer.saveResults uses the line's integer ROI bounds for RECT,
         // not the sampled profile's 0..samples processor ROI. Roi.setIntBounds

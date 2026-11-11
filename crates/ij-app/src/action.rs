@@ -45,6 +45,7 @@ pub enum AppAction {
     Histogram,
     PlotProfile,
     SetMeasurements,
+    SetScale,
     ClearResults,
     InstalledPlugins,
     RunPluginFilter,
@@ -196,6 +197,7 @@ const ANALYZE_MENU: &[MenuNode] = &[
     item("Histogram", Some("H"), AppAction::Histogram),
     item("Clear Results", None, AppAction::ClearResults),
     item("Set Measurements...", None, AppAction::SetMeasurements),
+    item("Set Scale...", None, AppAction::SetScale),
     item("Plot Profile", Some("K"), AppAction::PlotProfile),
     unsupported("Calibrate...", None),
 ];
@@ -657,6 +659,9 @@ impl ImageJApp {
             }
             SetMeasurements => {
                 self.open_set_measurements_dialog();
+            }
+            SetScale => {
+                self.open_set_scale_dialog();
             }
             PlotProfile => {
                 let title = self.session.active_doc().map(|doc| doc.title.clone()).ok();

@@ -2936,6 +2936,296 @@ fn java_resaved_rust_metadata_roundtrips_through_rust_reader() {
     assert_eq!(loaded.calibration.unit, "\u{00b5}m");
 }
 
+// ---------------------------------------------------------------------------
+// P3.6 Analyze > Set Scale... and Remove Scale
+//
+// ScaleDialog.run (original_imagej/ij/plugin/filter/ScaleDialog.java 24-120)
+// converts Distance in pixels / Known distance / Pixel aspect ratio / Unit of
+// length into Calibration.pixelWidth/pixelHeight/pixelDepth, and
+// ImagePlus.removeScale (ImagePlus.java 2206-2216) restores the defaults.
+// Measurements, the profile axis and TIFF metadata all read that Calibration.
+// ---------------------------------------------------------------------------
+
+const SCALE_MEASUREMENTS: &str =
+    "area mean standard modal min max median skewness kurtosis centroid center perimeter decimal=3";
+
+const SCALE_MEASUREMENT_FLAGS: u32 = MeasurementFlags::AREA
+    | MeasurementFlags::MEAN
+    | MeasurementFlags::STD_DEV
+    | MeasurementFlags::MODE
+    | MeasurementFlags::MIN_MAX
+    | MeasurementFlags::MEDIAN
+    | MeasurementFlags::SKEWNESS
+    | MeasurementFlags::KURTOSIS
+    | MeasurementFlags::CENTROID
+    | MeasurementFlags::CENTER_OF_MASS
+    | MeasurementFlags::PERIMETER;
+
+#[test]
+fn parity_set_scale_rect_measurement_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new_ramp_8bit("set-scale-rect", 64, 64).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            &format!(
+                "makeRectangle(10,10,20,10); \
+                 run(\"Set Scale...\", \"distance=20 known=10 unit=mm\"); \
+                 run(\"Set Measurements...\", \"{SCALE_MEASUREMENTS}\"); run(\"Measure\"); \
+                 getPixelSize(u,w,h); print(\"CAL:\"+u+\",\"+w+\",\"+h);"
+            ),
+        )
+        .unwrap();
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 10,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetScale {
+            distance: 20.0,
+            known: 10.0,
+            aspect: 1.0,
+            unit: "mm".into(),
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: SCALE_MEASUREMENT_FLAGS,
+            precision: 3,
+        })
+        .unwrap();
+    let CommandOutcome::Measured(stats) = session.dispatch(Command::Measure).unwrap() else {
+        panic!("Measure must return statistics");
+    };
+
+    let columns = oracle_columns(&oracle.stdout);
+    assert_measurement_columns(&stats, &columns);
+    assert_eq!(format_ij_num(stats.perimeter), columns["Perim."]);
+    assert_eq!(oracle_line(&oracle.stdout, "CAL:"), "CAL:mm,0.5,0.5");
+
+    let calibration = &session.active_doc().unwrap().calibration;
+    assert_eq!(calibration.pixel_width, 0.5);
+    assert_eq!(calibration.pixel_height, 0.5);
+    // ScaleDialog.java 100-102 also raises pixelDepth while it is still 1.0.
+    assert_eq!(calibration.pixel_depth, 0.5);
+    assert_eq!(calibration.unit, "mm");
+}
+
+#[test]
+fn parity_set_scale_pixel_aspect_ratio_line_measurement_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new_ramp_8bit("set-scale-line", 64, 64).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            &format!(
+                "makeLine(0,0,30,40); \
+                 run(\"Set Scale...\", \"distance=100 known=1 pixel=0.5 unit=um\"); \
+                 run(\"Set Measurements...\", \"{SCALE_MEASUREMENTS}\"); run(\"Measure\"); \
+                 getPixelSize(u,w,h); print(\"CAL:\"+u+\",\"+w+\",\"+h);"
+            ),
+        )
+        .unwrap();
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeLineRoi {
+            x1: 0,
+            y1: 0,
+            x2: 30,
+            y2: 40,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetScale {
+            distance: 100.0,
+            known: 1.0,
+            aspect: 0.5,
+            unit: "um".into(),
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: SCALE_MEASUREMENT_FLAGS,
+            precision: 3,
+        })
+        .unwrap();
+    let CommandOutcome::Measured(stats) = session.dispatch(Command::Measure).unwrap() else {
+        panic!("Measure must return statistics");
+    };
+
+    let columns = oracle_columns(&oracle.stdout);
+    for (name, value) in [
+        ("Area", stats.area),
+        ("Mean", stats.mean),
+        ("X", stats.x_centroid),
+        ("Y", stats.y_centroid),
+        ("XM", stats.x_center_of_mass),
+        ("YM", stats.y_center_of_mass),
+        ("Perim.", stats.perimeter),
+    ] {
+        assert_eq!(format_ij_num(value), columns[name], "column {name} differs");
+    }
+    let line = stats.line.expect("line measurement");
+    assert_eq!(format_ij_num(line.length), columns["Length"]);
+    assert_eq!(format_ij_num(line.angle), columns["Angle"]);
+    // Calibration.setUnit mirrors "um" to the micro sign (Calibration.java
+    // 128-137); pixelHeight = pixelWidth*aspect (ScaleDialog.java 103-106).
+    assert_eq!(oracle_line(&oracle.stdout, "CAL:"), "CAL:\u{00b5}m,0.01,0.005");
+    assert_eq!(session.active_doc().unwrap().calibration.unit, "\u{00b5}m");
+}
+
+#[test]
+fn parity_remove_scale_restores_measurements_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new_ramp_8bit("remove-scale", 64, 64).unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            &format!(
+                "makeRectangle(4,5,12,7); \
+                 run(\"Set Scale...\", \"distance=20 known=10 unit=mm\"); \
+                 Image.removeScale; \
+                 run(\"Set Measurements...\", \"{SCALE_MEASUREMENTS}\"); run(\"Measure\"); \
+                 getPixelSize(u,w,h); print(\"CAL:\"+u+\",\"+w+\",\"+h);"
+            ),
+        )
+        .unwrap();
+
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::MakeRectRoi {
+            x: 4,
+            y: 5,
+            width: 12,
+            height: 7,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetScale {
+            distance: 20.0,
+            known: 10.0,
+            aspect: 1.0,
+            unit: "mm".into(),
+        })
+        .unwrap();
+    session.dispatch(Command::RemoveScale).unwrap();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: SCALE_MEASUREMENT_FLAGS,
+            precision: 3,
+        })
+        .unwrap();
+    let CommandOutcome::Measured(stats) = session.dispatch(Command::Measure).unwrap() else {
+        panic!("Measure must return statistics");
+    };
+
+    let columns = oracle_columns(&oracle.stdout);
+    assert_measurement_columns(&stats, &columns);
+    assert_eq!(format_ij_num(stats.area), columns["Area"]);
+    assert_eq!(format_ij_num(stats.perimeter), columns["Perim."]);
+    assert_eq!(oracle_line(&oracle.stdout, "CAL:"), "CAL:pixels,1,1");
+    assert_eq!(session.active_doc().unwrap().calibration, ij_core::Calibration::default());
+    assert!(session
+        .macro_recorder
+        .iter()
+        .any(|record| record == "Image.removeScale;"));
+}
+
+#[test]
+fn session_set_scale_records_macro_options_and_marks_dirty() {
+    let mut session = Session::new();
+    let CommandOutcome::ImageOpened(id) = session
+        .dispatch(Command::NewRamp8Bit {
+            title: "scale".into(),
+            width: 16,
+            height: 16,
+        })
+        .unwrap()
+    else {
+        panic!("new image");
+    };
+    session.set_dirty(id, false);
+
+    session
+        .dispatch(Command::SetScale {
+            distance: 20.0,
+            known: 10.0,
+            aspect: 1.0,
+            unit: "mm".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Set Scale...\", \"distance=20 known=10 pixel=1 unit=mm\");")
+    );
+    assert!(session.is_dirty(id), "ScaleDialog.run sets imp.changes");
+
+    // ScaleDialog.java 92-96: zero distances or a "pixel" unit reset calibration.
+    session
+        .dispatch(Command::SetScale {
+            distance: 0.0,
+            known: 0.0,
+            aspect: 1.0,
+            unit: "pixel".into(),
+        })
+        .unwrap();
+    assert_eq!(
+        session.active_doc().unwrap().calibration,
+        ij_core::Calibration::default()
+    );
+
+    session.set_dirty(id, false);
+    session.dispatch(Command::RemoveScale).unwrap();
+    // ImagePlus.removeScale (ImagePlus.java 2206-2216) only resets Calibration;
+    // it does not set the changes flag.
+    assert!(!session.is_dirty(id));
+}
+
+#[test]
+fn set_scale_calibration_survives_tiff_roundtrip_read_by_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let path = temp_tiff("session_set_scale.tif");
+
+    let mut session = Session::new();
+    session.insert_doc(distinct_stack_8bit(16, 16, 3));
+    session
+        .dispatch(Command::SetScale {
+            distance: 20.0,
+            known: 10.0,
+            aspect: 1.0,
+            unit: "um".into(),
+        })
+        .unwrap();
+    session.dispatch(Command::SaveTiff { path: path.clone() }).unwrap();
+
+    let oracle = bridge
+        .eval_macro(&format!(
+            "open(\"{p}\"); getVoxelSize(w,h,d,u); print(\"VOX:\"+u+\",\"+w+\",\"+h+\",\"+d);",
+            p = path.display()
+        ))
+        .unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "VOX:"),
+        "VOX:\u{00b5}m,0.5,0.5,0.5"
+    );
+
+    let loaded = load_tiff(&path).unwrap();
+    assert_eq!(loaded.calibration.pixel_width, 0.5);
+    assert_eq!(loaded.calibration.pixel_height, 0.5);
+    assert_eq!(loaded.calibration.pixel_depth, 0.5);
+    assert_eq!(loaded.calibration.unit, "\u{00b5}m");
+}
+
 /// Recorder records the Process Stack? answer as a `slice` or `stack`
 /// option (IJ.java 1287-1291), and `run("Invert")` is only complete for a
 /// single image.
@@ -13897,4 +14187,48 @@ fn session_image_format_commands_use_magic_and_preserve_revert() {
         .unwrap();
     assert!(std::fs::read(&jpeg_path).unwrap().starts_with(&[0xff, 0xd8, 0xff]));
     assert_eq!(session.image_path(id), Some(jpeg_path.as_path()));
+}
+
+#[test]
+fn parity_set_scale_single_image_tiff_omits_z_spacing_like_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let java_path = dir.path().join("java_scaled.tif");
+    let rust_path = dir.path().join("rust_scaled.tif");
+    bridge
+        .eval_macro(&format!(
+            "newImage(\"scaled\", \"8-bit ramp\", 2, 2, 1); \
+             run(\"Set Scale...\", \"distance=2 known=1 pixel=1 unit=mm\"); \
+             saveAs(\"Tiff\", \"{}\");",
+            java_path.display()
+        ))
+        .unwrap();
+    let java_saved = load_tiff(&java_path).unwrap();
+
+    let mut session = Session::new();
+    session
+        .dispatch(Command::NewRamp8Bit {
+            title: "scaled".into(),
+            width: 2,
+            height: 2,
+        })
+        .unwrap();
+    session
+        .dispatch(Command::SetScale {
+            distance: 2.0,
+            known: 1.0,
+            aspect: 1.0,
+            unit: "mm".into(),
+        })
+        .unwrap();
+    assert_eq!(session.active_doc().unwrap().calibration.pixel_depth, 0.5);
+    session
+        .dispatch(Command::SaveTiff {
+            path: rust_path.clone(),
+        })
+        .unwrap();
+    let rust_saved = load_tiff(&rust_path).unwrap();
+    assert_eq!(rust_saved.slices, java_saved.slices);
+    assert_eq!(rust_saved.calibration, java_saved.calibration);
+    assert_eq!(rust_saved.calibration.pixel_depth, 1.0);
 }

@@ -313,6 +313,10 @@ impl ImageJApp {
             self.render_set_measurements_dialog(ctx);
         }
 
+        if self.set_scale.open {
+            self.render_set_scale_dialog(ctx);
+        }
+
         self.render_histogram_window(ctx);
 
         self.render_plot_profile_window(ctx);
@@ -944,6 +948,296 @@ impl ImageJApp {
         );
         if close {
             self.set_measurements.open = false;
+        }
+    }
+}
+
+/// Initial values ScaleDialog.run derives from the active image
+/// (original_imagej/ij/plugin/filter/ScaleDialog.java 24-70).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetScaleDefaults {
+    pub distance: f64,
+    pub known: f64,
+    pub aspect: f64,
+    pub unit: String,
+    /// Uncalibrated length used by "Click to Remove Scale".
+    pub raw_length: f64,
+}
+
+/// Reads the same initial dialog values as ScaleDialog: a line selection
+/// contributes its raw length and a rectangular selection its larger side; an
+/// already calibrated image converts those pixels back to physical units.
+pub fn set_scale_defaults(doc: &ij_core::ImageDocument) -> SetScaleDefaults {
+    let mut distance = 0.0;
+    let mut known = 0.0;
+    let mut aspect = 1.0;
+    let mut unit = "pixel".to_string();
+    let mut raw_length = 0.0;
+
+    if let Some(roi) = &doc.roi {
+        match roi {
+            Roi::Line(line) => {
+                distance = line.raw_length();
+                raw_length = distance;
+            }
+            Roi::Rect(rect) => {
+                distance = f64::from(rect.width.max(rect.height));
+                raw_length = distance;
+            }
+            _ => {}
+        }
+    }
+
+    let calibration = &doc.calibration;
+    if calibration.scaled() {
+        if distance != 0.0 {
+            known = distance * calibration.pixel_width;
+        } else {
+            distance = 1.0 / calibration.pixel_width;
+            known = 1.0;
+        }
+        unit = calibration.unit.clone();
+        aspect = calibration.pixel_height / calibration.pixel_width;
+    }
+
+    SetScaleDefaults {
+        distance,
+        known,
+        aspect,
+        unit,
+        raw_length,
+    }
+}
+
+/// `Tools.getDecimalPlaces` (original_imagej/ij/util/Tools.java 209-222) for
+/// the scale label: integer values need no decimals and more than four are
+/// rounded back to four.
+fn scale_decimal_places(value: f64) -> i32 {
+    if (value as i32) as f64 == value || value.is_nan() {
+        return 0;
+    }
+    if value != 0.0 && (value.abs() < 1.0e-3 || value.abs() >= 1.0e7) {
+        // Java's Double.toString switches to exponent notation here.
+        return -2;
+    }
+    let mut text = format!("{value}");
+    if text.contains('E') {
+        return -2;
+    }
+    while text.ends_with('0') {
+        text.pop();
+    }
+    match text.find('.') {
+        Some(index) => ((text.len() - index - 1) as i32).min(4),
+        None => 0,
+    }
+}
+
+/// `IJ.d2s(value, digits)` for the Set Scale label (IJ.java 1000-1029).
+fn format_scale_label_number(value: f64, digits: i32) -> String {
+    if digits < 0 {
+        format!("{value:.2E}")
+    } else {
+        format!("{:.*}", digits as usize, value)
+    }
+}
+
+/// Scale: label text from `SetScaleDialog.textValueChanged`
+/// (ScaleDialog.java 152-180), including its singular "pixel/" form.
+pub fn set_scale_label(distance: f64, known: f64, unit: &str) -> String {
+    let no_unit = unit.is_empty() || unit.starts_with("pixel") || unit.starts_with("Pixel");
+    if distance <= 0.0 || known <= 0.0 || no_unit {
+        return "<no scale>".to_string();
+    }
+    let scale = distance / known;
+    let digits = scale_decimal_places(scale);
+    let pixels = if scale == 1.0 { "pixel" } else { "pixels" };
+    format!(
+        "{} {pixels}/{unit}",
+        format_scale_label_number(scale, digits)
+    )
+}
+
+/// Numeric fields must be real numbers before the dialog can apply them.
+pub fn set_scale_input_is_valid(distance: f64, known: f64, aspect: f64) -> bool {
+    distance.is_finite() && known.is_finite() && aspect.is_finite()
+}
+
+impl ImageJApp {
+    /// Opens `Analyze > Set Scale...` with ScaleDialog's initial values.
+    pub fn open_set_scale_dialog(&mut self) {
+        let defaults = self
+            .session
+            .active_doc()
+            .map(set_scale_defaults)
+            .unwrap_or(SetScaleDefaults {
+                distance: 0.0,
+                known: 0.0,
+                aspect: 1.0,
+                unit: "pixel".to_string(),
+                raw_length: 0.0,
+            });
+        self.set_scale = SetScaleDialog {
+            open: true,
+            distance: defaults.distance,
+            known: defaults.known,
+            aspect: defaults.aspect,
+            unit: defaults.unit,
+            raw_length: defaults.raw_length,
+            removed: false,
+        };
+    }
+
+    /// Applies the dialog fields as one `SetScale` command (ScaleDialog.java
+    /// 80-112 only changes the image when OK is pressed).
+    pub fn apply_set_scale_dialog(&mut self) -> Result<(), SessionError> {
+        let dialog = self.set_scale.clone();
+        if !set_scale_input_is_valid(dialog.distance, dialog.known, dialog.aspect) {
+            let message = "Set Scale needs finite numbers".to_string();
+            self.status_message = message.clone();
+            self.dialogs.last_error = Some(message);
+            return Err(SessionError::Core(ij_core::CoreError::InvalidOperation(
+                "Set Scale needs finite numbers",
+            )));
+        }
+        let removing = dialog.removed
+            && dialog.distance == dialog.raw_length
+            && dialog.known == 0.0
+            && dialog.aspect == 1.0
+            && dialog.unit == "pixel";
+        let result = if removing {
+            self.session.dispatch(Command::RemoveScale)
+        } else {
+            self.session.dispatch(Command::SetScale {
+                distance: dialog.distance,
+                known: dialog.known,
+                aspect: dialog.aspect,
+                unit: dialog.unit,
+            })
+        };
+        match result {
+            Ok(_) => {
+                self.set_scale.open = false;
+                self.set_scale.removed = false;
+                Ok(())
+            }
+            Err(error) => {
+                self.status_message = format!("Set Scale failed: {error}");
+                self.dialogs.last_error = Some(format!("Set Scale failed: {error}"));
+                Err(error)
+            }
+        }
+    }
+
+    /// "Click to Remove Scale" (ScaleDialog.java 182-203): reset the dialog
+    /// fields. ScaleDialog.run applies them only if the user presses OK.
+    pub fn remove_scale_from_dialog(&mut self) -> Result<(), SessionError> {
+        self.set_scale.distance = self.set_scale.raw_length;
+        self.set_scale.known = 0.0;
+        self.set_scale.aspect = 1.0;
+        self.set_scale.unit = "pixel".to_string();
+        self.set_scale.removed = true;
+        Ok(())
+    }
+
+    pub fn set_scale_button_rect(ctx: &egui::Context, label: &str) -> Option<egui::Rect> {
+        ctx.data(|data| {
+            data.get_temp(egui::Id::new(("ij_set_scale_button_rect", label)))
+        })
+    }
+
+    /// The same "Set Scale" content is used by the native window and by
+    /// headless egui tests.
+    pub fn render_set_scale_content(&mut self, ui: &mut egui::Ui) {
+        let mut dialog = self.set_scale.clone();
+
+        ui.horizontal(|ui| {
+            ui.label("Scale:");
+            ui.label(set_scale_label(dialog.distance, dialog.known, &dialog.unit));
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Distance in pixels:");
+            ui.add(egui::DragValue::new(&mut dialog.distance).speed(0.01));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Known distance:");
+            ui.add(egui::DragValue::new(&mut dialog.known).speed(0.01));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Pixel aspect ratio:");
+            ui.add(egui::DragValue::new(&mut dialog.aspect).speed(0.001));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Unit of length:");
+            ui.add(egui::TextEdit::singleline(&mut dialog.unit).desired_width(90.0));
+        });
+
+        ui.add_space(6.0);
+        let mut action = None;
+        let remove = ui.button("Click to Remove Scale");
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new(("ij_set_scale_button_rect", "Click to Remove Scale")),
+                remove.rect,
+            )
+        });
+        if remove.clicked() {
+            action = Some("Click to Remove Scale");
+        }
+
+        ui.separator();
+        let valid = set_scale_input_is_valid(dialog.distance, dialog.known, dialog.aspect);
+        ui.horizontal(|ui| {
+            for label in ["OK", "Cancel"] {
+                let response = ui.add_enabled(valid, egui::Button::new(label));
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new(("ij_set_scale_button_rect", label)), response.rect)
+                });
+                if response.clicked() {
+                    action = Some(label);
+                }
+            }
+        });
+
+        self.set_scale = dialog;
+        match action {
+            Some("Click to Remove Scale") => {
+                let _ = self.remove_scale_from_dialog();
+            }
+            Some("OK") => {
+                let _ = self.apply_set_scale_dialog();
+            }
+            Some(_) => {
+                self.set_scale.open = false;
+            }
+            None => {}
+        }
+    }
+
+    fn render_set_scale_dialog(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        ctx.show_viewport_immediate(
+            egui::ViewportId::from_hash_of("ij_set_scale_dialog"),
+            egui::ViewportBuilder::default()
+                .with_title("Set Scale")
+                .with_inner_size([360.0, 230.0])
+                .with_resizable(false),
+            |ctx, class| {
+                let is_embedded = matches!(class, egui::ViewportClass::Embedded);
+                if (!is_embedded && ctx.input(|i| i.viewport().close_requested()))
+                    || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    close = true;
+                }
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    self.render_set_scale_content(ui);
+                });
+            },
+        );
+        if close {
+            self.set_scale.open = false;
         }
     }
 }
