@@ -316,7 +316,7 @@ fn native_spec_preserves_unsupported_entries_and_separators() {
     assert!(edit[1].is_separator);
     let cut = node(edit, "Cut");
     assert!(!cut.enabled);
-    assert_eq!(cut.action, None);
+    assert_eq!(cut.action, Some(AppAction::Cut));
     assert_eq!(cut.shortcut, None);
     assert!(!cut.is_separator);
     assert!(cut.children.is_empty());

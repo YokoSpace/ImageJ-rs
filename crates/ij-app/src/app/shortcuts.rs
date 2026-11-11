@@ -106,6 +106,14 @@ impl ImageJApp {
             return;
         }
 
+        for (key, action) in [(egui::Key::C, AppAction::Copy), (egui::Key::X, AppAction::Cut), (egui::Key::V, AppAction::Paste)] {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, key)) {
+                let _ = self.set_active_window(target_id);
+                self.perform(action, ctx);
+                return;
+            }
+        }
+
         // Fill: ImageJ's Edit menu assigns unmodified F (Menus.java 150).
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F)) {
             let _ = self.set_active_window(target_id);

@@ -184,6 +184,9 @@ pub enum Command {
     /// `run("Fill")` — Filler("fill") fills the current slice's selection
     /// interior with the foreground color (Filler.java 97-113).
     Fill,
+    Copy,
+    Cut,
+    Paste,
     /// `run("Clear")` — Filler("clear") fills the selection interior with the
     /// background color (Filler.java 79-95).
     Clear,
@@ -597,6 +600,7 @@ pub struct Session {
     pub foreground_color: [u8; 3],
     /// Toolbar background color (default black), used by Edit > Clear.
     pub background_color: [u8; 3],
+    pub clipboard: Option<ij_core::ClipboardBuffer>,
 }
 
 impl Session {
@@ -1256,6 +1260,28 @@ impl Session {
                 self.background_color = color;
                 self.macro_recorder
                     .push(format!("setBackgroundColor({}, {}, {});", color[0], color[1], color[2]));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Copy | Command::Cut => {
+                let cut = matches!(cmd, Command::Cut);
+                if cut && !self.active_doc()?.roi.as_ref().is_some_and(|r| r.is_area()) {
+                    return Err(ij_core::CoreError::InvalidOperation("Cut requires an area selection").into());
+                }
+                self.clipboard = Some(self.active_doc()?.copy_selection()?);
+                if cut {
+                    let color = self.background_color;
+                    self.active_doc_mut()?.clear_roi_or_plane(color)?;
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push(format!("run(\"{}\");", if cut {"Cut"} else {"Copy"}));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Paste => {
+                if let Some(buffer) = self.clipboard.clone() {
+                    self.active_doc_mut()?.paste_selection(&buffer)?;
+                    self.mark_active_dirty();
+                }
+                self.macro_recorder.push("run(\"Paste\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Fill => {

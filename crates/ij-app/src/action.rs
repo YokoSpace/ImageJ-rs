@@ -85,6 +85,9 @@ pub enum AppAction {
     /// Edit > Fill (`F`): fills the selection with the foreground color
     /// (Filler.java "fill").
     Fill,
+    Copy,
+    Cut,
+    Paste,
     /// Edit > Draw (`D`): draws the selection outline with the foreground
     /// color (Filler.java "draw").
     Draw,
@@ -169,9 +172,9 @@ const EDIT_SELECTION: &[MenuNode] = &[
 const EDIT_MENU: &[MenuNode] = &[
     item("Undo", Some("Z"), AppAction::Undo),
     SEPARATOR,
-    unsupported("Cut", Some("X")),
-    unsupported("Copy", Some("C")),
-    unsupported("Paste", Some("V")),
+    item("Cut", Some("X"), AppAction::Cut),
+    item("Copy", Some("C"), AppAction::Copy),
+    item("Paste", Some("V"), AppAction::Paste),
     item("Clear", None, AppAction::Clear),
     item("Fill", Some("F"), AppAction::Fill),
     item("Draw", Some("D"), AppAction::Draw),
@@ -649,6 +652,13 @@ impl ImageJApp {
             }
             Clear => {
                 let _ = self.filler_clear_active();
+            }
+            Copy | Cut | Paste => {
+                let command = match action { Copy => ij_session::Command::Copy, Cut => ij_session::Command::Cut, _ => ij_session::Command::Paste };
+                match self.session.dispatch(command) {
+                    Ok(_) => { self.status_message = format!("{action:?}"); },
+                    Err(error) => { self.status_message = error.to_string(); }
+                }
             }
             Fill => {
                 let _ = self.fill_active();

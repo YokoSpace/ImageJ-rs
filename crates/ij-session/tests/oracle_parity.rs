@@ -15898,3 +15898,48 @@ fn parity_edit_point_angle_and_polyline_outlines_match_java_oracle() {
         assert_eq!(session.active_doc().unwrap().slices, expected.slices, "{edit_name}");
     }
 }
+
+#[test]
+fn parity_clipboard_rectangle() {
+    let source = ImageDocument::new("clipboard", 12, 10, PixelPlane::Gray8(ramp8(12, 10))).unwrap();
+    let expected = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap()
+        .run_macro_on_image(&source, "makeRectangle(1,1,3,3); run('Copy'); makeRectangle(7,5,3,3); run('Paste'); run('Select None');")
+        .unwrap().output_image.unwrap();
+    let mut session = Session::new();
+    session.insert_doc(source);
+    session.dispatch(Command::MakeRectRoi { x:1, y:1, width:3, height:3 }).unwrap();
+    session.dispatch(Command::Copy).unwrap();
+    session.dispatch(Command::MakeRectRoi { x:7, y:5, width:3, height:3 }).unwrap();
+    session.dispatch(Command::Paste).unwrap();
+    assert_eq!(session.active_doc().unwrap().slices, expected.slices);
+}
+
+#[test]
+fn parity_clipboard_oval_cut_center() {
+    for plane in [PixelPlane::Gray8(ramp8(12,10)), PixelPlane::ColorRgb((0..120).map(|i| 0xff000000 | (i*12345) as u32).collect())] {
+        let source=ImageDocument::new("oval clipboard",12,10,plane).unwrap();
+        let expected=JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap()
+            .run_macro_on_image(&source,"setBackgroundColor(0,0,0); makeOval(1,1,3,5); run('Cut'); run('Select None'); run('Paste'); run('Select None');")
+            .unwrap().output_image.unwrap();
+        let mut session=Session::new(); session.insert_doc(source);
+        session.dispatch(Command::MakeOvalRoi{x:1,y:1,width:3,height:5}).unwrap();
+        session.dispatch(Command::Cut).unwrap();
+        session.dispatch(Command::ClearRoi).unwrap();
+        let before=session.active_doc().unwrap().slices.clone();
+        session.dispatch(Command::Paste).unwrap();
+        assert_eq!(session.active_doc().unwrap().slices,expected.slices);
+        session.dispatch(Command::Undo).unwrap();
+        assert_eq!(session.active_doc().unwrap().slices,before);
+    }
+}
+
+#[test]
+fn clipboard_rejects_mismatched_planes_without_mutating_pixels() {
+    let mut session=Session::new();
+    session.insert_doc(ImageDocument::new("source",3,3,PixelPlane::Gray8(vec![42;9])).unwrap());
+    session.dispatch(Command::Copy).unwrap();
+    session.insert_doc(ImageDocument::new("target",5,5,PixelPlane::Gray16(vec![123;25])).unwrap());
+    let before=session.active_doc().unwrap().slices.clone();
+    assert!(session.dispatch(Command::Paste).is_err());
+    assert_eq!(session.active_doc().unwrap().slices,before);
+}

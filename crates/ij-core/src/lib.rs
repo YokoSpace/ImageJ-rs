@@ -5874,3 +5874,57 @@ mod tests {
         assert_eq!(doc.plane(), &PixelPlane::Gray8(vec![245, 244, 243, 242]));
     }
 }
+
+/// Pure pixel payload for the session's internal clipboard.
+#[derive(Debug, Clone)]
+pub struct ClipboardBuffer {
+    pub roi: Option<Roi>,
+    pub width: u32,
+    pub height: u32,
+    pub plane: PixelPlane,
+    pub mask: Option<RoiMask>,
+}
+
+impl ImageDocument {
+    pub fn copy_selection(&self) -> Result<ClipboardBuffer, CoreError> {
+        let (x,y,width,height) = match self.roi.as_ref().filter(|r| r.is_area()) {
+            Some(r) => r.clipped_bounds(self.width,self.height)?,
+            None => (0,0,self.width,self.height),
+        };
+        let mut mask = self.roi_mask()?;
+        if let Some(m) = &mut mask { m.x -= x; m.y -= y; }
+        Ok(ClipboardBuffer { roi: self.roi.clone().filter(|r| r.is_area()), width, height, plane: crop_plane(self.plane(),self.width,x,y,width,height), mask })
+    }
+
+    pub fn paste_selection(&mut self, buffer: &ClipboardBuffer) -> Result<(), CoreError> {
+        if std::mem::discriminant(self.plane()) != std::mem::discriminant(&buffer.plane) {
+            return Err(CoreError::InvalidOperation("clipboard pixel type differs from destination"));
+        }
+        let existing = self.roi.as_ref().filter(|r| { let (_,_,w,h)=r.bounds(); w==buffer.width as i32 && h==buffer.height as i32 });
+        let (x,y,mask) = if let Some(r)=existing {
+            let (x,y,_,_)=r.bounds(); (x,y,self.roi_mask()?.map(|mut m| { m.x=m.x.saturating_sub(x.max(0) as u32); m.y=m.y.saturating_sub(y.max(0) as u32); m }))
+        } else {
+            let x=self.width as i32/2-buffer.width as i32/2;
+            let y=self.height as i32/2-buffer.height as i32/2;
+            self.roi=Some(if let Some(mut roi)=buffer.roi.clone() { roi.set_location(x,y); roi } else { Roi::Rect(RectRoi::new(x,y,buffer.width as i32,buffer.height as i32)?) });
+            let mask=buffer.mask.clone();
+            (x,y,mask)
+        };
+        self.save_snapshot();
+        let dw=self.width; let dh=self.height;
+        for sy in 0..buffer.height { for sx in 0..buffer.width {
+            let dx=x+sx as i32; let dy=y+sy as i32;
+            if dx<0 || dy<0 || dx>=dw as i32 || dy>=dh as i32 || mask.as_ref().is_some_and(|m| !m.contains(sx,sy)) {continue;}
+            let si=(sy*buffer.width+sx) as usize; let di=(dy as u32*dw+dx as u32) as usize;
+            match (self.plane_mut(), &buffer.plane) {
+                (PixelPlane::Gray8(d),PixelPlane::Gray8(s)) => d[di]=s[si],
+                (PixelPlane::Gray16(d),PixelPlane::Gray16(s)) => d[di]=s[si],
+                (PixelPlane::Gray32(d),PixelPlane::Gray32(s)) => d[di]=s[si],
+                (PixelPlane::ColorRgb(d),PixelPlane::ColorRgb(s)) => d[di]=s[si],
+                (PixelPlane::Color256{pixels:d,..},PixelPlane::Color256{pixels:s,..}) => d[di]=s[si],
+                _ => unreachable!(),
+            }
+        }}
+        Ok(())
+    }
+}
