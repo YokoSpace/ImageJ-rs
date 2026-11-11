@@ -1556,6 +1556,11 @@ pub fn validate_filter_request(doc: &ImageDocument) -> Result<(), PluginFilterIn
                 detail: "angle selections are not supported".to_string(),
             });
         }
+        Some(Roi::Polyline(_)) => {
+            return Err(PluginFilterInputError::UnsupportedRoi {
+                detail: "line selections are not supported".to_string(),
+            });
+        }
     }
 
     Ok(())

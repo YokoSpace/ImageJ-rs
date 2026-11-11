@@ -1,4 +1,4 @@
-use ij_core::{AngleRoi, LineRoi, PointRoi, PolygonRoi, RectRoi, Roi};
+use ij_core::{AngleRoi, LineRoi, PointRoi, PolygonRoi, PolylineRoi, RectRoi, Roi};
 
 /// Result of hit testing a ROI with screen coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +185,10 @@ pub fn hit_test(roi: &Roi, screen: (f64, f64), mag: f64, src_origin: (f64, f64))
             }
             RoiHit::Outside
         }
+        // Line selections contain nothing (Roi.contains returns false for
+        // open-line types), and the Rust UI has no vertex-handle dragging
+        // for polylines yet (PolygonRoi.isHandle/moveHandle).
+        Roi::Polyline(_) => RoiHit::Outside,
     }
 }
 
@@ -208,6 +212,14 @@ pub fn move_by(roi: &Roi, dx: i32, dy: i32) -> Roi {
         }),
         Roi::Angle(a) => Roi::Angle(AngleRoi {
             points: a.points.map(|(x, y)| (x + dx, y + dy)),
+        }),
+        Roi::Polyline(p) => Roi::Polyline(PolylineRoi {
+            points: p
+                .points
+                .iter()
+                .map(|&(x, y)| (x + dx, y + dy))
+                .collect(),
+            freehand: p.freehand,
         }),
     }
 }
@@ -355,6 +367,8 @@ pub fn drag_handle(roi: &Roi, handle: u8, image_xy: (i32, i32)) -> Roi {
             }
             Roi::Angle(next)
         }
+        // PolygonRoi.moveHandle drags individual vertices; not ported yet.
+        Roi::Polyline(_) => roi.clone(),
     }
 }
 
@@ -518,6 +532,47 @@ pub fn nudge(roi: &Roi, a: Arrow, img_w: u32, img_h: u32) -> Roi {
             next.set_location(next_x, next_y);
             next
         }
+        Roi::Polyline(p) => {
+            let (min_x, min_y, w, h) = p.bounds();
+            let mut bx = min_x;
+            let mut by = min_y;
+            match a {
+                Arrow::Up => {
+                    by -= 1;
+                    if by < 0 {
+                        by = 0;
+                    }
+                }
+                Arrow::Down => {
+                    by += 1;
+                    if (by + h) >= y_max {
+                        by = y_max - h;
+                    }
+                }
+                Arrow::Left => {
+                    bx -= 1;
+                    if bx < 0 {
+                        bx = 0;
+                    }
+                }
+                Arrow::Right => {
+                    bx += 1;
+                    if (bx + w) >= x_max {
+                        bx = x_max - w;
+                    }
+                }
+            }
+            let dx = bx - min_x;
+            let dy = by - min_y;
+            Roi::Polyline(PolylineRoi {
+                points: p
+                    .points
+                    .iter()
+                    .map(|&(x, y)| (x + dx, y + dy))
+                    .collect(),
+                freehand: p.freehand,
+            })
+        }
     }
 }
 
@@ -633,6 +688,11 @@ pub fn nudge_corner(roi: &Roi, a: Arrow, img_w: u32, img_h: u32) -> Roi {
         }
         Roi::Polygon(_) | Roi::Point(_) | Roi::Angle(_) => {
             // PolygonRoi is type > OVAL, so Roi.java line 1233 returns early without changes.
+            roi.clone()
+        }
+        Roi::Polyline(_) => {
+            // Open lines are PolygonRoi types too: the same Roi.java line
+            // 1233 early return leaves them unchanged.
             roi.clone()
         }
     }

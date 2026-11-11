@@ -3,6 +3,7 @@ use crate::image_view::{visible_stack_axes, StackAxis};
 use crate::roi_edit::{RoiHit, drag_handle, hit_test, move_by};
 use crate::tool::{
     freehand_is_valid, freehand_push, polygon_closes_at_start, polygon_preview_segments,
+    polyline_is_valid,
 };
 use ij_core::{Wand, WandMode};
 
@@ -654,9 +655,11 @@ impl ImageJApp {
                         }
                     }
                 }
-                if tool == Tool::Freehand {
+                if matches!(tool, Tool::Freehand | Tool::Freeline) {
                     // FreehandRoi's constructor seeds the polygon with the
-                    // press point and nPoints=1 (FreehandRoi.java 10-17).
+                    // press point and nPoints=1 (FreehandRoi.java 10-17);
+                    // the FREELINE tool uses the same class
+                    // (ImagePlus.createNewRoi 2133-2135).
                     ui.ctx().data_mut(|data| {
                         data.insert_temp(
                             freehand_build_id(image_id),
@@ -677,7 +680,7 @@ impl ImageJApp {
                     view.drag_current_pixel = Some((px, py));
                 }
             }
-            if tool == Tool::Freehand {
+            if matches!(tool, Tool::Freehand | Tool::Freeline) {
                 if let Some(curr) = view.drag_current_pixel {
                     let mut build = ui
                         .ctx()
@@ -722,6 +725,7 @@ impl ImageJApp {
 
         let mut drag_action = None;
         let mut freehand_finish: Option<Vec<(i32, i32)>> = None;
+        let mut freeline_finish: Option<Vec<(i32, i32)>> = None;
         if response.drag_stopped() {
             view.is_dragging = false;
             let edit = ui.ctx().data_mut(|data| {
@@ -741,7 +745,7 @@ impl ImageJApp {
                             Roi::Rect(r) => Some(DragAction::Rect(r.x, r.y, r.width, r.height)),
                             Roi::Oval(r) => Some(DragAction::Oval(r.x, r.y, r.width, r.height)),
                             Roi::Line(l) => Some(DragAction::Line(l.x1, l.y1, l.x2, l.y2)),
-                            Roi::Polygon(_) => None,
+                            Roi::Polygon(_) | Roi::Polyline(_) => None,
                             Roi::Point(p) => Some(DragAction::Point(p.points.clone())),
                             Roi::Angle(a) => Some(DragAction::Angle(a.points)),
                         };
@@ -773,7 +777,7 @@ impl ImageJApp {
                     _ => {}
                 }
             }
-            if tool == Tool::Freehand {
+            if matches!(tool, Tool::Freehand | Tool::Freeline) {
                 let build = ui.ctx().data_mut(|data| {
                     data.remove_temp::<FreehandBuild>(freehand_build_id(image_id))
                 });
@@ -781,10 +785,15 @@ impl ImageJApp {
                     if let Some(curr) = view.drag_current_pixel {
                         freehand_push(&mut build.points, curr, doc_w, doc_h);
                     }
-                    // handleMouseUp finishes the polygon, and finishPolygon
-                    // discards degenerate selections (FreehandRoi.java 90-96,
-                    // PolygonRoi.java 591-593).
-                    if freehand_is_valid(&build.points) {
+                    // handleMouseUp finishes via finishPolygon, which keeps a
+                    // freehand area with three-plus vertices and a non-zero
+                    // span, and an open line with two-plus vertices
+                    // (FreehandRoi.java 90-96, PolygonRoi.java 591-593).
+                    if tool == Tool::Freeline {
+                        if polyline_is_valid(&build.points) {
+                            freeline_finish = Some(build.points);
+                        }
+                    } else if freehand_is_valid(&build.points) {
                         freehand_finish = Some(build.points);
                     }
                 }
@@ -792,7 +801,7 @@ impl ImageJApp {
             view.drag_start_pixel = None;
             view.drag_current_pixel = None;
         }
-        if tool != Tool::Freehand {
+        if !matches!(tool, Tool::Freehand | Tool::Freeline) {
             ui.ctx()
                 .data_mut(|data| data.remove::<FreehandBuild>(freehand_build_id(image_id)));
         }
@@ -849,13 +858,16 @@ impl ImageJApp {
             ui.ctx().data_mut(|data| data.remove::<PolygonBuild>(angle_key));
         }
 
-        // Polygon tool: every click appends a vertex; a double-click or a click
-        // in the 10x10 screen-pixel start box finishes the open polyline
-        // (PolygonRoi.handleMouseUp 1100-1118). Nothing is written to the
-        // document until the selection closes.
+        // Polygon and Segmented Line tools: every click appends a vertex; a
+        // double-click or a click in the 10x10 screen-pixel start box finishes
+        // the construction (PolygonRoi.handleMouseUp 1100-1118). Nothing is
+        // written to the document until the selection completes: as a closed
+        // polygon for the Polygon tool, an open polyline for the Segmented
+        // Line tool.
         let build_key = polygon_build_id(image_id);
         let mut polygon_finish: Option<Vec<(i32, i32)>> = None;
-        if tool == Tool::Polygon {
+        let mut polyline_finish: Option<Vec<(i32, i32)>> = None;
+        if matches!(tool, Tool::Polygon | Tool::Polyline) {
             let mut build = ui
                 .ctx()
                 .data(|data| data.get_temp::<PolygonBuild>(build_key))
@@ -872,18 +884,37 @@ impl ImageJApp {
                 {
                     let rel = (pos.x - img_rect.min.x, pos.y - img_rect.min.y);
                     let (px, py) = view.screen_to_pixel(rel.0, rel.1);
-                    let closes = build.vertices.len() >= 3
+                    // handleMouseUp completes a segment construction once
+                    // nPoints>2 - committed vertices plus the rubber-band
+                    // point - and the click lands in the start box or
+                    // doubles the previous one; a polygon needs three
+                    // committed vertices, a polyline two.
+                    let min_vertices = if tool == Tool::Polyline { 2 } else { 3 };
+                    let closes = build.vertices.len() >= min_vertices
                         && (response.double_clicked()
-                            || polygon_closes_at_start(build.vertices[0], rel, view.zoom as f32));
+                            || polygon_closes_at_start(
+                                build.vertices[0],
+                                rel,
+                                view.zoom as f32,
+                            ));
                     if closes {
-                        polygon_finish = Some(build.vertices.clone());
-                    } else {
+                        if tool == Tool::Polyline {
+                            polyline_finish = Some(build.vertices.clone());
+                        } else {
+                            polygon_finish = Some(build.vertices.clone());
+                        }
+                    } else if !(tool == Tool::Polyline
+                        && response.double_clicked()
+                        && build.vertices.last() == Some(&(px, py)))
+                    {
+                        // handleMouseUp appends a repeated double-click only
+                        // when samePoint is false (PolygonRoi.java 1121).
                         build.vertices.push((px, py));
                     }
                     let _ = self.set_active_window(image_id);
                 }
             }
-            if polygon_finish.is_some() {
+            if polygon_finish.is_some() || polyline_finish.is_some() {
                 ui.ctx()
                     .data_mut(|data| data.remove::<PolygonBuild>(build_key));
             } else {
@@ -942,9 +973,10 @@ impl ImageJApp {
                         );
                         painter.line_segment([p1, p2], stroke);
                     }
-                    Tool::Freehand => {
+                    Tool::Freehand | Tool::Freeline => {
                         // FreehandRoi.drawLine repaints the growing path while
-                        // the mouse is down (FreehandRoi.java 61-88).
+                        // the mouse is down (FreehandRoi.java 61-88); the
+                        // FREELINE tool uses the same construction path.
                         if let Some(build) = ui.ctx().data(|data| {
                             data.get_temp::<FreehandBuild>(freehand_build_id(image_id))
                         }) {
@@ -1041,14 +1073,32 @@ impl ImageJApp {
                             painter.circle_filled(point, 3.0, Color32::from_rgb(255, 255, 0));
                         }
                     }
+                    Roi::Polyline(p) => {
+                        // PolygonRoi.draw paints open lines with
+                        // g.drawPolyline: no closing segment back to the
+                        // first vertex (PolygonRoi.java 228).
+                        let pts: Vec<Pos2> = p
+                            .points
+                            .iter()
+                            .map(|&(x, y)| {
+                                Pos2::new(
+                                    x as f32 * z + img_rect.min.x,
+                                    y as f32 * z + img_rect.min.y,
+                                )
+                            })
+                            .collect();
+                        for pair in pts.windows(2) {
+                            painter.line_segment([pair[0], pair[1]], stroke);
+                        }
+                    }
                 }
             }
         }
 
-        // Transient Polygon tool rubber band: open edges plus the live edge to
-        // the cursor, and the start box that closes the selection
-        // (PolygonRoi.draw 228, drawStartBox 190-193).
-        if tool == Tool::Polygon {
+        // Transient Polygon/Segmented Line tool rubber band: open edges plus
+        // the live edge to the cursor, and the start box that completes the
+        // selection (PolygonRoi.draw 228, drawStartBox 190-193).
+        if matches!(tool, Tool::Polygon | Tool::Polyline) {
             if let Some(build) = ui
                 .ctx()
                 .data(|data| data.get_temp::<PolygonBuild>(build_key))
@@ -1168,12 +1218,34 @@ impl ImageJApp {
             let _ = self.dispatch_polygon_roi(points);
         }
 
+        if let Some(points) = polyline_finish {
+            let _ = self.set_active_window(image_id);
+            match self.session.dispatch(Command::MakePolylineRoi { points }) {
+                Ok(_) => self.status_message = "Segmented line ROI created".into(),
+                Err(error) => {
+                    self.status_message = format!("Segmented line ROI failed: {error}");
+                    self.dialogs.last_error = Some(self.status_message.clone());
+                }
+            }
+        }
+
         if let Some(points) = freehand_finish {
             let _ = self.set_active_window(image_id);
             match self.session.dispatch(Command::MakeFreehandRoi { points }) {
                 Ok(_) => self.status_message = "Freehand ROI created".into(),
                 Err(error) => {
                     self.status_message = format!("Freehand ROI failed: {error}");
+                    self.dialogs.last_error = Some(self.status_message.clone());
+                }
+            }
+        }
+
+        if let Some(points) = freeline_finish {
+            let _ = self.set_active_window(image_id);
+            match self.session.dispatch(Command::MakeFreelineRoi { points }) {
+                Ok(_) => self.status_message = "Freehand line ROI created".into(),
+                Err(error) => {
+                    self.status_message = format!("Freehand line ROI failed: {error}");
                     self.dialogs.last_error = Some(self.status_message.clone());
                 }
             }

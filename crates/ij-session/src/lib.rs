@@ -150,6 +150,19 @@ pub enum Command {
         x2: i32,
         y2: i32,
     },
+    /// Segmented Line tool / multi-point `makeLine`: a `POLYLINE` selection
+    /// (`Functions.makeLine` routes more than four arguments to
+    /// PolygonRoi, Functions.java 819-843). Recorded as `makeLine(...)`
+    /// (Recorder.recordRoi 397-424).
+    MakePolylineRoi {
+        points: Vec<(i32, i32)>,
+    },
+    /// Freehand Line tool: a `FREELINE` selection built by `FreehandRoi`.
+    /// `finishPolygon` records no macro for freehand shapes
+    /// (PolygonRoi.java 594-596).
+    MakeFreelineRoi {
+        points: Vec<(i32, i32)>,
+    },
     SelectAll,
     ClearRoi,
     RestoreSelection,
@@ -999,6 +1012,38 @@ impl Session {
                 }
                 self.macro_recorder
                     .push(format!("makeLine({x1}, {y1}, {x2}, {y2});"));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MakePolylineRoi { points } => {
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let before = doc.roi.clone();
+                    doc.set_polyline_roi(&points, false)?;
+                    doc.roi != before
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
+                // Recorder.recordRoi emits multi-point makeLine for POLYLINE
+                // (Recorder.java 397-424).
+                let coords = points
+                    .iter()
+                    .map(|(x, y)| format!("{x}, {y}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.macro_recorder.push(format!("makeLine({coords});"));
+                Ok(CommandOutcome::Updated)
+            }
+            Command::MakeFreelineRoi { points } => {
+                let changed = {
+                    let doc = self.active_doc_mut()?;
+                    let before = doc.roi.clone();
+                    doc.set_polyline_roi(&points, true)?;
+                    doc.roi != before
+                };
+                if changed {
+                    self.mark_active_dirty();
+                }
                 Ok(CommandOutcome::Updated)
             }
             Command::SelectAll => {

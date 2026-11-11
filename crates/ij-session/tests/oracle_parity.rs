@@ -14774,3 +14774,281 @@ fn parity_angle_calibrated_results_match_java() {
         }
     }
 }
+
+// P3.7b: Segmented Line (Polyline) and Freehand Line (Freeline) selections.
+// PolygonRoi.java 1389-1422 (getLength: raw segment sums for POLYLINE, the
+// 3-point running average for FREELINE with more than two points),
+// ProfilePlot.java 236-290 (getIrregularProfile) and Analyzer.java
+// 443-519/692-693 (measureLength: profile statistics plus Results-only
+// Length column, without the Angle column that straight Lines write).
+
+fn polyline_roi_macro(points: &[(i32, i32)], freehand: bool) -> String {
+    // Functions.makeLine routes more than four arguments to PolygonRoi
+    // (Functions.java 819-843); exactly four arguments build a straight
+    // Line instead, so a two-point macro needs makeSelection.
+    if freehand || points.len() == 2 {
+        let xs = points
+            .iter()
+            .map(|(x, _)| x.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let ys = points
+            .iter()
+            .map(|(_, y)| y.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let kind = if freehand { "freeline" } else { "polyline" };
+        format!("makeSelection('{kind}', newArray({xs}), newArray({ys}));")
+    } else {
+        let coords = points
+            .iter()
+            .map(|(x, y)| format!("{x}, {y}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("makeLine({coords});")
+    }
+}
+
+fn oracle_polyline_measure(
+    points: &[(i32, i32)],
+    freehand: bool,
+    pixel_width: f64,
+    pixel_height: f64,
+) -> BTreeMap<String, String> {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let cal_macro = if pixel_width == 1.0 {
+        String::new()
+    } else {
+        format!("setVoxelSize({pixel_width},{pixel_height},1,'mm');")
+    };
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('polyline', '8-bit ramp', 16, 16, 1); {cal_macro} {} \
+             run('Set Measurements...', 'area mean standard min max bounding decimal=3'); run('Measure');",
+            polyline_roi_macro(points, freehand)
+        ))
+        .unwrap();
+    oracle_columns(&oracle.stdout)
+}
+
+#[test]
+fn parity_polyline_measure_matches_java_oracle() {
+    let cases: [(&str, &[(i32, i32)], bool, f64, f64); 6] = [
+        (
+            "polyline",
+            &[(1, 1), (5, 3), (9, 7)],
+            false,
+            1.0,
+            1.0,
+        ),
+        (
+            "calibrated polyline",
+            &[(1, 1), (5, 3), (9, 7)],
+            false,
+            0.5,
+            0.25,
+        ),
+        (
+            // FREELINE with more than two points reports the smoothed
+            // length (PolygonRoi.getSmoothedLineLength 1248-1258).
+            "freeline",
+            &[(1, 1), (6, 2), (9, 5), (13, 8), (15, 9)],
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "calibrated freeline",
+            &[(1, 1), (6, 2), (9, 5), (13, 8), (15, 9)],
+            true,
+            0.5,
+            0.25,
+        ),
+        (
+            // A two-point freeline skips the smoothing branch and takes
+            // the plain segment sum (PolygonRoi.getLength 1397-1400).
+            "two-point freeline",
+            &[(1, 1), (9, 7)],
+            true,
+            1.0,
+            1.0,
+        ),
+        (
+            "origin-adjacent polyline",
+            &[(0, 0), (5, 2), (9, 7)],
+            false,
+            1.0,
+            1.0,
+        ),
+    ];
+    let config = MeasurementConfig {
+        flags: MeasurementFlags::AREA
+            | MeasurementFlags::MEAN
+            | MeasurementFlags::STD_DEV
+            | MeasurementFlags::MIN_MAX
+            | MeasurementFlags::RECT,
+        precision: 3,
+    };
+    for (name, points, freehand, pixel_width, pixel_height) in cases {
+        let expected = oracle_polyline_measure(points, freehand, pixel_width, pixel_height);
+        let mut doc = ImageDocument::new_ramp_8bit("polyline", 16, 16).unwrap();
+        doc.calibration.pixel_width = pixel_width;
+        doc.calibration.pixel_height = pixel_height;
+        doc.set_polyline_roi(points, freehand).unwrap();
+        let stats = doc.measure_with_config(config).unwrap();
+        for (column, actual) in [
+            ("Area", stats.area),
+            ("Mean", stats.mean),
+            ("StdDev", stats.std_dev),
+            ("Min", stats.min),
+            ("Max", stats.max),
+            // Int-coordinate line ROIs get the +1 "draw area" bounds
+            // (PolygonRoi.finishPolygon 571-573, Roi.setIntBounds 538-543).
+            ("BX", stats.roi_x),
+            ("BY", stats.roi_y),
+            ("Width", stats.roi_width),
+            ("Height", stats.roi_height),
+            (
+                "Length",
+                stats.line.as_ref().expect("line measurement").length,
+            ),
+        ] {
+            assert_eq!(
+                &format_ij_num(actual),
+                expected
+                    .get(column)
+                    .unwrap_or_else(|| panic!("oracle column {column} missing")),
+                "{name} {column}"
+            );
+        }
+        // Analyzer.saveResults writes the Angle column for straight Lines
+        // only (Analyzer.java 692-697), so no polyline row has one.
+        assert!(!expected.contains_key("Angle"), "{name} unexpected Angle");
+    }
+}
+
+/// Profile values for a selection whose roi_macro would leave an open line
+/// active: the bridge saves the macro's image back to a TIFF afterwards, and
+/// the narrow TIFF ROI codec does not carry polyline records yet, so the
+/// selection is deselected again at the end of the macro body.
+fn oracle_polyline_profile(doc: &ImageDocument, roi_macro: &str) -> Vec<f64> {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let macro_text = format!(
+        "{roi_macro} p=getProfile(); print(\"PROFILE_LEN:\"+p.length);\n         for(i=0;i<p.length;i++) print(d2s(p[i],9)); run(\"Select None\");"
+    );
+    let output = bridge.run_macro_on_image(doc, &macro_text).unwrap();
+    let mut lines = output.stdout.lines().filter(|line| !line.trim().is_empty());
+    let len = lines
+        .next()
+        .unwrap()
+        .strip_prefix("PROFILE_LEN:")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    let values = lines
+        .map(|line| line.trim().parse::<f64>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), len);
+    values
+}
+
+#[test]
+fn parity_polyline_profile_matches_java_oracle() {
+    for (name, doc) in profile_test_documents() {
+        for (label, points, freehand) in [
+            ("polyline", vec![(1, 1), (4, 3), (6, 5)], false),
+            (
+                "freeline",
+                vec![(1, 1), (3, 2), (4, 4), (6, 5), (7, 5)],
+                true,
+            ),
+            ("two-point polyline", vec![(1, 1), (6, 2)], false),
+            ("two-point freeline", vec![(1, 1), (6, 2)], true),
+            (
+                // The first sample is kept only when its distance from the
+                // (0, 0) initial lastx/lasty reaches 1-inc/2, so a
+                // selection starting at (0, 0) never records its first
+                // point (ProfilePlot.java 269-289).
+                "origin-adjacent polyline",
+                vec![(0, 0), (4, 2), (6, 5)],
+                false,
+            ),
+        ] {
+            let mut doc = doc.clone();
+            doc.set_polyline_roi(&points, freehand).unwrap();
+            // The pixels reach Java through a TIFF, so the selection travels
+            // as the roi_macro itself rather than as ROI metadata.
+            let mut raw_doc = doc.clone();
+            raw_doc.clear_roi();
+            let expected = oracle_polyline_profile(&raw_doc, &polyline_roi_macro(&points, freehand));
+            let actual = doc.plot_profile().unwrap();
+            assert_profile_values(&actual.values, &expected, &format!("{name} {label}"));
+            assert_profile_min_max(
+                (actual.min, actual.max),
+                java_profile_min_max(&expected),
+                &format!("{name} {label}"),
+            );
+            // getIrregularProfile keeps xInc = cal.pixelWidth; only the
+            // straight-line branch recalibrates (ProfilePlot.java 66-68,
+            // 190-203).
+            assert_eq!(actual.x_inc, doc.calibration.pixel_width, "{name} {label} xInc");
+        }
+    }
+}
+
+#[test]
+fn session_polyline_commands_measure_record_and_profile() {
+    let mut session = Session::new();
+    session
+        .dispatch(Command::NewRamp8Bit {
+            title: "polyline".into(),
+            width: 16,
+            height: 16,
+        })
+        .unwrap();
+    let records = session.macro_recorder.len();
+
+    // The segmented-line tool records makeLine (Recorder.recordRoi 397-424).
+    session
+        .dispatch(Command::MakePolylineRoi {
+            points: vec![(1, 1), (5, 3), (9, 7)],
+        })
+        .unwrap();
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("makeLine(1, 1, 5, 3, 9, 7);")
+    );
+    match session.dispatch(Command::Measure).unwrap() {
+        CommandOutcome::Measured(summary) => {
+            assert_eq!(format_ij_num(summary.line.unwrap().length), "10.129");
+        }
+        other => panic!("expected Measured, got {other:?}"),
+    }
+    let results_tsv = session.results.to_tsv();
+    assert!(results_tsv.contains("\tLength\n"), "results: {results_tsv}");
+
+    // The freehand-line tool shares FreehandRoi construction, which
+    // finishPolygon never records (PolygonRoi.java 594-596); only the
+    // Measure commands add further records here.
+    session
+        .dispatch(Command::MakeFreelineRoi {
+            points: vec![(1, 1), (6, 2), (9, 5), (13, 8), (15, 9)],
+        })
+        .unwrap();
+    assert_eq!(session.macro_recorder.len(), records + 2);
+
+    match session.dispatch(Command::Measure).unwrap() {
+        CommandOutcome::Measured(summary) => {
+            assert_eq!(format_ij_num(summary.line.unwrap().length), "16.219");
+        }
+        other => panic!("expected Measured, got {other:?}"),
+    }
+    match session.dispatch(Command::PlotProfile).unwrap() {
+        CommandOutcome::ProfileComputed(profile) => {
+            assert_eq!(profile.values.len(), 17);
+            // First and last samples are exact endpoint pixels of the ramp.
+            assert_eq!(format_ij_num(profile.values[0]), "16");
+        }
+        other => panic!("expected ProfileComputed, got {other:?}"),
+    }
+}

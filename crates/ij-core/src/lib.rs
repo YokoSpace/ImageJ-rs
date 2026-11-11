@@ -423,6 +423,95 @@ impl LineRoi {
     }
 }
 
+/// A segmented line (`POLYLINE`) or freehand line (`FREELINE`) selection,
+/// built by the Segmented Line / Freehand Line tools, by multi-point
+/// `makeLine`, and by `makeSelection("polyline"/"freeline", ...)` with
+/// integer coordinates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolylineRoi {
+    pub points: Vec<(i32, i32)>,
+    /// Distinguishes `FREELINE` from `POLYLINE`: a freeline with more than
+    /// two points reports a smoothed length
+    /// (PolygonRoi.getSmoothedLineLength 1248-1258).
+    pub freehand: bool,
+}
+
+impl PolylineRoi {
+    /// Integer-coordinate open lines get the "draw area" bounds: the raw
+    /// bounding span plus one on each axis, so both endpoint pixels are
+    /// enclosed (`PolygonRoi.finishPolygon` increments width/height,
+    /// PolygonRoi.java 571-573; `Roi.setIntBounds` 538-543).
+    pub fn bounds(&self) -> (i32, i32, i32, i32) {
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+        for &(x, y) in &self.points {
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+        }
+        if self.points.is_empty() {
+            return (0, 0, 1, 1);
+        }
+        (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1)
+    }
+
+    /// `PolygonRoi.getLength` for `POLYLINE`/`FREELINE`
+    /// (PolygonRoi.java 1389-1422, 1444-1463).
+    pub fn length(&self, pixel_width: f64, pixel_height: f64) -> f64 {
+        let n = self.points.len();
+        if n < 2 {
+            return 0.0;
+        }
+        // Java takes the smoothed length for a FREELINE with more than two
+        // points unless the ROI width or height is zero. That guard is on
+        // the finishPolygon-inflated bounds, which are always >= 1 here, so
+        // the smoothing branch always applies (PolygonRoi.java 1397-1400).
+        if self.freehand && n > 2 {
+            return self.smoothed_length(pixel_width, pixel_height);
+        }
+        // getLength(int[], ...): plain calibrated segment sums; open lines
+        // never close the shape (closeShape = isArea()).
+        self.points
+            .windows(2)
+            .map(|pair| {
+                let dx = f64::from(pair[1].0 - pair[0].0) * pixel_width;
+                let dy = f64::from(pair[1].1 - pair[0].1) * pixel_height;
+                (dx * dx + dy * dy).sqrt()
+            })
+            .sum()
+    }
+
+    /// `PolygonRoi.getSmoothedLineLength` with integer coordinates
+    /// (PolygonRoi.java 1248-1258): the length of the polyline through the
+    /// 3-point running averages of the vertices, endpoints included.
+    fn smoothed_length(&self, pixel_width: f64, pixel_height: f64) -> f64 {
+        let w2 = pixel_width * pixel_width;
+        let h2 = pixel_height * pixel_height;
+        // Java indexes xp[0..=2] directly, so n >= 3 here.
+        let x: Vec<f64> = self.points.iter().map(|p| f64::from(p.0)).collect();
+        let y: Vec<f64> = self.points.iter().map(|p| f64::from(p.1)).collect();
+        let n = x.len();
+        // dx = (x0+x1+x2)/3-x0, dy likewise
+        let mut length =
+            (((x[0] + x[1] + x[2]) / 3.0 - x[0]) * ((x[0] + x[1] + x[2]) / 3.0 - x[0]) * w2
+                + ((y[0] + y[1] + y[2]) / 3.0 - y[0]) * ((y[0] + y[1] + y[2]) / 3.0 - y[0]) * h2)
+                .sqrt();
+        for i in 1..n - 2 {
+            let dx = (x[i + 2] - x[i - 1]) / 3.0;
+            let dy = (y[i + 2] - y[i - 1]) / 3.0;
+            length += (dx * dx * w2 + dy * dy * h2).sqrt();
+        }
+        // dx = xp[nPoints-1]-(xp[n-3]+xp[n-2]+xp[n-1])/3
+        let dx = x[n - 1] - (x[n - 3] + x[n - 2] + x[n - 1]) / 3.0;
+        let dy = y[n - 1] - (y[n - 3] + y[n - 2] + y[n - 1]) / 3.0;
+        length += (dx * dx * w2 + dy * dy * h2).sqrt();
+        length
+    }
+}
+
 /// A rasterized ROI mask in image coordinates. `pixels` is row-major over
 /// `(width, height)` and is already clipped to the image, matching
 /// ImageProcessor.setRoi(Rectangle), which crops a mask to the image.
@@ -654,11 +743,17 @@ pub enum Roi {
     Line(LineRoi),
     Point(PointRoi),
     Angle(AngleRoi),
+    Polyline(PolylineRoi),
 }
 
 impl Roi {
     pub fn is_area(&self) -> bool {
         matches!(self, Self::Rect(_) | Self::Oval(_) | Self::Polygon(_))
+    }
+
+    /// `Roi.isLine` covers straight, segmented, freehand and angle selections.
+    pub fn is_line(&self) -> bool {
+        matches!(self, Self::Line(_) | Self::Polyline(_) | Self::Angle(_))
     }
 
     pub fn bounds(&self) -> (i32, i32, i32, i32) {
@@ -671,6 +766,7 @@ impl Roi {
                 (x, y, w + 1, h + 1)
             }
             Self::Angle(a) => point_bounds(&a.points),
+            Self::Polyline(p) => p.bounds(),
         }
     }
 
@@ -694,10 +790,10 @@ impl Roi {
     }
 
     /// Returns `None` for rectangular ROIs, whose processor has no mask, and
-    /// for line ROIs, which `ImagePlus.setRoi` turns into `resetRoi`
-    /// (ImagePlus.java 2080-2083). Those cases return `None` even when the
-    /// bounds lie outside the image; only area masks can fail with
-    /// `EmptySelection`.
+    /// for line ROIs (straight, segmented and freehand), which
+    /// `ImagePlus.setRoi` turns into `resetRoi` (ImagePlus.java 2078-2083).
+    /// Those cases return `None` even when the bounds lie outside the image;
+    /// only area masks can fail with `EmptySelection`.
     pub fn raster_mask(
         &self,
         img_width: u32,
@@ -705,7 +801,7 @@ impl Roi {
     ) -> Result<Option<RoiMask>, CoreError> {
         let (bx, by, bw, bh) = self.bounds();
         let local = match self {
-            Self::Rect(_) | Self::Line(_) | Self::Point(_) | Self::Angle(_) => return Ok(None),
+            Self::Rect(_) | Self::Line(_) | Self::Polyline(_) | Self::Point(_) | Self::Angle(_) => return Ok(None),
             Self::Oval(_) => oval_mask(bw, bh),
             Self::Polygon(p) => polygon_mask(&p.xpoints, &p.ypoints, bw, bh),
         };
@@ -778,6 +874,15 @@ impl Roi {
                 l.x2 += dx;
                 l.y2 += dy;
             }
+            Self::Polyline(p) => {
+                let (bx, by, _, _) = p.bounds();
+                let dx = new_x - bx;
+                let dy = new_y - by;
+                for point in p.points.iter_mut() {
+                    point.0 += dx;
+                    point.1 += dy;
+                }
+            }
         }
     }
 
@@ -787,7 +892,7 @@ impl Roi {
     pub fn is_smaller(&self, img_width: u32, img_height: u32) -> bool {
         let (_, _, bw, bh) = self.bounds();
         let mask = match self {
-            Self::Rect(_) | Self::Line(_) | Self::Point(_) | Self::Angle(_) => return false,
+            Self::Rect(_) | Self::Line(_) | Self::Polyline(_) | Self::Point(_) | Self::Angle(_) => return false,
             Self::Oval(_) => oval_mask(bw, bh),
             Self::Polygon(p) => polygon_mask(&p.xpoints, &p.ypoints, bw, bh),
         };
@@ -1781,6 +1886,24 @@ impl ImageDocument {
         self.roi = Some(Roi::Line(LineRoi { x1, y1, x2, y2 }));
     }
 
+    /// Sets a segmented-line (or freehand-line) selection. `finishPolygon`
+    /// deletes open lines with fewer than two vertices
+    /// (PolygonRoi.java 591-593).
+    pub fn set_polyline_roi(
+        &mut self,
+        points: &[(i32, i32)],
+        freehand: bool,
+    ) -> Result<(), CoreError> {
+        if points.len() < 2 {
+            return Err(CoreError::InvalidPolygon);
+        }
+        self.roi = Some(Roi::Polyline(PolylineRoi {
+            points: points.to_vec(),
+            freehand,
+        }));
+        Ok(())
+    }
+
     /// The irregular ROI mask, or `None` for the whole image, rectangular
     /// ROIs (Roi.getMask returns null for rectangles) and line ROIs (a line
     /// resets the processor ROI instead of installing a mask, ImagePlus.java
@@ -1884,7 +2007,7 @@ impl ImageDocument {
                 xpoints: p.xpoints.iter().map(|px| px - x as i32).collect(),
                 ypoints: p.ypoints.iter().map(|py| py - y as i32).collect(),
             })),
-            Roi::Line(_) | Roi::Point(_) | Roi::Angle(_) => {
+            Roi::Line(_) | Roi::Polyline(_) | Roi::Point(_) | Roi::Angle(_) => {
                 unreachable!("non-area ROIs are rejected above")
             }
         };
@@ -1940,7 +2063,7 @@ impl ImageDocument {
                 // Duplicator.java 121-123 calls roi.setLocation(0, 0) for
                 // non-rectangular area selections.
                 relocated_roi = match roi {
-                    Roi::Rect(_) | Roi::Line(_) | Roi::Point(_) | Roi::Angle(_) => None,
+                    Roi::Rect(_) | Roi::Line(_) | Roi::Polyline(_) | Roi::Point(_) | Roi::Angle(_) => None,
                     Roi::Oval(r) => Some(Roi::Oval(RectRoi {
                         x: 0,
                         y: 0,
@@ -2887,6 +3010,16 @@ impl ImageDocument {
             self.populate_shape_descriptors(&mut summary, config);
             return Ok(summary);
         }
+        if let Some(Roi::Polyline(polyline)) = &self.roi {
+            let mut summary = self.measure_polyline(
+                polyline,
+                config.contains(MeasurementFlags::LIMIT),
+                limit,
+            );
+            summary.threshold_range = self.measurement_threshold_range(config);
+            self.populate_shape_descriptors(&mut summary, config);
+            return Ok(summary);
+        }
         let (rx, ry, rw, rh) = match &self.roi {
             // A selection entirely outside the image leaves a 0x0 processor
             // ROI (ImageProcessor.setRoi lines 860-864) but still produces a
@@ -2977,6 +3110,13 @@ impl ImageDocument {
         let mut x_inc = self.calibration.pixel_width;
         let values = match self.roi.as_ref() {
             Some(Roi::Rect(rect)) => self.column_average_profile(rect),
+            Some(Roi::Polyline(poly)) => {
+                // ProfilePlot.java 82-86: POLYLINE and FREELINE selections
+                // sample the raw segments via getIrregularProfile; only the
+                // straight-line branch recalibrates xInc, so the increment
+                // stays at cal.pixelWidth.
+                self.irregular_profile(&poly.points)
+            }
             Some(Roi::Line(line)) => {
                 let values = self.straight_line_profile(*line);
                 // ProfilePlot.java 190-203: only a non-square pixel keeps the
@@ -3205,8 +3345,134 @@ impl ImageDocument {
         let angle = (((y1 - y2) * self.calibration.pixel_height)
             .atan2((x2 - x1) * self.calibration.pixel_width))
         .to_degrees();
-        summary.line = Some(LineMeasurement { length, angle });
+        summary.line = Some(LineMeasurement {
+            length,
+            angle,
+            show_angle: true,
+        });
         summary
+    }
+
+    /// `Analyzer.measureLength` for a 1-pixel-wide segmented or freehand
+    /// line (Analyzer.java 443-519): the statistics come from the
+    /// `getIrregularProfile` samples wrapped in a one-row FloatProcessor,
+    /// and `Area` is the sample count scaled by the spatial calibration.
+    fn measure_polyline(
+        &self,
+        polyline: &PolylineRoi,
+        limit_enabled: bool,
+        limit: Option<ThresholdLevels>,
+    ) -> MeasurementSummary {
+        let profile = self.irregular_profile(&polyline.points);
+        // FloatProcessor(double[]) narrows the samples to float before
+        // FloatStatistics runs (FloatProcessor.java 49-53).
+        let profile: Vec<f32> = profile.into_iter().map(|value| value as f32).collect();
+        let samples = profile.len() as u32;
+        // Analyzer.java 500-511 converts the float profile back to the
+        // source depth whenever LIMIT is selected, even without a threshold.
+        let raw = match (limit_enabled, self.plane()) {
+            (true, PixelPlane::Gray8(_) | PixelPlane::Color256 { .. }) => {
+                // ByteProcessor.setPixels(int, FloatProcessor) adds 0.5f,
+                // clamps, then narrows to byte (ByteProcessor.java 1268-1278).
+                let pixels: Vec<u8> = profile
+                    .iter()
+                    .map(|&value| (value + 0.5_f32).clamp(0.0, 255.0) as u8)
+                    .collect();
+                self.measure_byte_like(&pixels, 0, 0, samples, 1, None, None, limit)
+            }
+            (true, PixelPlane::Gray16(_)) => {
+                let pixels: Vec<u16> = profile
+                    .iter()
+                    .map(|&value| float_to_short(value, 0.0, 1.0))
+                    .collect();
+                self.measure_short(&pixels, 0, 0, samples, 1, None, None, limit)
+            }
+            _ => self.measure_float(&profile, 0, 0, samples, 1, None, None, limit),
+        };
+        let mut summary = self.finish_measurement(0, 0, samples, 1, raw);
+
+        // Analyzer.measureLength calls ImageStatistics with
+        // AREA+MEAN+STD_DEV+MODE+MIN_MAX+MEDIAN (+LIMIT) (Analyzer.java
+        // 512), so CENTROID/CENTER_OF_MASS stay at ImageStatistics' 0.0
+        // defaults for polylines: the endpoint-midpoint override only
+        // exists for straight Lines (Analyzer.java 515-524).
+        summary.x_centroid = 0.0;
+        summary.y_centroid = 0.0;
+        summary.x_center_of_mass = 0.0;
+        summary.y_center_of_mass = 0.0;
+
+        // Analyzer.saveResults writes the selection's integer bounds for
+        // RECT (Analyzer.java 598-611); open lines carry the +1 draw-area
+        // inset (PolygonRoi.finishPolygon 571-573).
+        let (bx, by, bw, bh) = polyline.bounds();
+        summary.roi_x = self.calibration.transform_x(f64::from(bx));
+        summary.roi_y = self.calibration.transform_y(f64::from(by), self.height);
+        summary.roi_width = f64::from(bw) * self.calibration.pixel_width;
+        summary.roi_height = f64::from(bh) * self.calibration.pixel_height;
+
+        // Analyzer.saveResults writes the Length column for every line
+        // selection (Analyzer.java 692-693); only straight Lines also write
+        // Angle, so the polyline Angle cell stays unset.
+        let length = polyline.length(self.calibration.pixel_width, self.calibration.pixel_height);
+        summary.line = Some(LineMeasurement {
+            length,
+            angle: f64::NAN,
+            show_angle: false,
+        });
+        summary
+    }
+
+    /// `ProfilePlot.getIrregularProfile` (ProfilePlot.java 236-290) with
+    /// `PlotWindow.interpolate` true: walk each segment in `inc = 0.01`
+    /// micro-steps and sample bilinearly whenever the point is at least
+    /// `1.0 - inc/2` from the previous sample. The first sample keeps that
+    /// same test against the initial (0, 0) previous position, so a
+    /// selection that starts at the image origin drops its first point.
+    fn irregular_profile(&self, points: &[(i32, i32)]) -> Vec<f64> {
+        let mut values = Vec::new();
+        let n = points.len();
+        if n < 2 {
+            return values;
+        }
+        let inc = 0.01;
+        let mut x2 = f64::from(points[0].0);
+        let mut y2 = f64::from(points[0].1);
+        let (mut lastx, mut lasty) = (0.0, 0.0);
+        for i in 1..n {
+            let (x1, y1) = (x2, y2);
+            let (mut x, mut y) = (x1, y1);
+            x2 = f64::from(points[i].0);
+            y2 = f64::from(points[i].1);
+            let dx = x2 - x1;
+            let dy = y2 - y1;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let xinc = dx * inc / distance;
+            let yinc = dy * inc / distance;
+            // (int)(distance/inc) truncates toward zero; Java's NaN cast
+            // yields 0 for a zero-length segment, and f64 as i32 repeats it.
+            let mut n2 = (distance / inc) as i32;
+            if n == 2 {
+                n2 += 1;
+            }
+            loop {
+                // do { ... } while (--n2 > 0)
+                let dx = x - lastx;
+                let dy = y - lasty;
+                let distance2 = (dx * dx + dy * dy).sqrt();
+                if distance2 >= 1.0 - inc / 2.0 {
+                    values.push(self.interpolated_value(x, y));
+                    lastx = x;
+                    lasty = y;
+                }
+                x += xinc;
+                y += yinc;
+                n2 -= 1;
+                if n2 <= 0 {
+                    break;
+                }
+            }
+        }
+        values
     }
 
     /// `ImageProcessor.getInterpolatedValue` (ImageProcessor.java 2005-2028).
@@ -3472,7 +3738,7 @@ impl ImageDocument {
                 convex_hull_area(&poly.xpoints.iter().copied().zip(poly.ypoints.iter().copied()).collect::<Vec<_>>())
             }
             Some(Roi::Oval(oval)) => oval_convex_area(*oval),
-            Some(Roi::Line(_) | Roi::Point(_) | Roi::Angle(_)) => unreachable!(),
+            Some(Roi::Line(_) | Roi::Polyline(_) | Roi::Point(_) | Roi::Angle(_)) => unreachable!(),
         };
         summary.solidity = summary.pixel_count as f64 / convex_area;
     }
@@ -3537,6 +3803,7 @@ impl ImageDocument {
                 let dy = f64::from(line.y2 - line.y1) * ph;
                 dx.hypot(dy)
             }
+            Some(Roi::Polyline(poly)) => poly.length(pw, ph),
         }
     }
 
@@ -4372,6 +4639,15 @@ pub struct LineMeasurement {
     pub length: f64,
     /// Degrees between the line and a horizontal axis (`Roi.getFloatAngle`).
     pub angle: f64,
+    /// `true` only for straight lines: `Analyzer.saveResults` writes the
+    /// Angle column for `Roi.LINE` alone (Analyzer.java 692-697), and no
+    /// polyline row carries an Angle cell.
+    #[serde(default = "default_true")]
+    pub show_angle: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Bit flags from `ij.measure.Measurements` (original_imagej/ij/measure/
@@ -4777,9 +5053,12 @@ impl MeasurementSummary {
         let mut cells = [None; 39];
         if self.line.is_some() && !self.has_line_stat_columns(config) {
             // Analyzer.measureLength's early return writes only these two cells
-            // (Analyzer.java 464-474).
+            // (Analyzer.java 464-474); the Angle cell is again a straight-line
+            // only value.
             if let Some(line) = self.line {
-                cells[COLUMN_ANGLE] = Some(line.angle);
+                if line.show_angle {
+                    cells[COLUMN_ANGLE] = Some(line.angle);
+                }
                 cells[COLUMN_LENGTH] = Some(line.length);
             }
             return cells;
@@ -4865,10 +5144,13 @@ impl MeasurementSummary {
             }
         }
         if let Some(line) = self.line {
-            // saveResults appends these after the statistics cells; the line
-            // angle overwrites the ellipse angle at index 17
-            // (Analyzer.java 687-697).
-            cells[COLUMN_ANGLE] = Some(line.angle);
+            // saveResults appends these after the statistics cells
+            // (Analyzer.java 687-697): the line angle overwrites the ellipse
+            // angle at index 17, but only for straight Lines — polylines
+            // contribute the Length column alone.
+            if line.show_angle {
+                cells[COLUMN_ANGLE] = Some(line.angle);
+            }
             cells[COLUMN_LENGTH] = Some(line.length);
         }
         if let Some((x, y)) = self.point {

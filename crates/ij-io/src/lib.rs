@@ -479,6 +479,13 @@ fn encode_roi_metadata(roi: &Roi) -> Result<Vec<u8>, IoError> {
         Roi::Polygon(polygon) => encode_polygon_roi(polygon),
         Roi::Line(line) => encode_line_roi(line),
         Roi::Point(_) | Roi::Angle(_) => Err(unsupported_roi("with point or angle selections")),
+        // RoiEncoder writes polylines as their own types (RoiEncoder.java
+        // 107-108); the narrow TIFF codec only carries the four classic
+        // types, so open polylines are rejected explicitly instead of being
+        // silently converted into a filled polygon.
+        Roi::Polyline(_) => Err(unsupported_roi(
+            "with a polyline or freehand line, which the narrow TIFF ROI codec cannot represent",
+        )),
     }
 }
 

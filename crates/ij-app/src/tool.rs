@@ -86,6 +86,8 @@ impl Tool {
                 | Self::Freehand
                 | Self::Line
                 | Self::Point
+                | Self::Polyline
+                | Self::Freeline
                 | Self::Wand
                 | Self::Magnifier
                 | Self::Hand
@@ -146,6 +148,16 @@ pub fn polygon_preview_segments(
         }
     }
     segments
+}
+
+/// True when `finishPolygon` would keep a POLYLINE or FREELINE.
+///
+/// Open line selections are deleted when `nPoints < 2` only
+/// (PolygonRoi.java 591-593); unlike freehand areas they survive a zero
+/// width or height because both bounds axes are inflated by one
+/// (PolygonRoi.java 571-573).
+pub fn polyline_is_valid(points: &[(i32, i32)]) -> bool {
+    points.len() >= 2
 }
 
 /// True when a click closes a polygon by landing in the start box.
