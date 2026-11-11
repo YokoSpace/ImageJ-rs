@@ -2095,14 +2095,20 @@ impl ImageDocument {
 
         let raw = match self.plane() {
             PixelPlane::Gray8(pixels) => {
-                self.measure_byte_like(pixels, rx, ry, rw, rh, mask.as_ref())
+                self.measure_byte_like(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
             }
             PixelPlane::Color256 { pixels, .. } => {
-                self.measure_byte_like(pixels, rx, ry, rw, rh, mask.as_ref())
+                self.measure_byte_like(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
             }
-            PixelPlane::Gray16(pixels) => self.measure_short(pixels, rx, ry, rw, rh, mask.as_ref()),
-            PixelPlane::Gray32(pixels) => self.measure_float(pixels, rx, ry, rw, rh, mask.as_ref()),
-            PixelPlane::ColorRgb(pixels) => self.measure_rgb(pixels, rx, ry, rw, rh, mask.as_ref()),
+            PixelPlane::Gray16(pixels) => {
+                self.measure_short(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
+            }
+            PixelPlane::Gray32(pixels) => {
+                self.measure_float(pixels, rx, ry, rw, rh, mask.as_ref(), self.threshold)
+            }
+            PixelPlane::ColorRgb(pixels) => {
+                self.measure_rgb(pixels, rx, ry, rw, rh, mask.as_ref())
+            }
         };
 
         Ok(self.finish_measurement(rx, ry, rw, rh, raw))
@@ -2140,7 +2146,7 @@ impl ImageDocument {
         }
 
         let samples = (n + 1) as u32;
-        let raw = self.measure_float(&profile, 0, 0, samples, 1, None);
+        let raw = self.measure_float(&profile, 0, 0, samples, 1, None, None);
         let mut summary = self.finish_measurement(0, 0, samples, 1, raw);
 
         // Line.getLength (Line.java 430-437) and Roi.getFloatAngle
@@ -2269,7 +2275,30 @@ impl ImageDocument {
             median: raw.median,
             skewness: raw.skewness,
             kurtosis: raw.kurtosis,
+            area_fraction: raw.area_fraction,
+            stack_position: self.stack_position(),
             line: None,
+        }
+    }
+
+    /// `Analyzer.saveResults` stack-position branch (Analyzer.java 660-686).
+    fn stack_position(&self) -> StackPosition {
+        if self.is_hyperstack() {
+            let [channel, slice, frame] = self
+                .convert_index_to_position(self.current_slice as i32)
+                .unwrap_or([1, 1, 1]);
+            StackPosition {
+                channel: (self.n_channels > 1).then_some(channel),
+                slice: (self.n_slices > 1).then_some(slice),
+                frame: (self.n_frames > 1).then_some(frame),
+            }
+        } else {
+            // A plain stack (or a single image) reports the raw slice index.
+            StackPosition {
+                channel: None,
+                slice: Some(self.current_slice),
+                frame: None,
+            }
         }
     }
 
@@ -2284,6 +2313,7 @@ impl ImageDocument {
         rw: u32,
         rh: u32,
         mask: Option<&RoiMask>,
+        threshold: Option<ThresholdLevels>,
     ) -> RawMeasurement {
         let mut histogram = vec![0u64; 256];
         for y in ry..(ry + rh) {
@@ -2313,6 +2343,7 @@ impl ImageDocument {
         }
         let mean = sum / pixel_count as f64;
         let median = median_from_hist(&histogram, 0, 255, pixel_count);
+        let area_fraction = area_fraction_from_histogram(&histogram, threshold);
         let (skewness, kurtosis, x_center_of_mass, y_center_of_mass) = self.raw_moments(
             rx,
             ry,
@@ -2342,6 +2373,7 @@ impl ImageDocument {
             y_centroid,
             x_center_of_mass,
             y_center_of_mass,
+            area_fraction,
         }
     }
 
@@ -2358,6 +2390,7 @@ impl ImageDocument {
         rw: u32,
         rh: u32,
         mask: Option<&RoiMask>,
+        threshold: Option<ThresholdLevels>,
     ) -> RawMeasurement {
         let mut histogram = vec![0u64; 65536];
         let mut bbox_max = 0u16;
@@ -2397,6 +2430,7 @@ impl ImageDocument {
         }
         let mean = sum / pixel_count as f64;
         let median = median_from_hist(&histogram, 0, 65535, pixel_count);
+        let area_fraction = area_fraction_from_histogram(&histogram, threshold);
         let (skewness, kurtosis, x_center_of_mass, y_center_of_mass) = self.raw_moments(
             rx,
             ry,
@@ -2426,6 +2460,7 @@ impl ImageDocument {
             y_centroid,
             x_center_of_mass,
             y_center_of_mass,
+            area_fraction,
         }
     }
 
@@ -2439,6 +2474,7 @@ impl ImageDocument {
         rw: u32,
         rh: u32,
         mask: Option<&RoiMask>,
+        threshold: Option<ThresholdLevels>,
     ) -> RawMeasurement {
         let min_threshold = -(f32::MAX as f64);
         let max_threshold = f32::MAX as f64;
@@ -2551,6 +2587,7 @@ impl ImageDocument {
             |v| v >= min_threshold && v <= max_threshold,
             mask,
         );
+        let area_fraction = self.area_fraction_float(pixels, rx, ry, rw, rh, mask, threshold);
 
         RawMeasurement {
             histogram,
@@ -2567,6 +2604,7 @@ impl ImageDocument {
             y_centroid,
             x_center_of_mass,
             y_center_of_mass,
+            area_fraction,
         }
     }
 
@@ -2642,7 +2680,48 @@ impl ImageDocument {
             y_centroid,
             x_center_of_mass,
             y_center_of_mass,
+            // ColorStatistics never calls calculateAreaFraction.
+            area_fraction: 0.0,
         }
+    }
+
+    /// `FloatStatistics.calculateAreaFraction` (FloatStatistics.java 200-226).
+    /// The threshold comparison is done in float, and NaN samples count as
+    /// non-zero because `NaN != 0f` is true in Java.
+    fn area_fraction_float(
+        &self,
+        pixels: &[f32],
+        rx: u32,
+        ry: u32,
+        rw: u32,
+        rh: u32,
+        mask: Option<&RoiMask>,
+        threshold: Option<ThresholdLevels>,
+    ) -> f64 {
+        let (lower, upper) = threshold.map_or((0.0, 0.0), |levels| {
+            (levels.lower as f32, levels.upper as f32)
+        });
+        let mut sum = 0u64;
+        let mut total = 0u64;
+        for y in ry..(ry + rh) {
+            let base = (y * self.width + rx) as usize;
+            for offset in 0..rw as usize {
+                let x = rx + offset as u32;
+                if mask.is_some_and(|m| !m.contains(x, y)) {
+                    continue;
+                }
+                let value = pixels[base + offset];
+                total += 1;
+                let counted = match threshold {
+                    None => value != 0.0,
+                    Some(_) => value >= lower && value <= upper,
+                };
+                if counted {
+                    sum += 1;
+                }
+            }
+        }
+        sum as f64 * 100.0 / total as f64
     }
 
     fn raw_centroid<F, P>(
@@ -2811,6 +2890,7 @@ struct RawMeasurement {
     y_centroid: f64,
     x_center_of_mass: f64,
     y_center_of_mass: f64,
+    area_fraction: f64,
 }
 
 fn luminance_bin(pixel: u32) -> usize {
@@ -2881,6 +2961,36 @@ fn calculate_std_dev(n: f64, sum: f64, sum2: f64) -> f64 {
     }
 }
 
+/// Java's `Math.round(double)` is `floor(x+0.5)`, unlike Rust's
+/// round-half-away-from-zero.
+fn java_round(value: f64) -> i64 {
+    (value + 0.5).floor() as i64
+}
+
+/// `ImageStatistics.calculateAreaFraction` (ImageStatistics.java 276-293) for
+/// the 8-bit and 16-bit histogram paths. Without a threshold the numerator is
+/// every non-zero bin; with one it is the bins inside `[round(min), round(max)]`.
+fn area_fraction_from_histogram(histogram: &[u64], threshold: Option<ThresholdLevels>) -> f64 {
+    let total: u64 = histogram.iter().sum();
+    let sum = match threshold {
+        None => total.saturating_sub(histogram.first().copied().unwrap_or(0)),
+        Some(levels) => {
+            let lower = java_round(levels.lower);
+            let upper = java_round(levels.upper);
+            histogram
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    let value = *index as i64;
+                    value >= lower && value <= upper
+                })
+                .map(|(_, count)| *count)
+                .sum()
+        }
+    };
+    sum as f64 * 100.0 / total as f64
+}
+
 fn finish_moments(
     n: f64,
     mean: f64,
@@ -2907,6 +3017,95 @@ pub struct LineMeasurement {
     pub length: f64,
     /// Degrees between the line and a horizontal axis (`Roi.getFloatAngle`).
     pub angle: f64,
+}
+
+/// Bit flags from `ij.measure.Measurements` (original_imagej/ij/measure/
+/// Measurements.java lines 4-10). `SHAPE_DESCRIPTORS` and `CIRCULARITY`
+/// intentionally share the same bit, exactly as in ImageJ 1.54u.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementFlags;
+
+impl MeasurementFlags {
+    pub const AREA: u32 = 1;
+    pub const MEAN: u32 = 2;
+    pub const STD_DEV: u32 = 4;
+    pub const MODE: u32 = 8;
+    pub const MIN_MAX: u32 = 16;
+    pub const CENTROID: u32 = 32;
+    pub const CENTER_OF_MASS: u32 = 64;
+    pub const PERIMETER: u32 = 128;
+    pub const LIMIT: u32 = 256;
+    pub const RECT: u32 = 512;
+    pub const LABELS: u32 = 1024;
+    pub const ELLIPSE: u32 = 2048;
+    pub const INVERT_Y: u32 = 4096;
+    pub const CIRCULARITY: u32 = 8192;
+    pub const SHAPE_DESCRIPTORS: u32 = 8192;
+    pub const FERET: u32 = 16384;
+    pub const INTEGRATED_DENSITY: u32 = 0x8000;
+    pub const MEDIAN: u32 = 0x10000;
+    pub const SKEWNESS: u32 = 0x20000;
+    pub const KURTOSIS: u32 = 0x40000;
+    pub const AREA_FRACTION: u32 = 0x80000;
+    pub const SLICE: u32 = 0x100000;
+    pub const STACK_POSITION: u32 = 0x100000;
+    pub const SCIENTIFIC_NOTATION: u32 = 0x200000;
+    pub const ADD_TO_OVERLAY: u32 = 0x400000;
+    pub const NAN_EMPTY_CELLS: u32 = 0x800000;
+
+    /// `Measurements.ALL_STATS` (Measurements.java lines 16-19).
+    pub const ALL_STATS: u32 = Self::AREA
+        + Self::MEAN
+        + Self::STD_DEV
+        + Self::MODE
+        + Self::MIN_MAX
+        + Self::CENTROID
+        + Self::CENTER_OF_MASS
+        + Self::PERIMETER
+        + Self::RECT
+        + Self::ELLIPSE
+        + Self::SHAPE_DESCRIPTORS
+        + Self::FERET
+        + Self::INTEGRATED_DENSITY
+        + Self::MEDIAN
+        + Self::SKEWNESS
+        + Self::KURTOSIS
+        + Self::AREA_FRACTION;
+}
+
+/// State of `Analyze > Set Measurements...`: the `Measurements` bit flags and
+/// the decimal-place count. The default matches ImageJ's startup state
+/// (Analyzer.java line 42: Area, Mean and Min/Max at three decimals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeasurementConfig {
+    pub flags: u32,
+    pub precision: u8,
+}
+
+impl Default for MeasurementConfig {
+    fn default() -> Self {
+        Self {
+            flags: MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::MIN_MAX,
+            precision: 3,
+        }
+    }
+}
+
+impl MeasurementConfig {
+    pub fn contains(&self, flag: u32) -> bool {
+        self.flags & flag != 0
+    }
+}
+
+/// Values `Analyzer.saveResults` writes to the `Ch`, `Slice` and `Frame`
+/// columns (Analyzer.java lines 660-686). `None` means ImageJ omits that
+/// column for this row, either because the dimension is 1 or because the
+/// image is not a hyperstack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackPosition {
+    pub channel: Option<u32>,
+    pub slice: Option<u32>,
+    pub frame: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2937,6 +3136,13 @@ pub struct MeasurementSummary {
     pub median: f64,
     pub skewness: f64,
     pub kurtosis: f64,
+    /// `%Area` (`ImageStatistics.areaFraction`): percentage of ROI pixels
+    /// inside the active threshold, or non-zero pixels when no threshold is
+    /// active. RGB images leave this at 0 because `ColorStatistics` never
+    /// calls `calculateAreaFraction`.
+    pub area_fraction: f64,
+    /// `Ch`/`Slice`/`Frame` values for the `STACK_POSITION` columns.
+    pub stack_position: StackPosition,
     /// Results-table-only `Length`/`Angle` values for line measurements.
     /// Area measurements leave these cells unset, exactly like ImageJ's
     /// default Results table.

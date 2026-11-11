@@ -1,8 +1,8 @@
 use ij_bridge::JavaOracleBridge;
 use ij_core::{
     display_histogram, format_ij_num, CoreError, DisplayHistogram, DisplayRange, ImageDocument,
-    LineRoi, Lut256, MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi,
-    ThresholdLevels, Wand, WandMode,
+    LineRoi, Lut256, MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane,
+    PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition, ThresholdLevels, Wand, WandMode,
 };
 use ij_io::{load_tiff, save_tiff};
 use ij_session::{Command, Session};
@@ -628,6 +628,316 @@ fn parity_rgb_oval_roi_statistics_match_java_oracle() {
 
     assert_measurement_columns(&stats, &oracle_columns(&oracle.stdout));
     assert_eq!(stats.histogram, oracle_histogram(&oracle.stdout));
+}
+
+const AREA_FRACTION_MEASUREMENTS: &str = "area mean area_fraction";
+
+#[test]
+fn measurement_config_defaults_match_imagej_startup_state() {
+    // Measurements.java lines 4-10 and Analyzer.java line 42: ImageJ starts
+    // with Area, Mean and Min/Max enabled at three decimal places.
+    let config = MeasurementConfig::default();
+    assert_eq!(
+        config.flags,
+        MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::MIN_MAX
+    );
+    assert_eq!(config.precision, 3);
+    assert_eq!(MeasurementFlags::AREA, 1);
+    assert_eq!(MeasurementFlags::MEAN, 2);
+    assert_eq!(MeasurementFlags::STD_DEV, 4);
+    assert_eq!(MeasurementFlags::MODE, 8);
+    assert_eq!(MeasurementFlags::MIN_MAX, 16);
+    assert_eq!(MeasurementFlags::CENTROID, 32);
+    assert_eq!(MeasurementFlags::CENTER_OF_MASS, 64);
+    assert_eq!(MeasurementFlags::PERIMETER, 128);
+    assert_eq!(MeasurementFlags::LIMIT, 256);
+    assert_eq!(MeasurementFlags::RECT, 512);
+    assert_eq!(MeasurementFlags::ELLIPSE, 2048);
+    assert_eq!(MeasurementFlags::SHAPE_DESCRIPTORS, 8192);
+    assert_eq!(MeasurementFlags::INTEGRATED_DENSITY, 0x8000);
+    assert_eq!(MeasurementFlags::MEDIAN, 0x10000);
+    assert_eq!(MeasurementFlags::SKEWNESS, 0x20000);
+    assert_eq!(MeasurementFlags::KURTOSIS, 0x40000);
+    assert_eq!(MeasurementFlags::AREA_FRACTION, 0x80000);
+    assert_eq!(MeasurementFlags::STACK_POSITION, 0x100000);
+}
+
+#[test]
+fn parity_8bit_area_fraction_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // Without a threshold, %Area is the fraction of non-zero pixels
+    // (ImageStatistics.java 281-284).
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '8-bit ramp', 16, 16, 1); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let doc = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    let stats = doc.measure().unwrap();
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+
+    // An active threshold changes %Area even when Limit to threshold is off,
+    // because calculateAreaFraction reads the processor threshold directly
+    // (ImageStatistics.java 285-291).
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '8-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             setThreshold(100, 200); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 100.0,
+        upper: 200.0,
+    });
+    let stats = doc.measure().unwrap();
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+}
+
+#[test]
+fn parity_16bit_area_fraction_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '16-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    let stats = doc.measure().unwrap();
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '16-bit ramp', 16, 16, 1); setThreshold(20000, 45000); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_16bit("test", 16, 16).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 20000.0,
+        upper: 45000.0,
+    });
+    let stats = doc.measure().unwrap();
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+}
+
+#[test]
+fn parity_32bit_area_fraction_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // FloatStatistics counts non-zero samples when no threshold is active
+    // (FloatStatistics.java 217-218).
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '32-bit ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    let stats = doc.measure().unwrap();
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+
+    // FloatStatistics compares the float pixel against float thresholds
+    // (FloatStatistics.java 203-204, 219-220).
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', '32-bit ramp', 16, 16, 1); setThreshold(0.25, 0.75); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_32bit("test", 16, 16).unwrap();
+    doc.threshold = Some(ThresholdLevels {
+        lower: 0.25,
+        upper: 0.75,
+    });
+    let stats = doc.measure().unwrap();
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+}
+
+#[test]
+fn parity_rgb_area_fraction_is_zero_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(&format!(
+            "newImage('test', 'RGB ramp', 16, 16, 1); makeRectangle(2, 3, 10, 8); \
+             run(\"Set Measurements...\", \"{AREA_FRACTION_MEASUREMENTS}\"); run('Measure');"
+        ))
+        .unwrap();
+    let mut doc =
+        ImageDocument::new("test", 16, 16, PixelPlane::ColorRgb(rgb_ramp(16, 16))).unwrap();
+    doc.set_rect_roi(2, 3, 10, 8).unwrap();
+    // ColorStatistics never calls calculateAreaFraction, so %Area stays at
+    // the ImageStatistics field default of 0.
+    let stats = doc.measure().unwrap();
+    assert_eq!(stats.area_fraction, 0.0);
+    assert_eq!(
+        format_ij_num(stats.area_fraction),
+        oracle_columns(&oracle.stdout)["%Area"]
+    );
+}
+
+fn ramp8_plane(width: u32, height: u32) -> PixelPlane {
+    ImageDocument::new_ramp_8bit("plane", width, height)
+        .unwrap()
+        .slices[0]
+        .clone()
+}
+
+/// NewImage.java lines 193-201: the RGB ramp repeats one gray column.
+fn rgb_ramp(width: u32, height: u32) -> Vec<u32> {
+    let mut pixels = vec![0u32; (width * height) as usize];
+    for x in 0..width {
+        let value = ((x as f64 * 256.0) / width as f64) as u8;
+        let pixel = 0xff00_0000 | ((value as u32) << 16) | ((value as u32) << 8) | value as u32;
+        for y in 0..height {
+            pixels[(y * width + x) as usize] = pixel;
+        }
+    }
+    pixels
+}
+
+fn assert_stack_columns(stats: &MeasurementSummary, columns: &BTreeMap<String, String>) {
+    let actual = [
+        ("Ch", stats.stack_position.channel),
+        ("Slice", stats.stack_position.slice),
+        ("Frame", stats.stack_position.frame),
+    ];
+    for (name, value) in actual {
+        assert_eq!(
+            value.map(|v| v.to_string()),
+            columns.get(name).cloned(),
+            "column {name} differs (full oracle row: {columns:?})"
+        );
+    }
+}
+
+#[test]
+fn parity_plain_stack_slice_column_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 8, 8, 5); setSlice(3); \
+             run(\"Set Measurements...\", \"area mean stack\"); run('Measure');",
+        )
+        .unwrap();
+    let plane = ramp8_plane(8, 8);
+    let mut doc = ImageDocument::new_stack("test", 8, 8, vec![plane; 5]).unwrap();
+    doc.set_slice(3).unwrap();
+    let stats = doc.measure().unwrap();
+
+    assert_eq!(stats.stack_position.slice, Some(3));
+    assert_stack_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_hyperstack_channel_slice_frame_columns_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 8, 8, 12); Stack.setDimensions(2, 3, 2); \
+             Stack.setPosition(2, 2, 2); \
+             run(\"Set Measurements...\", \"area mean stack\"); run('Measure');",
+        )
+        .unwrap();
+    let plane = ramp8_plane(8, 8);
+    let mut doc = ImageDocument::new_stack("test", 8, 8, vec![plane; 12]).unwrap();
+    doc.set_dimensions(2, 3, 2).unwrap();
+    doc.set_position(2, 2, 2);
+    let stats = doc.measure().unwrap();
+
+    assert_eq!(
+        stats.stack_position,
+        StackPosition {
+            channel: Some(2),
+            slice: Some(2),
+            frame: Some(2),
+        }
+    );
+    assert_stack_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_hyperstack_omits_unit_dimension_columns_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // A 2x3x1 hyperstack writes Ch and Slice but no Frame column
+    // (Analyzer.java 664-678).
+    let oracle = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 8, 8, 6); Stack.setDimensions(2, 3, 1); \
+             Stack.setPosition(1, 3, 1); \
+             run(\"Set Measurements...\", \"area mean stack\"); run('Measure');",
+        )
+        .unwrap();
+    let plane = ramp8_plane(8, 8);
+    let mut doc = ImageDocument::new_stack("test", 8, 8, vec![plane; 6]).unwrap();
+    doc.set_dimensions(2, 3, 1).unwrap();
+    doc.set_position(1, 3, 1);
+    let stats = doc.measure().unwrap();
+
+    assert_eq!(
+        stats.stack_position,
+        StackPosition {
+            channel: Some(1),
+            slice: Some(3),
+            frame: None,
+        }
+    );
+    assert_stack_columns(&stats, &oracle_columns(&oracle.stdout));
+}
+
+#[test]
+fn parity_channel_stack_without_hyperstack_reports_slice_like_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Four channels in one slice is not a hyperstack (ImagePlus.java
+    // 1294-1297), so Analyzer.java 679-683 reports the raw slice index.
+    let oracle = bridge
+        .eval_macro(
+            "newImage('test', '8-bit ramp', 8, 8, 4); Stack.setDimensions(4, 1, 1); \
+             Stack.setPosition(3, 1, 1); \
+             run(\"Set Measurements...\", \"area mean stack\"); run('Measure');",
+        )
+        .unwrap();
+    let plane = ramp8_plane(8, 8);
+    let mut doc = ImageDocument::new_stack("test", 8, 8, vec![plane; 4]).unwrap();
+    doc.set_dimensions(4, 1, 1).unwrap();
+    doc.set_position(3, 1, 1);
+    let stats = doc.measure().unwrap();
+
+    assert_eq!(
+        stats.stack_position,
+        StackPosition {
+            channel: None,
+            slice: Some(3),
+            frame: None,
+        }
+    );
+    assert_stack_columns(&stats, &oracle_columns(&oracle.stdout));
 }
 
 #[test]
