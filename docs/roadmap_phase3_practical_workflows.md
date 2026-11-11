@@ -67,189 +67,344 @@ flowchart TD
 
 表の各行は機能群であり、1 回の大きな変更にまとめない。P3.1 は Revert と選択状態、P3.2 は Clear/Fill/Draw と Copy/Cut/Paste、P3.3 は Gray8 と追加の画素型・スタック、P3.4 は Erode/Dilate と Open/Close、P3.5 は単画像 Math と Image Calculator、P3.7 は ROI 型・ツールごと、P3.8 は粒子抽出と ROI Manager、P3.9 は圧縮方式・画像形式ごと、P3.10 は画素型・スタックごとに分ける。**各小単位で失敗テスト → 実装 → `VERIFY_ALL_OK` → コミット**を完了してから次へ進む。
 
-## 2. タスク詳細
+## 2. サブエージェント向け詳細設計（P3.0–P3.12、全 26 ステップ）
+
+ここからの各ユニットは、1 回のサブエージェント呼び出しで **「失敗テスト作成 → 最小実装 → `./tools/verify.sh` で `VERIFY_ALL_OK` → 1 コミット」** まで完結する粒度に分けています。
+
+---
+
+### P3.0 ビルド生成 JAR の追跡解除と旧作業ブランチの掃除 🟢
+
+- **現状（実測）**:
+  1. `tools/plugin-host/plugin-host.jar` と `tools/plugin-host/fixtures/fixtures.jar` が git 追跡対象になっているため、`./tools/verify.sh` 実行のたびにタイムスタンプ差分で `git status` が汚れる。
+  2. `t3/*` のローカル作業ブランチが 8 本残っている（内容はすべて `main` に統合済み）。
+- **編集してよいファイル**: `.gitignore`（および `git rm --cached`）
+- **手順**:
+  1. `.gitignore` に `/tools/plugin-host/plugin-host.jar` と `/tools/plugin-host/fixtures/fixtures.jar` を追加し、`git rm --cached tools/plugin-host/plugin-host.jar tools/plugin-host/fixtures/fixtures.jar` を実行する（ディスク上のファイルは残す）。
+  2. `git branch -D $(git branch --list 't3/*')` でローカルの旧作業ブランチ 8 本を削除する。
+  3. `./tools/verify.sh` を実行し、完了後に `git status --short` が完全に空であることを確認する。
+- **受け入れ条件**: `./tools/verify.sh` 実行直後に `git status --short` が空出力。`VERIFY_ALL_OK`。
+
+---
+
+### P3.1 選択状態の復元と `Revert`（P3.1a は完了済み）
+
+- **P3.1a（完了済み `24e80d6`）**: `File > Revert`（`Cmd+R`）と変更確認ダイアログ、TIFF 再読込、ROI 保持。
+
+#### P3.1b `Edit > Selection > Select All`（`Cmd+A`）と `Restore Selection`（`Shift+E`）🟢
+- **ゴール**: `Select All` で画像全体の矩形 ROI が作られ、ROI のクリアや上書き時に直前の ROI が `Session.previous_roi` に保存され、`Restore Selection`（`Shift+E`）で復元される。
+- **最初に読むもの**:
+  - [Selection.java:29-46](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/Selection.java#L29-L46)（`all`, `none`, `restore`）
+  - [ImagePlus.java:2245-2285](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/ImagePlus.java#L2245-L2285)（`saveRoi`, `restoreRoi` のはみ出し判定と中央移動 `(width - r.width) / 2`, `(height - r.height) / 2`）
+- **編集してよいファイル**:
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/app/shortcuts.rs`
+  - `crates/ij-app/tests/roi_interaction_test.rs`
+- **厳密な仕様**:
+  1. `Session` に `pub previous_roi: Option<Roi>` を持たせる。`ClearRoi`, `SelectAll`, または新しい `Make*Roi` で既存の `doc.roi`（幅または高さ `> 0`）が消える直前に `self.previous_roi = doc.roi.clone()` を保存する（`ImagePlus.saveRoi`）。
+  2. `Command::SelectAll`（マクロ記録 `"run(\"Select All\");\n"`）: 現在の `doc.roi` を `previous_roi` に退避し、`Roi::Rect(RectRoi::new(0, 0, doc.width as i32, doc.height as i32))` をセットする。
+  3. `Command::RestoreSelection`（マクロ記録 `"run(\"Restore Selection\");\n"`）: `previous_roi` が `Some(prev)` のとき、`ImagePlus.restoreRoi`（`ImagePlus.java:2268-2277`）の条件に従って復元する。ROI のバウンディングボックス `r` が画像外（`r.x >= w || r.y >= h || r.x + r.width < 0 || r.y + r.height < 0`）なら `((w - r.width) / 2, (h - r.height) / 2)` に平行移動し、`r.width == w && r.height == h` なら `(0, 0)` に配置する。
+  4. `AppAction::SelectAll`（`Cmd+A`）と `AppAction::RestoreSelection`（`Shift+E`）を `EDIT_SELECTION` メニューとショートカットに追加。
+- **先に書くテスト**:
+  - `oracle_parity.rs`: 矩形・楕円・多角形 ROI を作成 → `Select None` → `Restore Selection` → `Measure` の結果がオラクルと一致。別サイズの画像に対する `Restore Selection` の中央再配置がオラクルと一致。
+- **受け入れ条件**: `./tools/verify.sh` が `VERIFY_ALL_OK`。
+
+---
+
+### P3.2 `Edit` の画素操作（Clear / Fill / Draw）と内部クリップボード（Copy / Cut / Paste）
+
+#### P3.2a `Edit > Clear` / `Fill`（`F`）/ `Draw`（`D`）と前景色・背景色 🟡
+- **ゴール**: 前景色（既定：黒 `0, 0, 0`）と背景色（既定：白 `255, 255, 255`）に基づき、現在スライス（または ROI 内部／輪郭）に対する `Clear`, `Fill`, `Draw` が 5 種の `PixelPlane` すべてで ImageJ と完全一致する。
+- **最初に読むもの**:
+  - [Filler.java:18-175](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/Filler.java#L18-L175)（`clear`, `fill`, `draw`）
+  - [ImageProcessor.java:1712-1820](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/process/ImageProcessor.java#L1712-L1820)（`fill()`, `fill(Roi)`, `drawRoi(Roi)`）
+  - `ByteProcessor.java`, `ShortProcessor.java`, `FloatProcessor.java`, `ColorProcessor.java` の `setColor(Color)` が RGB 色をどの画素値（例: Gray8 なら輝度またはパレット最近傍、Gray16/32 なら display_range の min/max または輝度換算）に変換するかを必ずオラクル実測で確認すること！
+- **編集してよいファイル**:
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/app/mod.rs`
+  - `crates/ij-app/src/app/shortcuts.rs`
+- **仕様**:
+  - `Session` に `foreground_color: [u8; 3]`（初期値 `[0, 0, 0]`）と `background_color: [u8; 3]`（初期値 `[255, 255, 255]`）を持たせる（`Command::SetForegroundColor`, `Command::SetBackgroundColor`）。
+  - `ImageDocument::clear_roi_or_plane(&mut self, bg: [u8; 3])`, `fill_roi_or_plane(&mut self, fg: [u8; 3])`, `draw_roi(&mut self, fg: [u8; 3])`:
+    - 実行前に `self.save_snapshot()` を呼ぶ。
+    - `Clear` と `Fill` は面積 ROI があれば `roi_mask` 内の画素のみ、ROI なしならスライス全体を塗る。
+    - `Draw` は ROI が必須（ROI なしならエラー）。ROI の 1px 輪郭線（`Roi.drawPixels(ip)` と同じラスタライズ規則）を前景色で描く。
+  - `EDIT_MENU` の `Clear`, `Fill` (`F`), `Draw` (`D`) を `unsupported` から `item` に切り替える。
+- **先に書くテスト**: `oracle_parity.rs` で矩形・楕円・多角形・線分 ROI に対して `run("Clear")`, `run("Fill")`, `run("Draw")` を実行し、画素がオラクルと一致すること。
+
+#### P3.2b `Edit > Copy`（`C`）/ `Cut`（`X`）/ `Paste`（`V`）🟡
+- **ゴール**: `Session` 内の内部クリップボードを使って、選択領域（または画像全体）の `Copy`, `Cut`, `Paste` と `Undo` が動作する。
+- **最初に読むもの**:
+  - [ImagePlus.java:2882-3025](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/ImagePlus.java#L2882-L3025)（`cut()`, `copy(boolean cut)`, `paste()`）
+- **編集してよいファイル**:
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/app/shortcuts.rs`
+- **仕様**:
+  - `Copy`: 面積 ROI があればそのバウンディングボックスを切り抜いた `ClipboardBuffer { width, height, plane: PixelPlane, mask: Option<RoiMask> }` を `Session.clipboard` に保存。ROI なしなら現在スライス全体を保存。
+  - `Cut`: 面積 ROI が必須（Java `ImagePlus.java:2901`）。`Copy` 実行後、`save_snapshot()` して面積 ROI 内を背景色で塗る。
+  - `Paste`: `Session.clipboard` が `Some` のとき、`save_snapshot()` してターゲット画像の現在スライスへ貼り付ける。配置座標は、ターゲットに同じサイズの面積 ROI があればその左上 `(rx, ry)`、なければ画像中央 `((w - cw) / 2, (h - ch) / 2)`（`ImagePlus.java:2960-2975` の規則に合わせる）。非矩形マスクがある場合はマスク内画素のみ上書きする。
+  - `EDIT_MENU` の `Cut` (`X`), `Copy` (`C`), `Paste` (`V`) を有効化する。
+- **先に書くテスト**: `oracle_parity.rs` で (a) 矩形 ROI の Copy → 別位置の同サイズ ROI へ Paste、(b) 楕円 ROI の Cut → ROI 無し画像への Paste（中央配置とマスク透過）、(c) Paste 後の `Undo` をオラクルと比較。
+
+---
+
+### P3.3 `Threshold > Apply` と `Process > Binary > Make Binary / Convert to Mask`
+
+#### P3.3a 単一画像の二値化確定（`Apply` / `Make Binary` / `Convert to Mask`）🟡
+- **ゴール**: 閾値設定済み（または未設定時に自動 `IsoData` 閾値を計算した）画像を `0` と `255` の 8-bit 二値画像へ変換し、Threshold パレットの `Apply` ボタンおよび `Process > Binary > Make Binary` / `Convert to Mask` メニューから実行できる。
+- **最初に読むもの**:
+  - [Thresholder.java:13-230](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/Thresholder.java#L13-L230)（`applyThreshold`, `convertToByte`, `BlackBackground` の扱い: デフォルト `Prefs.blackBackground` が `false` のとき前景=255/背景=0 か、inverting LUT がどうなるかを必ずオラクル実測で確認！）
+  - [ThresholdAdjuster.java:749-830](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/frame/ThresholdAdjuster.java#L749-L830)
+- **編集してよいファイル**:
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/app/threshold_palette.rs`
+  - `crates/ij-app/tests/threshold_palette_test.rs`
+- **仕様**:
+  - `ImageDocument::apply_threshold(&mut self, black_background: bool) -> Result<(), CoreError>`:
+    - 閾値が `None` の場合、8-bit / 16-bit なら既定の `IsoData`（`dark_background = black_background`）で閾値を自動決定してから適用する。
+    - `Gray16` / `Gray32` の場合は 8-bit `Gray8` に変換した上で、元の閾値範囲 `[lower, upper]` に入る画素を前景値（`black_background == true` なら `255`、`false` の既定挙動はオラクル実測値に合わせる）、範囲外を背景値にし、`self.threshold = None` にリセットする。
+  - `Command::ApplyThreshold { black_background: bool }`（マクロ記録 `"setOption(\"BlackBackground\", ...);\nrun(\"Convert to Mask\");\n"` または `"run(\"Make Binary\");\n"`）。
+  - `threshold_palette.rs` の `Apply` ボタンを有効化して接続。
+
+#### P3.3b スタック画像の二値化（`Convert Stack to Binary`）🟢
+- **ゴール**: 複数スライスのスタック画像に対しても `Make Binary` / `Convert to Mask` が動作する（全スライス一括または各スライス自動計算のオプション対応）。
+- **最初に読むもの**: [Thresholder.java:70-150](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/Thresholder.java#L70-L150)
+- **編集してよいファイル**: `crates/ij-core/src/lib.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`, `crates/ij-app/src/app/threshold_palette.rs`, `crates/ij-app/src/app/adjust_dialogs.rs`
+- **先に書くテスト**: 3スライス 8-bit / 16-bit スタックの二値化がオラクルの `run("Convert to Mask", "method=Otsu background=Dark calculate black")` および固定閾値適用と完全一致。
+
+---
+
+### P3.4 `Process > Binary` のモルフォロジー演算（Erode / Dilate / Open / Close）🟡
+
+- **ゴール**: 8-bit 二値画像（画素値が `0` と `255` のみ）に対して `Erode`, `Dilate`, `Open`, `Close` が動作し、`Process > Binary` サブメニューから実行できる（スタック時の `Process Stack?` 対応を含む）。
+- **最初に読むもの**:
+  - [Binary.java:14-205](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/Binary.java#L14-L205)
+  - [BinaryProcessor.java:1-220](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/process/BinaryProcessor.java#L1-L220)
+  - [ByteProcessor.java](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/process/ByteProcessor.java) の `erode(int count, int background)` / `dilate(int count, int background)`（画像境界の外側画素をどう扱うか要確認！）
+- **編集してよいファイル**:
+  - `crates/ij-core/src/filters.rs`
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/stack_process.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/app/mod.rs`
+- **仕様**:
+  - 入力平面が `Gray8` でかつ全画素が `0` または `255` でない場合は `CoreError::InvalidOperation("8-bit binary (0 and 255 only) image required.")` を返す（`Binary.java` と同じチェック）。
+  - `Open` は `erode` の後に `dilate`、`Close` は `dilate` の後に `erode`。
+  - `PROCESS_MENU` の `unsupported("Binary", None)` を `submenu("Binary", PROCESS_BINARY)`（`Make Binary`, `Convert to Mask`, `Erode`, `Dilate`, `Open`, `Close`）に置き換える。
+- **先に書くテスト**: `oracle_parity.rs` で孤立点・穴・画像境界に接する矩形を含む二値パターンに対し、`Erode`, `Dilate`, `Open`, `Close`（単一画像・ROI あり・スタック全体）の画素がオラクルと完全一致。
+
+---
+
+### P3.5 `Process > Math` と `Process > Image Calculator...`
+
+#### P3.5a 単画像 `Process > Math`（Add / Subtract / Multiply / Divide / Min / Max / Gamma / Log / Exp / Square / Square Root / Reciprocal / Abs / Set）🟡
+- **最初に読むもの**:
+  - [ImageMath.java:14-205](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/ImageMath.java#L14-L205)
+  - 各 `ImageProcessor`（`ByteProcessor`, `ShortProcessor`, `FloatProcessor`, `ColorProcessor`）の `add(double)`, `multiply(double)`, `gamma(double)`, `log()`, `exp()`, `sqr()`, `sqrt()`, `abs()` 等の実装（特に 8-bit / 16-bit での `log()` / `exp()` のスケール係数と丸め・飽和クランプ規則を必ず Java 原文で確認すること！）。
+- **編集してよいファイル**:
+  - `crates/ij-core/src/filters.rs`（または新規 `crates/ij-core/src/math.rs`）
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/stack_process.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/dialogs.rs`
+  - `crates/ij-app/src/app/adjust_dialogs.rs`
+  - `crates/ij-app/src/app/mod.rs`
+- **先に書くテスト**: `oracle_parity.rs` で Gray8 / Gray16 / Gray32 / ColorRgb（および ROI・スタック）に対する各 Math 演算の結果がオラクルと完全一致。
+
+#### P3.5b 2 画像間演算 `Process > Image Calculator...` 🟡
+- **最初に読むもの**:
+  - [ImageCalculator.java:19-220](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/ImageCalculator.java#L19-L220)（12 演算: `Add`, `Subtract`, `Multiply`, `Divide`, `AND`, `OR`, `XOR`, `Min`, `Max`, `Average`, `Difference`, `Copy`, `Transparent-zero`、および `createWindow` と `floatResult`（32-bit 出力）オプション）
+- **編集してよいファイル**:
+  - `crates/ij-core/src/math.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/dialogs.rs`
+  - `crates/ij-app/src/app/adjust_dialogs.rs`
+- **先に書くテスト**: `oracle_parity.rs` で 2 枚の画像に対する `imageCalculator("Add create", ...)` / `"Subtract create 32-bit"` / `"Difference"` 等がオラクルと完全一致。
+
+---
+
+### P3.6 `Analyze > Set Scale...` と空間校正ダイアログ 🟢
+
+- **ゴール**: `Analyze > Set Scale...` ダイアログから `Distance in pixels`, `Known distance`, `Pixel aspect ratio`, `Unit of length`（および `Click to Remove Scale`）を設定でき、計測値（`Area`, `Length`, `Perim.`）、プロファイル横軸、ステータスバー座標、サブタイトル実寸表記、保存 TIFF に即座に反映される。
+- **最初に読むもの**:
+  - [ScaleDialog.java:13-140](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/ScaleDialog.java#L13-L140)
+  - [ImagePlus.java:2206-2216](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/ImagePlus.java#L2206-L2216)
+- **編集してよいファイル**:
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/dialogs.rs`
+  - `crates/ij-app/src/app/adjust_dialogs.rs`
+  - `crates/ij-app/src/app/mod.rs`
+- **仕様**:
+  - ダイアログを開いたとき、アクティブ画像に `Roi::Line` があればそのピクセル長さを `Distance in pixels` の初期値に入れる（`ScaleDialog.java:42-53`）。
+  - `pixel_width = known_distance / distance_in_pixels`, `pixel_height = pixel_width * aspect_ratio`。`distance <= 0` または `known <= 0` または `unit` が `"pixel"` / 空のときは未校正（`1.0, 1.0, "pixel"`）にリセットする。
+  - `Command::SetScale { distance: f64, known: f64, aspect: f64, unit: String }`（マクロ記録 `"run(\"Set Scale...\", \"distance=... known=... pixel=... unit=...\");\n"`）。
+- **先に書くテスト**: `oracle_parity.rs` で `Set Scale...` 実行後の `Measure`（Area, Perim., Centroid, Length）および TIFF 保存・再読込後の校正値がオラクルと一致。
+
+---
+
+### P3.7 残りの全ツールバー 6 種の実装（Point / Polyline / Freeline / Angle / Dropper / Text）
+
+14 個のツールバー枠のうち未有効の 6 ツールを 3 ステップに分けてすべて有効化し、`Tool::is_supported` を全ツール `true` にする。
+
+#### P3.7a `Point`（マルチポイント）と `Angle` ツール 🟡
+- **最初に読むもの**:
+  - [PointRoi.java:22-130](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/gui/PointRoi.java#L22-L130)
+  - [Analyzer.java:382-430](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/Analyzer.java#L382-L430)（`measurePoint`, `measureAngle`）
+  - [PolygonRoi.java:398-444](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/gui/PolygonRoi.java#L398-L444)（`getAngle`: 3 頂点からの角度計算）
+- **編集してよいファイル**: `crates/ij-core/src/lib.rs`, `crates/ij-io/src/lib.rs`（ROI シリアライズ対応または明示対応）, `crates/ij-session/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`, `crates/ij-app/src/tool.rs`, `crates/ij-app/src/roi_edit.rs`, `crates/ij-app/src/app/image_window.rs`
+- **仕様**:
+  - `Roi::Point(PointRoi { points: Vec<(i32, i32)> })` と `Roi::Angle(AngleRoi { points: [(i32, i32); 3] })` を追加。
+  - `Point` の `Measure` は各点ごとに `X`, `Y`, およびその画素値（`Mean`/`Min`/`Max`/`Mode` 等すべて同じ単一画素値、`Area = 0`）を Results に追加する（`Analyzer.measurePoint` と一致させる）。
+  - `Angle` の `Measure` は 3 点のなす角（`0..=180` 度、校正考慮）を `Angle` 列に出力する。
+- **先に書くテスト**: `oracle_parity.rs` で `makePoint(x, y)` と `makeSelection("angle", ...)` の `Measure` 出力がオラクルと一致。
+
+#### P3.7b `Segmented Line`（`Polyline`）と `Freehand Line`（`Freeline`）ツール 🟡
+- **最初に読むもの**:
+  - [PolygonRoi.java:250-395](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/gui/PolygonRoi.java#L250-L395)（`POLYLINE`, `FREELINE` の `getLength()`）
+  - [ProfilePlot.java:236-290](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/gui/ProfilePlot.java#L236-L290)（`getIrregularProfile`）
+- **編集してよいファイル**: `crates/ij-core/src/lib.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`, `crates/ij-app/src/tool.rs`, `crates/ij-app/src/roi_edit.rs`, `crates/ij-app/src/app/image_window.rs`
+- **仕様**:
+  - `Roi::Polyline(PolylineRoi { points: Vec<(i32, i32)>, freehand: bool })` を追加。`is_area()` は `false`、`is_line()` は `true`。
+  - 各線分長の合計（校正考慮）を `Length` とし、`Measure` および `Plot Profile`（`getIrregularProfile`）に対応させる。
+- **先に書くテスト**: `oracle_parity.rs` で `makeLine(x1, y1, x2, y2, x3, y3)` の `Measure`（Length, Mean, Min, Max）と `getProfile()` がオラクルと一致。
+
+#### P3.7c `Color Picker`（`Dropper`）と `Text` ツール 🟢
+- **最初に読むもの**:
+  - `Toolbar.java` および `ImageCanvas.java` の `DROPPER` 処理（クリックで前景色、Alt+クリックで背景色を画像画素からスポイト取得）
+  - `TextRoi.java`（またはクリック位置にテキストスタンプを `Fill` / `Draw` で焼き込む最小実装）
+- **編集してよいファイル**: `crates/ij-app/src/tool.rs`, `crates/ij-app/src/app/image_window.rs`, `crates/ij-app/src/app/mod.rs`, `crates/ij-app/tests/dropper_and_text_tool_test.rs`（新規）
+- **仕様**:
+  - `Dropper`: 画像上の画素をクリックすると、その画素の RGB 表示色を `Session.foreground_color`（Alt 押下時は `background_color`）にセットし、ステータスバーに `Foreground color: (R, G, B)` を表示する。
+  - `Text`: クリックで矩形とテキスト入力状態を作り、`Edit > Draw`（`D`）でビットマップフォント（5×7 または 8×8 の組み込み ASCII グリフ）を前景色で画素に描画する。これで 14 個すべてのツールが有効（`Tool::is_supported` が全件 `true`）になる。
+
+---
+
+### P3.8 `Analyze > Analyze Particles...` と `ROI Manager`
+
+#### P3.8a 粒子解析コアエンジン（`ij-core`, `ij-session`）🔴
+- **ゴール**: 二値化または閾値設定済みの画像に対し、ラスタ走査＋`Wand` 輪郭トレース＋内部塗りつぶしによって全粒子を検出し、`Size (pixel^2 or calibrated)` と `Circularity (0.00-1.00)` と `Exclude on edges` と `Include holes` の条件に従って各粒子の `MeasurementSummary` と `Roi` を生成する。
+- **最初に読むもの**:
+  - [ParticleAnalyzer.java:464-955](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/ParticleAnalyzer.java#L464-L955)（走査順序 `y: 0..h, x: 0..w`、閾値判定、`Wand.autoOutline` 呼び出し、`PolygonFiller` による走査済み粒子の消去、エッジ接触判定、Circularity フィルタ）
+- **編集してよいファイル**:
+  - `crates/ij-core/src/particles.rs`（新規）
+  - `crates/ij-core/src/lib.rs`
+  - `crates/ij-session/src/lib.rs`
+  - `crates/ij-session/tests/oracle_parity.rs`
+- **厳密な仕様**:
+  - 元画像の画素を破壊しないよう、作業用のクローン平面上で走査・消去を行う。
+  - 各検出粒子について `PolygonRoi`（または `TracedRoi`）を生成し、`Include holes` が `false` の場合は内部の穴を除いたマスク、および既存の `measure_with_config` を使って統計値を算出する。
+  - `Circularity = 4.0 * PI * area / (perimeter * perimeter)`（`> 1.0` は `1.0` にクランプ）が `[min_circ, max_circ]` の範囲外ならスキップ。
+  - `Exclude on edges` が `true` のとき、粒子のバウンディングボックスが画像端（または選択範囲端）に接していればスキップ。
+- **先に書くテスト**: `oracle_parity.rs` で複数の粒子・穴・端接触粒子を含むテスト画像に対し、`run("Analyze Particles...", "size=0-Infinity circularity=0.00-1.00 display clear")`、`exclude` 付き、`include` 付き、`size=10-100` 付きの Results テーブル出力（行数・Area・Mean・X・Y・Perim.・Circ.）がオラクルと完全一致。
+
+#### P3.8b `ROI Manager` と `Analyze Particles...` ダイアログ（`ij-session`, `ij-app`）🟡
+- **ゴール**: `Analyze > Tools > ROI Manager...`（または `Edit > Selection > Add to Manager` (`T`)）で複数 ROI の登録・選択・削除・一括 `Measure` ができ、`Analyze Particles...` の `Add to Manager` および `Summarize` が動作する。
+- **編集してよいファイル**:
+  - `crates/ij-session/src/lib.rs`（`Session.roi_manager: Vec<NamedRoi>`, `Command::RoiManagerAdd`, `RoiManagerSelect`, `RoiManagerDelete`, `RoiManagerMeasure`）
+  - `crates/ij-app/src/action.rs`
+  - `crates/ij-app/src/dialogs.rs`
+  - `crates/ij-app/src/app/adjust_dialogs.rs`
+  - `crates/ij-app/src/app/mod.rs`
+  - `crates/ij-app/tests/particle_and_roi_manager_ui_test.rs`（新規）
+- **先に書くテスト**: `Analyze Particles...` で `Add to Manager` を ON にして実行すると検出粒子の ROI が `Session.roi_manager` に順番通り入り、任意の項目を選択するとアクティブ画像の ROI が切り替わること。
+
+---
+
+### P3.9 圧縮 TIFF（PackBits / Deflate / LZW）と PNG / JPEG 入出力
+
+#### P3.9a 圧縮 TIFF の読み込み（PackBits / Deflate / LZW）🟡
+- **ゴール**: 顕微鏡や ImageJ で保存された圧縮 TIFF（Compression タグ `32773` PackBits、`8` / `32946` Deflate/AdobeDeflate、`5` LZW、および Horizontal Predictor `Tag 317 = 2`）を `ij-io::load_tiff` で正確にデコードできる。
+- **最初に読むもの**:
+  - [FileOpener.java:516-615](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/io/FileOpener.java#L516-L615)（`uncompress`, `packBitsUncompress`, `lzwUncompress`, horizontal differencing predictor）
+  - [crates/ij-io/src/lib.rs](file:///Users/nauti/GitHub/ImageJ-rs/crates/ij-io/src/lib.rs)
+- **編集してよいファイル**: `crates/ij-io/Cargo.toml`（既に workspace にある `flate2` 等を利用可。`ij-core` には一切依存を足さない）, `crates/ij-io/src/lib.rs`, `crates/ij-session/tests/oracle_parity.rs`
+- **先に書くテスト**: Java オラクルの `saveAs("Tiff", ...)` や LZW / PackBits / ZIP 圧縮ストリップ（8-bit / 16-bit / RGB、Predictor あり・なし）を `load_tiff` で読み込み、全画素が元画像と一致すること。
+
+#### P3.9b PNG と JPEG の読み込み・書き出し 🟡
+- **ゴール**: `File > Open...` で `.png` / `.jpg` / `.jpeg`（マジックバイト判定優先）を開け、`File > Save As > PNG...` / `Jpeg...` で保存できる。
+- **最初に読むもの**:
+  - [PNG_Writer.java:11-105](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/PNG_Writer.java#L11-L105)
+  - [JpegWriter.java:18-85](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/JpegWriter.java#L18-L85)
+- **編集してよいファイル**: `crates/ij-io/Cargo.toml`, `crates/ij-io/src/lib.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-app/src/action.rs`, `crates/ij-app/src/app/mod.rs`, `tools/ledger/sync_ledger.py`（`PNG...`, `Jpeg...` を `RustTier1` に追加する場合）
+- **先に書くテスト**: Gray8 / Gray16 / ColorRgb の PNG 往復で全画素完全一致、JPEG 往復で寸法・チャンネルと PSNR（または許容誤差内の輝度）を確認し、保存失敗時のアトミック性（既存ファイルを壊さないこと）をテストする。
+
+---
+
+### P3.10–P3.12 プラグイン基盤の拡張（互換拡大と Rust ネイティブ API）
+
+#### P3.10 `PlugInFilter` の 16-bit / 32-bit / RGB およびスタック（`DOES_STACKS`）対応 🔴
+- **最初に読むもの**:
+  - [PlugInFilter.java:10-91](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/PlugInFilter.java#L10-L91)
+  - [PlugInFilterRunner.java:48-165, 397-425](file:///Users/nauti/GitHub/ImageJ-rs/original_imagej/ij/plugin/filter/PlugInFilterRunner.java#L48-L165)
+  - [crates/ij-bridge/src/plugin.rs](file:///Users/nauti/GitHub/ImageJ-rs/crates/ij-bridge/src/plugin.rs)
+  - [tools/plugin-host/src/tools/plugin/PluginHost.java](file:///Users/nauti/GitHub/ImageJ-rs/tools/plugin-host/src/tools/plugin/PluginHost.java)
+- **編集してよいファイル**: `tools/plugin-host/src/tools/plugin/*.java`, `tools/plugin-host/fixtures/src/fixtures/*.java`, `crates/ij-bridge/src/plugin.rs`, `crates/ij-bridge/src/plugin_discovery.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-app/src/app/plugin_ops.rs`, `crates/ij-bridge/tests/plugin_filter_compatibility.rs`, `crates/ij-session/tests/plugin_filter_integration.rs`
+- **仕様**:
+  - `setup()` が返すフラグ（`DOES_8G`, `DOES_16`, `DOES_32`, `DOES_RGB`, `DOES_ALL`, `DOES_STACKS`, `NO_CHANGES`, `NO_UNDO`）を検査時に記録する。
+  - アクティブ画像のビット深度がプラグインの対応フラグに含まれる場合、16-bit / 32-bit / RGB でも一時 TIFF 経由で実行を許可する。
+  - スタック画像のとき、`DOES_STACKS` があれば全スライスを処理し、なければ現在スライス 1 枚だけを処理して書き戻す（`PlugInFilterTicket` の世代検証を維持）。
+
+#### P3.11 `GenericDialog` の JSON スキーマ交換（単一ダイアログ対応）🔴
+- **ゴール**: 数値（`addNumericField`）・文字列（`addStringField`）・選択肢（`addChoice`）・真偽値（`addCheckbox`）を持つ標準的な `GenericDialog` プラグインに対し、検査時にフィールド定義を抽出し、Rust 側 egui でパラメータ入力ダイアログを自動生成してマクロオプション文字列（`"sigma=2.0 radius=3 ..."`）として Java ホストへ渡して実行できる。
+- **編集してよいファイル**: `tools/plugin-host/src/tools/plugin/*.java`, `crates/ij-bridge/src/plugin.rs`, `crates/ij-session/src/lib.rs`, `crates/ij-app/src/app/plugins_ui.rs`, `crates/ij-bridge/tests/plugin_filter_compatibility.rs`
+- **先に書くテスト**: `GenericDialog` で `numeric` + `checkbox` を要求する fixture プラグインに対し、Rust 側から指定したパラメータ値が渡り、計算結果とマクロ記録がオラクルと一致すること。
+
+#### P3.12 型付き Rust プラグイン API（`crates/ij-plugin-api`）🟡
+- **ゴール**: Java を介さず純粋な Rust コードでフィルタや解析プラグインを書ける `ij-plugin-api` クレートと、`Session::run_rust_plugin` のトランザクション境界を提供する。
+- **編集してよいファイル**: `Cargo.toml`, `crates/ij-plugin-api/Cargo.toml`（新規）, `crates/ij-plugin-api/src/lib.rs`（新規）, `crates/ij-session/Cargo.toml`, `crates/ij-session/src/lib.rs`, `crates/ij-session/tests/rust_plugin_api_test.rs`（新規）
+- **仕様**:
+  - `pub trait RustImagePlugin { fn name(&self) -> &str; fn supports(&self, meta: &ImageMetadata) -> Result<(), String>; fn run(&self, ctx: &mut PluginContext) -> Result<(), String>; }`
+  - `PluginContext` は `ImageDocument` のクローン（またはスライスバッファ）と `ResultsTable` 追記バッファのみを公開し、ファイルシステムや UI へのアクセスを持たない。`run` が `Ok` を返したときだけ `Session` が Undo スナップショットを保存して変更をコミットし、`Err` のときは元画像を一切変更しない。
+
+---
+
+## 3. 一気通貫で進めるための実行順序とサブエージェント分担表
+
+以下の 14 バッチを上から順番にディスパッチし、各バッチ完了ごとに `./tools/verify.sh`（`VERIFY_ALL_OK`）と `git push` を行います。
+
+| バッチ | タスク ID | 内容 | 担当モデル |
+| --- | --- | --- | --- |
+| **Batch 1** | **P3.0 + P3.1b** | 追跡 JAR の `.gitignore` 化・旧ブランチ削除 + `Select All` (`Cmd+A`) / `Restore Selection` (`Shift+E`) | DeepSeek flash / Gemini flash |
+| **Batch 2** | **P3.2a** | `Edit > Clear / Fill (F) / Draw (D)` と前景色・背景色 | DeepSeek flash / Gemini flash |
+| **Batch 3** | **P3.2b** | `Edit > Copy (C) / Cut (X) / Paste (V)`（内部クリップボード + マスク + Undo） | Claude Sonnet |
+| **Batch 4** | **P3.3a + P3.3b** | `Threshold > Apply` と `Make Binary / Convert to Mask`（単一画像 + スタック） | DeepSeek flash / Gemini flash |
+| **Batch 5** | **P3.4** | `Process > Binary > Erode / Dilate / Open / Close` | DeepSeek flash / Gemini flash |
+| **Batch 6** | **P3.5a** | `Process > Math`（単画像 14 演算 + ダイアログ + スタック対応） | DeepSeek flash / Gemini flash |
+| **Batch 7** | **P3.5b** | `Process > Image Calculator...`（2 画像間 12 演算 + 32-bit 出力） | Claude Sonnet |
+| **Batch 8** | **P3.6** | `Analyze > Set Scale...` ダイアログと Remove Scale | DeepSeek flash / Gemini flash |
+| **Batch 9** | **P3.7a + P3.7b + P3.7c** | 残り全 6 ツール（`Point`, `Angle`, `Polyline`, `Freeline`, `Dropper`, `Text`）有効化 | Claude Sonnet / flash |
+| **Batch 10** | **P3.8a + P3.8b** | `Analyze > Analyze Particles...` コアエンジンと `ROI Manager` UI | Claude Sonnet（P3.8a）→ flash（P3.8b） |
+| **Batch 11** | **P3.9a + P3.9b** | 圧縮 TIFF（PackBits / Deflate / LZW）読込 + PNG / JPEG 読み書き | Claude Sonnet |
+| **Batch 12** | **P3.10** | Java `PlugInFilter` の 16/32/RGB・スタック（`DOES_STACKS`）拡張 | Claude Sonnet |
+| **Batch 13** | **P3.11 + P3.12** | Java `GenericDialog` スキーマ交換 + Rust プラグイン API（`ij-plugin-api`） | Claude Sonnet |
+| **Batch 14** | **Final** | `README.md` / `README_ja.md` 最終更新、エンドツーエンド総合テスト、全検証・Push | 私（Opus）/ Sonnet |
+
+---
+
+## 4. 最終完了の定義（Project Complete）
+
+1. **ツールバー全 14 ツールが 100% 有効**（`Tool::ALL.iter().all(|t| t.is_supported())` が `true`）。
+2. **日常ワークフローの全メニューが稼働**（`File > Revert`, `Save As > Tiff / PNG / Jpeg / Results`, `Edit > Undo / Cut / Copy / Paste / Clear / Fill / Draw / Invert / Selection > Select All, Select None, Restore Selection, Add to Manager`, `Image > Adjust / Type / Stacks / Crop / Duplicate`, `Process > Smooth / Sharpen / Find Edges / Binary / Math / Filters / Noise / Image Calculator`, `Analyze > Measure / Analyze Particles / Set Measurements / Set Scale / Histogram / Plot Profile / Tools > ROI Manager`）。
+3. **エンドツーエンド自動検証**: 「圧縮 TIFF 読込 → Set Scale → フィルタ → Threshold Apply（二値化） → Erode/Open → Analyze Particles（Results 出力＋ROI Manager 登録） → 元画像へ ROI 復元して計測 → PNG / TIFF / Results 保存」を一気通貫で回す統合テストがオラクルと一致し、`./tools/verify.sh` が警告 0 件で `VERIFY_ALL_OK` を出力する。
 
-### 実装前の設計チェック（P3.1 の着手時に行う）
-
-**目的**: 後続機能がそれぞれ独自の clipboard、dirty、undo、ROI Manager を持たないよう、既存の `ImageDocument`/`Session` の境界を先に決める。
-
-**最初に読むもの**:
-
-- `crates/ij-core/src/lib.rs:1080-1180`（`ImageDocument` と `Calibration`）および `:2318-2350`（snapshot/undo）。
-- `crates/ij-session/src/lib.rs:267-450`（`CommandOutcome`、Session 状態、保存パス）および `:582-620`（Open/Save の dispatch）。
-- `crates/ij-app/src/action.rs:100-225,340-470`（メニュー表と enabled 判定）。
-- `original_imagej/ij/ImagePlus.java:2187-2283,2890-3035`、`original_imagej/ij/Undo.java:121-202`。
-
-**編集範囲**: `crates/ij-core/src/lib.rs`、`crates/ij-session/src/lib.rs`、必要な `crates/ij-app/src/action.rs` と `crates/ij-app/src/app/`。ledger 変更はスクリプト生成。新しい共有型は serde 可能な純粋データにする。
-
-**P3.1 で先に書くテスト**: `oracle_parity.rs` に画像を保存してから編集し、`Undo`/`File > Revert` 相当の pixel、ROI、calibration、threshold を比較する表を追加する。`action_model_test.rs` では画像なし、ROI なし、保存パスなしの enabled 状態を検証する。
-
-**判断事項**: 既存の `CommandOutcome` と `ImageDocument` の公開利用を壊さず、clipboard/previous ROI/dirty の所有者を一つに決める。これだけを独立タスクとして完了扱いにせず、最初の失敗テストと実装、`VERIFY_ALL_OK` までを P3.1 に含める。
-
-### P3.1 File > Revert と選択状態を実装する 🟡
-
-**Java の根拠**: `original_imagej/ij/plugin/Commands.java:50-56` は active image の `imp.revert()` を呼ぶ。`ImagePlus.java:2187-2204` は ROI を削除前に保存し、`:2245-2283` は Restore Selection の previous ROI を復元する。`:2293-2333` は元の `FileInfo` から再読込し、dirty 状態と current slice を扱う。Selection メニューの分岐は `original_imagej/ij/plugin/Selection.java` を読む。
-
-**実装方針**:
-
-- Session が記録した TIFF path を使い、再読込後に current slice/position、表示範囲、calibration、threshold、ROI の保持・破棄を Java の順序に合わせる。
-- `Select All` は image bounds の rectangle ROI、`Select None` は existing `ClearRoi` の previous-ROI 保存を使う。`Restore Selection` は image bounds に収まるときだけ clone し、必要なら中央へ移動する。
-- Revert は UI の確認ダイアログと純粋な Session operation を分離する。保存されていない新規画像は明示的なエラーにし、無言で別画像を開かない。
-
-**テスト**: `oracle_parity.rs` に「save → invert/crop/threshold → revert」、`session_ui_correctness.rs` に previous ROI と Select All/None、headless dialog test を追加する。
-
-**非ゴール**: URL/VirtualStack の Revert、overlay の完全再現、OS clipboard。`VERIFY_ALL_OK` が条件。
-
-### P3.2 Edit の画素操作と内部 clipboard を実装する 🔴
-
-**Java の根拠**: `original_imagej/ij/ImagePlus.java:2882-2934`（copy/cut と ROI mask、background fill、Undo）、`:2936-3025`（paste のサイズ・中央配置・paste mode）、`original_imagej/ij/process/ImageProcessor.java:1712-1805`（fill/fill mask/draw ROI）。OS clipboard の扱いは `original_imagej/ij/plugin/Clipboard.java:15-110`。
-
-**実装方針**:
-
-- `ij-core` に ROI bounds と mask を使う Clear/Fill/Draw の pure pixel operations を追加し、Gray8/Gray16/Gray32/RGB の型ごとに丸めとクリップを Java と比較する。
-- 内部 clipboard は `Session` が所有する document-independent な snapshot とし、paste は target ROI が clipboard と同サイズならそこへ、違えば visible image center へ配置する。OS clipboard は `ij-app` 境界でのみ扱う。
-- `Cut` は copy 後に背景色で塗り、non-rectangular ROI は mask で外側を保持する。各変更は既存 `save_snapshot`/`undo` の一回分として扱う。
-
-**テスト**: `oracle_parity.rs` で各 pixel type の 3x3 ROI、非矩形 mask、clipboard paste 位置、Undo を比較。`crates/ij-app/tests/usability_fidelity_test.rs` で X/C/V/F/D キーとメニューを headless で検証する。
-
-**非ゴール**: overlay flatten、system clipboard の画像形式変換、paste mode 全種類。まず内部 clipboard の Copy/Cut/Paste と macro 記録を完了する。
-
-### P3.3 Threshold Apply / Make Binary / Convert to Mask 🟡
-
-**Java の根拠**: `original_imagej/ij/plugin/Thresholder.java:13-51` が単画像/スタックの入口、`:151-230` が threshold の適用、`original_imagej/ij/process/ImageProcessor.java:2574-2628` が auto threshold、`original_imagej/ij/plugin/frame/ThresholdAdjuster.java` が current threshold と LUT を管理する。
-
-**実装方針**:
-
-- 最初は単一 `Gray8` 画像の `Apply` を実装し、active threshold がない場合の auto-threshold と foreground/background（black background を含む）を明示する。画素を 0/255 に確定し、threshold metadata を Java と同じ時点で reset/keep する。
-- 次に Gray16/Gray32 と stack を追加し、`Thresholder.convertStack` の current only / create new stack / local threshold を別コマンド引数にする。
-- UI の `Threshold...` palette の Apply ボタンを `AppAction`/`Command` に接続する。menu ledger は script で更新する。
-
-**テスト**: `oracle_parity.rs` で既知 threshold、auto threshold、dark/light background、8-bit stack の current/all slice を比較。`threshold_palette_test.rs` に Apply button の state transition を追加する。
-
-**非ゴール**: `Threshold to Selection`、ColorThresholder、16-bit の全 legacy dialog。まず mask pixel parity を合格させる。
-
-### P3.4 Process > Binary の基本形態学 🟡
-
-**Java の根拠**: `original_imagej/ij/plugin/filter/Binary.java:14-143`（operation、flags、run）、`:145-205`（iterations、Erode/Dilate/Open/Close/Fill）、`original_imagej/ij/process/BinaryProcessor.java:1-220`、`ByteProcessor.erode/dilate` の実装を読む。
-
-**実装方針**:
-
-- P3.3 の binary invariant（0 と 255 のみ）を入口で検証し、Erode/Dilate の `iterations` と `count`、black background、edge padding を型付き設定にする。
-- Open = erode → dilate、Close = dilate → erode の順序を固定し、single slice/whole stack の undo policy を ImageJ の PlugInFilterRunner に合わせる。
-- `ij-core` の pure morphology を先に実装し、UI の Binary dialog は後から同じ設定型を使う。
-
-**テスト**: Java macro で 5x5 の十字・穴・端接触パターンを生成し、近傍画素数の設定と各 operation の pixel 配列を `oracle_parity.rs` で比較。`stack_process_test.rs` に stack undo/processing scope を追加する。
-
-**非ゴール**: Skeletonize、EDM、Outline、Fill Holes の全オプション。基本形態学後に別タスクとして追加する。
-
-### P3.5 Process > Math と Image Calculator 🟡
-
-**Java の根拠**: `original_imagej/ij/plugin/filter/ImageMath.java:8-140,146-204`（add/sub/mul/div/min/max/gamma/set/log/exp/sqr/sqrt/reciprocal/abs と ROI/stack flags）、`original_imagej/ij/plugin/ImageCalculator.java:19-220`（2 画像の operator、create window、stack compatibility、32-bit promotion）。
-
-**実装方針**:
-
-- 単画像 Math は `ij-core` に型ごとの `f64` 中間値・Java の clip/round 規則を持つ pure function として追加し、ROI mask と stack scope を Session が選ぶ。
-- `Image Calculator` は image IDs を受け取り、同じ width/height/type、single-vs-stack broadcasting、result title、create window を Session で管理する。source と destination が同一の場合の snapshot 順序を固定する。
-- UI ダイアログは numeric validation と operation selection だけを担い、演算そのものを UI に置かない。
-
-**テスト**: `oracle_parity.rs` で全 operator の小さな Gray8/16/32/RGB 入力、0 除算、NaN/Infinity、ROI、stack broadcasting を比較する。UI では invalid number と cancel を headless test で検証する。
-
-**非ゴール**: `macro` operation の Java parser 完全互換、FFT Math、複雑な color space。`ImageMath.java:206-230` の macro は別設計にする。
-
-### P3.6 Analyze > Set Scale と校正 🟢
-
-**Java の根拠**: `original_imagej/ij/plugin/filter/ScaleDialog.java:13-120`（distance/known/aspect/unit/global と remove scale）、`original_imagej/ij/measure/Calibration.java`（scaled、units、pixelWidth/Height/Depth）、`original_imagej/ij/ImagePlus.java:2206-2216`（removeScale）。
-
-**実装方針**:
-
-- `Calibration` は既に `ij-core` にあるため、`known / measured`、aspect ratio、unit、global flag の入力と validation を追加する。`pixel`/空単位/0 以下は Java の unscale 規則に合わせる。
-- Set Scale は line ROI の raw length または rectangle の最大辺を初期値にする。変更後は既存 measurement/profile の calibrated values に反映させ、pixel count 自体は変えない。
-- TIFF metadata への校正保存・読込は existing `ij-io` metadata path を確認してから接続する。
-
-**テスト**: Java macro で 10 px line に `known=5, unit=um` を設定し、area/length/profile x increment と saved TIFF reopen を比較。`set_measurements_ui_test.rs` に dialog validation と Remove Scale を追加する。
-
-**非ゴール**: global calibration を複数ウィンドウへ完全反映、空間変換（rotate/scale）そのもの。
-
-### P3.7 追加ツールと ROI 型 🟡
-
-**Java の根拠**: `original_imagej/ij/gui/PolygonRoi.java:33-149,191-248,398-444,585-642`（POLYLINE/FREELINE/ANGLE/POINT の構築と確定）、`original_imagej/ij/gui/PointRoi.java:22-130,700-760`（multi-point/counters）、`original_imagej/ij/gui/Line.java:16-120`（line length/angle）、`original_imagej/ij/gui/Toolbar.java:24-38,398-469,661-690`（tool IDs）。
-
-**実装方針**:
-
-- `ij-core` の `Roi` enum が現在持つ Rect/Oval/Polygon/Line の境界を確認し、Polyline/Freeline/Angle/Point を別 variant として追加する。既存 polygon を無理に再解釈しない。
-- angle は calibrated vectors から ImageJ の 0–180/reflex angle 規則を再現し、polyline/freeline は open path として length を測る。point は複数座標と counter mode を保持する。
-- `Tool::is_supported`、mouse state、hit testing、macro recording を一つずつ有効化する。Dropper/Text は UI state と pixel sampling/text overlay の責任を分ける。
-
-**テスト**: `tool.rs` の純粋 geometry table test、`roi_interaction_test.rs` の RawInput 操作、`oracle_parity.rs` の line/polyline/angle/point measurement を追加する。既存 Rectangle/Oval/Polygon geometry を変更しない。
-
-**非ゴール**: ShapeRoi boolean、spline fit、overlay の全編集、Text のフォント組版。各ツールの最小作成・移動・計測から始める。
-
-### P3.8 Analyze Particles と ROI Manager 🔴
-
-**Java の根拠**: `original_imagej/ij/plugin/filter/ParticleAnalyzer.java:17-87`（options flags）、`:175-220`（constructor）、`:300-433`（dialog と size/circularity/options）、`:464-520`（analyze setup）、`:879-948`（wand trace、mask、measurement、edge/circularity filter）、`:982-1010`（ROI Manager 追加）。`original_imagej/ij/plugin/frame/RoiManager.java:448-490,2066-2100,2380-2425` も読む。
-
-**実装方針**:
-
-- まず single-slice binary Gray8、8-connected、SHOW_NONE/SHOW_RESULTS/CLEAR_WORKSHEET の最小組を実装する。連結成分、edge exclusion、min/max size、Results row は `ij-core` の pure iterator として出す。
-- 次に include holes、circularity、overlay、stack position を追加し、ROI Manager は `Session` が所有する ordered `Vec<RoiEntry>` として実装する。UI は list/select/add/delete/measure の thin layer にする。
-- Wand の既存実装は粒子境界の trace に再利用できるが、particle fill で source pixels を破壊する処理はコピー上で行う。結果と source image の mutation を分離する。
-
-**テスト**: 既知の blobs 相当 8-bit binary fixture を Java macro と Rust に渡し、count、area、centroid、perimeter、circularity、edge exclusion、Results column、ROI order を比較する。`particle_analysis_test.rs` を追加する。
-
-**非ゴール**: すべての Show（masks/outlines/ellipses）、redirect image、composite ROI、virtual stack。最小粒子解析が parity を得てから増やす。
-
-### P3.9 圧縮 TIFF と PNG/JPEG I/O 🔴
-
-**Java の根拠**: `original_imagej/ij/io/TiffDecoder.java`（IFD compression/strip/tile 解釈）、`original_imagej/ij/io/FileOpener.java:516-540,585-602`（LZW/compressed stream と pixel reader）、`original_imagej/ij/io/FileInfo.java:89-113`（compression constants）、`original_imagej/ij/io/Opener.java:330-365,749-760`（JPEG/PNG dispatch）、`original_imagej/ij/plugin/PNG_Writer.java:11-65,101-105`、`original_imagej/ij/plugin/JpegWriter.java:18-85`。
-
-**実装方針**:
-
-- 形式ごとに capability matrix を先に作る。TIFF は uncompressed → PackBits → Deflate → LZW の順、PNG は Gray8/Gray16/RGB、JPEG は Gray8/RGB の lossy 明示契約とする。JPEG の pixel-exact parity は要求せず、encoder quality と round-trip 誤差を別基準にする。
-- `ij-io` の decoder/encoder を純粋 byte parser と filesystem wrapper に分け、外部 crate を使う場合も `ij-core` に依存を持ち込まない。既存 `load_tiff`/`save_tiff` の metadata と atomic save safety を保持する。
-- `Session::OpenTiff/SaveTiff` を拡張する前に `OpenImage`/`SaveImage` の format enum を設計し、拡張子だけでなく magic bytes と explicit format を優先する。
-
-**テスト**: Java `FileSaver`/`Opener` で生成した圧縮 TIFF、PNG、JPEG fixture を Rust で開き、shape/type/calibration/representative pixels を比較する。Rust の保存物を Java で再読込する逆向きテストも行う。既存 `save_tiff_atomicity.rs` を回帰にする。
-
-**非ゴール**: DICOM/AVI/GIF、virtual stack、OME-TIFF の全メタデータ。codec の追加は一形式ごとに `VERIFY_ALL_OK` を挟む。
-
-### P3.10 PlugInFilter の画像型・スタック互換 🔴
-
-**Java の根拠**: `original_imagej/ij/plugin/filter/PlugInFilter.java:10-91`（capability flags）、`original_imagej/ij/plugin/filter/PlugInFilterRunner.java:48-120,156-162,397-425`（setup、stack dispatch、undo、type validation）。
-
-**実装方針**:
-
-- inspection/host protocol の JSON に setup flags、accepted bit depths、DOES_STACKS、SUPPORTS_MASKING、NO_UNDO/NO_CHANGES を追加する。既存の plain filter ticket を壊さず versioned protocol にする。
-- Gray16、Gray32、RGB の TIFF transfer を型ごとに検証し、plugin flags が要求しない型を開始前に拒否する。DOES_STACKS がない plugin は current slice のみ、ある plugin は stack planes を順番に渡す。
-- `NO_UNDO`/`NO_CHANGES`/`SNAPSHOT` の扱いを既存 `plugin_undo_policy` と一致させ、plugin が calibration/ROI/metadata を変えた場合は ticket stale として破棄する。
-
-**テスト**: `crates/ij-bridge/tests/plugin_filter_compatibility.rs` と `crates/ij-session/tests/plugin_filter_integration.rs` に、各 flag 組み合わせの fixture plugin（8/16/32/RGB、single/stack、mask/no-mask）を追加する。Java host の stdout/stderr と Rust document revision を比較する。
-
-**非ゴール**: AWT window、ExtendedPlugInFilter の preview、GenericDialog。これらは P3.11 で別 protocol にする。
-
-### P3.11 GenericDialog の限定交換 🔴
-
-**Java の根拠**: `original_imagej/ij/gui/GenericDialog.java:44-105,325-505,604-640,1566-1701`、`original_imagej/ij/plugin/filter/PlugInFilterRunner.java:22-48,585-620`。
-
-**方針**: Java host が表示した dialog を Rust UI へ丸ごと転送するのではなく、numeric/string/choice/checkbox の宣言と default、validation、cancel/OK を JSON で交換する。最初は `GenericDialog` を一つだけ使う fixture pluginで、preview callback と arbitrary AWT component は拒否する。
-
-**テストと受け入れ条件**: headless egui で dialog schema から同じ field order/default を生成し、OK/Cancel の結果を Java plugin が受け取ることを確認する。未知 field type は明示的な unsupported error にする。
-
-### P3.12 Rust プラグイン API 🔴
-
-**方針**: Java compatibility path と混ぜず、Rust plugin API を別 crate（候補: `ij-plugin-api`）として設計する。画像 plane、ROI、calibration、Results writer、undo policy を typed trait で表し、UI や filesystem を plugin trait に渡さない。まず in-process test plugin と versioned API を作り、将来の dynamic loading は別判断にする。
-
-**受け入れ条件**: Rust plugin が `ImageDocument` の clone/transaction を受け取り、成功時だけ Session に commit、失敗時は元画像を変えない。Java plugin の classpath や GenericDialog を API に漏らさない。
-
-## 3. 各タスクの報告形式
-
-```text
-TASK: P3.x
-STATUS: done | stopped
-CHANGED: <ファイル一覧>
-NEW TESTS: <テスト名一覧>
-VERIFY: VERIFY_ALL_OK | stopped with reason
-JAVA REFERENCES: <読んだファイルと行番号>
-NOTES: <pixel/measurement/UI parity、未実装範囲、次の依存>
-```
-
-Phase 3 の終了条件は、P3.1–P3.9 のうち日常ワークフローに必要な機能が `unsupported` から消え、編集→二値化→粒子計測→ROI 再利用→保存/再読込を一つの headless journey で通せること、ならびに毎タスクの `VERIFY_ALL_OK` が履歴に残ることである。P3.10–P3.12 は互換性の拡張トラックとして、コアワークフローの parity を壊さない順序で進める。
