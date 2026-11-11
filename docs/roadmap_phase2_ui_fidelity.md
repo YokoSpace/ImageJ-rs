@@ -393,6 +393,7 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
   - `crates/ij-session/tests/oracle_parity.rs`
   - `crates/ij-app/src/action.rs`
   - `crates/ij-app/src/app/mod.rs`
+  - `crates/ij-app/src/app/shortcuts.rs`
   - `crates/ij-app/tests/action_model_test.rs`
 - **厳密な仕様**:
   1. `ij-core`: `ImageDocument::crop(&mut self) -> Result<(), CoreError>`
@@ -405,8 +406,10 @@ Point, Angle, Text, Dropper は `ij-core` に新しい ROI 型と計測規則が
   3. `ij-app`: `AppAction::Crop` を追加し、`IMAGE_MENU` の `unsupported("Crop", None)` を `item("Crop", Some("Shift+X"), AppAction::Crop)` に変更。`action_enabled` はアクティブ画像に面積 ROI があるときのみ `Ok(())`。
 - **先に書くテスト**:
   - `oracle_parity.rs`: (a) Gray8 単一画像 + 矩形 ROI で `run("Crop")` とピクセル・寸法・ROI クリアが一致、(b) Gray16 3スライススタック + 矩形 ROI で全スライスとラベルが一致、(c) 楕円 ROI で Crop 後に ROI が `(0, 0, w, h)` として残ること、(d) 校正付き画像の Crop 後の `pixel_width` / `pixel_height` がオラクルと一致すること、(e) Gray32・RGB・Color256 の画素一致。
-  - `action_model_test.rs`: ROI なし・線分 ROI では `action_enabled(AppAction::Crop)` が `Err`、矩形 ROI では `Ok`。
+  - `action_model_test.rs`: ROI なし・線分 ROI では `action_enabled(AppAction::Crop)` が `Err`、矩形 ROI では `Ok`。`Shift+X` で Crop が実行される。
+  - `ij-core` の単体テスト: Crop 後の Undo で寸法と画素が共に戻り、Crop 後に別の画像編集をした場合はその直前の画像が Undo される（`Undo.java:64-68, 161-163`）。
 - **受け入れ条件**: `./tools/verify.sh` が `VERIFY_ALL_OK`。
+- **現在の制限**: 画像外にはみ出す楕円・多角形 ROI を Crop すると、Java 1.54u は交差部分を `ShapeRoi`（`selectionType()==9`）として保持する。Rust の ROI モデルに `ShapeRoi` がない間は、誤った ROI を残さないようこのケースを明示的に拒否する。矩形 ROI の境界クリップは対応する。
 
 ---
 

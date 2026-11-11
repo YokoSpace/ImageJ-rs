@@ -244,7 +244,19 @@ impl ImageJApp {
                 match action {
                     BrightnessContrast if matches!(doc.plane(), PixelPlane::ColorRgb(_)) => Err("B&C is not supported on RGB images".into()),
                     Crop => match doc.roi.as_ref() {
-                        Some(roi) if roi.is_area() => Ok(()),
+                        Some(roi) if roi.is_area() => {
+                            let (x, y, w, h) = roi
+                                .clipped_bounds(doc.width, doc.height)
+                                .map_err(|_| "Selection is outside image".to_string())?;
+                            let (bx, by, bw, bh) = roi.bounds();
+                            let clipped = (i64::from(bx), i64::from(by), i64::from(bw), i64::from(bh))
+                                != (i64::from(x), i64::from(y), i64::from(w), i64::from(h));
+                            if !matches!(roi, ij_core::Roi::Rect(_)) && clipped {
+                                Err("Crop of clipped non-rectangular ROI requires ShapeRoi".into())
+                            } else {
+                                Ok(())
+                            }
+                        }
                         _ => Err("Area selection required".into()),
                     },
                     Threshold if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_)) || doc.stack_size() != 1 => Err("Threshold is only supported on single-slice 8-bit or 16-bit grayscale images".into()),

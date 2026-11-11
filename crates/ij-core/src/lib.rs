@@ -617,6 +617,10 @@ pub struct ImageDocument {
     pub threshold: Option<ThresholdLevels>,
     /// Undo snapshot of all pixel planes.
     pub snapshot: Option<Vec<PixelPlane>>,
+    /// Dimensions of the planes in `snapshot`. A transform can change image
+    /// dimensions, so restoring only its pixels would invalidate the document.
+    #[serde(default)]
+    pub snapshot_dimensions: Option<(u32, u32)>,
 }
 
 impl ImageDocument {
@@ -680,6 +684,7 @@ impl ImageDocument {
             roi: None,
             threshold: None,
             snapshot: None,
+            snapshot_dimensions: None,
         })
     }
 
@@ -1130,6 +1135,15 @@ impl ImageDocument {
         if width == 0 || height == 0 {
             return Err(CoreError::InvalidOperation("Selection is outside image"));
         }
+        let (bx, by, bw, bh) = roi.bounds();
+        let clipped_shape = (i64::from(bx), i64::from(by), i64::from(bw), i64::from(bh))
+            != (i64::from(x), i64::from(y), i64::from(width), i64::from(height));
+        if !matches!(roi, Roi::Rect(_)) && clipped_shape {
+            // Resizer.java 51-60 turns this intersection into a ShapeRoi.
+            return Err(CoreError::InvalidOperation(
+                "Crop of clipped non-rectangular ROI requires ShapeRoi",
+            ));
+        }
 
         // Undo.setup(Undo.TRANSFORM, imp) runs before the resize and only for
         // single-slice images (Resizer.java 145-146). Whole-stack filters
@@ -1138,6 +1152,7 @@ impl ImageDocument {
             self.save_snapshot();
         } else {
             self.snapshot = None;
+            self.snapshot_dimensions = None;
         }
 
         let source_width = self.width;
@@ -1170,11 +1185,26 @@ impl ImageDocument {
 
     pub fn save_snapshot(&mut self) {
         self.snapshot = Some(self.slices.clone());
+        self.snapshot_dimensions = Some((self.width, self.height));
     }
 
     pub fn undo(&mut self) -> bool {
         if let Some(prev) = self.snapshot.take() {
+            let dimensions = self
+                .snapshot_dimensions
+                .take()
+                .filter(|(width, height)| {
+                    let expected = (*width as usize).saturating_mul(*height as usize);
+                    prev.iter().all(|plane| plane.len() == expected)
+                })
+                .unwrap_or((self.width, self.height));
+            let expected = (dimensions.0 as usize).saturating_mul(dimensions.1 as usize);
+            if prev.iter().any(|plane| plane.len() != expected) {
+                return false;
+            }
             self.slices = prev;
+            self.width = dimensions.0;
+            self.height = dimensions.1;
             let size = self.slices.len().max(1) as u32;
             self.current_slice = self.current_slice.clamp(1, size);
             true
@@ -2317,6 +2347,51 @@ mod tests {
         assert_ne!(doc.plane(), &original);
         assert!(doc.undo());
         assert_eq!(doc.plane(), &original);
+    }
+
+    #[test]
+    fn undo_after_crop_restores_image_dimensions_with_pixels() {
+        // Undo.TRANSFORM restores the duplicate image's stack, including its
+        // dimensions (Undo.java 64-68, 161-163).
+        let mut doc = ImageDocument::new_ramp_8bit("crop", 8, 6).unwrap();
+        let original = doc.slices.clone();
+        doc.set_rect_roi(2, 1, 4, 3).unwrap();
+        doc.crop().unwrap();
+        assert_eq!((doc.width, doc.height), (4, 3));
+        assert!(doc.undo());
+        assert_eq!((doc.width, doc.height), (8, 6));
+        assert_eq!(doc.slices, original);
+        assert_eq!(doc.plane().len(), (doc.width * doc.height) as usize);
+    }
+
+    #[test]
+    fn a_later_pixel_edit_replaces_the_crop_undo_dimensions() {
+        let mut doc = ImageDocument::new_ramp_8bit("crop", 8, 6).unwrap();
+        doc.set_rect_roi(2, 1, 4, 3).unwrap();
+        doc.crop().unwrap();
+        let cropped = doc.slices.clone();
+        doc.display_range = DisplayRange { min: 20.0, max: 200.0 };
+        doc.apply_display_lut().unwrap();
+        assert!(doc.undo());
+        assert_eq!((doc.width, doc.height), (4, 3));
+        assert_eq!(doc.slices, cropped);
+    }
+
+    #[test]
+    fn crop_rejects_clipped_oval_until_shape_roi_is_representable() {
+        // Resizer.java 51-60 intersects an out-of-bounds oval with the image,
+        // producing ShapeRoi (oracle selectionType()==9). Our ROI model has
+        // no ShapeRoi, so preserving the original oval would be misleading.
+        let mut doc = ImageDocument::new_ramp_8bit("crop", 10, 8).unwrap();
+        doc.set_oval_roi(-2, 1, 6, 4).unwrap();
+        let before = doc.clone();
+        assert_eq!(
+            doc.crop(),
+            Err(CoreError::InvalidOperation(
+                "Crop of clipped non-rectangular ROI requires ShapeRoi"
+            ))
+        );
+        assert_eq!(doc, before);
     }
 
     #[test]

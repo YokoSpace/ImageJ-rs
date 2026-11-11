@@ -80,6 +80,14 @@ impl ImageJApp {
             return;
         }
 
+        // Crop: ImageJ's Image menu assigns Shift+X (Menus.java 181).
+        let crop = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::X));
+        if crop {
+            let _ = self.set_active_window(target_id);
+            self.perform(AppAction::Crop, ctx);
+            return;
+        }
+
         // Measure: M or Command/Ctrl+M (without Shift)
         let measure = ctx.input_mut(|i| {
             i.consume_key(egui::Modifiers::COMMAND, egui::Key::M)

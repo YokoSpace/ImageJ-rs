@@ -1,4 +1,4 @@
-use egui::Context;
+use egui::{Context, Event, Key, Modifiers, RawInput};
 use ij_app::ImageJApp;
 use ij_app::action::{AppAction, MENU_TREE};
 use ij_core::{ImageDocument, PixelPlane};
@@ -57,7 +57,7 @@ fn crop_requires_an_area_selection() {
     let mut app = ImageJApp::new();
     assert!(app.action_enabled(AppAction::Crop).is_err());
 
-    let _id = app.open_ramp_8bit("gray", 8, 6).unwrap();
+    let id = app.open_ramp_8bit("gray", 8, 6).unwrap();
     assert!(app.action_enabled(AppAction::Crop).is_err());
 
     app.session
@@ -92,6 +92,16 @@ fn crop_requires_an_area_selection() {
         })
         .unwrap();
     assert!(app.action_enabled(AppAction::Crop).is_ok());
+
+    app.session
+        .get_image_mut(id)
+        .unwrap()
+        .set_oval_roi(-2, 1, 6, 4)
+        .unwrap();
+    assert_eq!(
+        app.action_enabled(AppAction::Crop),
+        Err("Crop of clipped non-rectangular ROI requires ShapeRoi".into())
+    );
 }
 
 #[test]
@@ -136,4 +146,35 @@ fn image_menu_wires_crop_with_shift_x() {
         crop.kind,
         ij_app::action::MenuKind::Item(AppAction::Crop)
     ));
+}
+
+#[test]
+fn shift_x_crops_the_active_image() {
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("gray", 8, 6).unwrap();
+    app.session
+        .dispatch(ij_session::Command::MakeRectRoi {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        })
+        .unwrap();
+    let modifiers = Modifiers::SHIFT;
+    let input = RawInput {
+        modifiers,
+        events: vec![Event::Key {
+            key: Key::X,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }],
+        ..Default::default()
+    };
+    let ctx = Context::default();
+    let _ = ctx.run(input, |ctx| app.handle_image_shortcuts(ctx, id));
+    let doc = app.session.get_image(id).unwrap();
+    assert_eq!((doc.width, doc.height), (4, 3));
+    assert_eq!(app.session.macro_recorder.last().map(String::as_str), Some("run(\"Crop\");"));
 }
