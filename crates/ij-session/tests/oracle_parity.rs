@@ -9303,3 +9303,273 @@ fn crop_rejects_missing_line_and_outside_selections() {
         Err(CoreError::InvalidOperation("Selection is outside image"))
     );
 }
+
+/// ImageJ's ShortProcessor.setMinAndMax rounds the display range to integers
+/// (original_imagej/ij/process/ShortProcessor.java 267-277), so a 16-bit
+/// conversion sees rounded bounds even when the model stores fractions.
+fn convert_gray16_pattern(width: u32, height: u32) -> ImageDocument {
+    let mut pixels = vec![0u16; (width * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            pixels[(y * width + x) as usize] = ((x * 4099 + y * 1237) % 65536) as u16;
+        }
+    }
+    pixels[0] = 0;
+    pixels[1] = 65535;
+    pixels[2] = 1;
+    pixels[3] = 255;
+    pixels[4] = 256;
+    ImageDocument::new("convert16.tif", width, height, PixelPlane::Gray16(pixels)).unwrap()
+}
+
+/// The standard 3-3-2 RGB palette. ImageProcessor.isPseudoColorLut returns
+/// false for it (original_imagej/ij/process/ImageProcessor.java 351-386), so
+/// ImageJ converts indexed images with this LUT through RGB.
+fn rgb332_lut() -> Lut256 {
+    let mut lut = Lut256 {
+        r: Vec::with_capacity(256),
+        g: Vec::with_capacity(256),
+        b: Vec::with_capacity(256),
+    };
+    for i in 0..256u32 {
+        lut.r.push((((i >> 5) & 7) * 255 / 7) as u8);
+        lut.g.push((((i >> 2) & 7) * 255 / 7) as u8);
+        lut.b.push(((i & 3) * 255 / 3) as u8);
+    }
+    lut
+}
+
+fn assert_grayscale_lut(lut: &Lut256) {
+    for i in 0..=255u8 {
+        assert_eq!(lut.r[i as usize], i, "grayscale LUT red[{i}]");
+        assert_eq!(lut.g[i as usize], i, "grayscale LUT green[{i}]");
+        assert_eq!(lut.b[i as usize], i, "grayscale LUT blue[{i}]");
+    }
+}
+
+#[test]
+fn parity_convert_to_8bit_gray16_display_ranges_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (min, max) in [
+        (0.0, 65535.0),
+        (1000.0, 20000.0),
+        (1000.7, 20000.2),
+        (30000.0, 40000.0),
+    ] {
+        let mut doc = convert_gray16_pattern(8, 4);
+        doc.display_range = DisplayRange { min, max };
+        let oracle = bridge
+            .run_macro_on_image(&doc, "run(\"8-bit\");")
+            .unwrap();
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_8bit();
+        assert!(
+            matches!(doc.plane(), PixelPlane::Gray8(_)),
+            "16-bit conversion must produce 8-bit pixels"
+        );
+        assert_eq!(
+            doc.slices, oracle_doc.slices,
+            "16-bit pixels differ for display range {min}..{max}"
+        );
+        assert_eq!(
+            doc.display_range, oracle_doc.display_range,
+            "16-bit display range differs for {min}..{max}"
+        );
+    }
+}
+
+#[test]
+fn parity_convert_to_8bit_gray32_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0f32; 32];
+    for (i, value) in pixels.iter_mut().enumerate() {
+        *value = (i as f32 - 4.0) * 0.25;
+    }
+    pixels[0] = -100.0;
+    pixels[1] = 100.0;
+    pixels[2] = 0.0;
+    pixels[3] = 0.5;
+    for (min, max) in [(-1.0, 1.0), (0.0, 1.0), (0.25, 0.75), (0.1, 1.1)] {
+        let mut doc =
+            ImageDocument::new("convert32.tif", 8, 4, PixelPlane::Gray32(pixels.clone())).unwrap();
+        doc.display_range = DisplayRange { min, max };
+        let oracle = bridge
+            .run_macro_on_image(&doc, "run(\"8-bit\");")
+            .unwrap();
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_8bit();
+        assert_eq!(
+            doc.slices, oracle_doc.slices,
+            "32-bit pixels differ for display range {min}..{max}"
+        );
+        assert_eq!(doc.display_range, oracle_doc.display_range);
+    }
+}
+
+#[test]
+fn parity_convert_to_8bit_rgb_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut pixels = vec![0u32; 32];
+    for (i, pixel) in pixels.iter_mut().enumerate() {
+        let r = (i * 37) % 256;
+        let g = (i * 53 + 7) % 256;
+        let b = (i * 97 + 11) % 256;
+        *pixel = 0xff00_0000 | ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+    }
+    pixels[0] = 0x00ff_0000;
+    pixels[1] = 0x0000_ff00;
+    pixels[2] = 0x0000_00ff;
+    pixels[3] = 0x00ff_ffff;
+    let mut doc =
+        ImageDocument::new("convert_rgb.tif", 8, 4, PixelPlane::ColorRgb(pixels)).unwrap();
+
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"8-bit\");")
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_8bit();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+}
+
+#[test]
+fn parity_convert_to_8bit_indexed_color_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let pixels: Vec<u8> = (0..32).map(|i| ((i * 13) % 256) as u8).collect();
+    for (name, lut, keep_indices) in [
+        ("pseudo-color", Lut256::default(), true),
+        ("3-3-2 RGB", rgb332_lut(), false),
+    ] {
+        let mut doc = ImageDocument::new(
+            format!("convert_{name}.tif"),
+            8,
+            4,
+            PixelPlane::Color256 {
+                pixels: pixels.clone(),
+                lut: Box::new(lut.clone()),
+            },
+        )
+        .unwrap();
+        let oracle = bridge
+            .run_macro_on_image(&doc, "run(\"8-bit\");")
+            .unwrap();
+        let oracle_doc = oracle
+            .output_image
+            .expect("oracle must return saved TIFF");
+
+        doc.convert_to_8bit();
+        let PixelPlane::Gray8(out) = doc.plane() else {
+            panic!("{name}: expected Gray8 after conversion, got {:?}", doc.plane());
+        };
+        let oracle_pixels = match oracle_doc.plane() {
+            PixelPlane::Gray8(v) => v.clone(),
+            PixelPlane::Color256 { pixels, lut } => {
+                // ImageConverter.java 42-45 keeps the Color256 image type but
+                // swaps in a grayscale LUT, so the saved TIFF still carries
+                // 8bitcolor=true.
+                assert_grayscale_lut(lut);
+                pixels.clone()
+            }
+            other => panic!("{name}: unexpected oracle plane {other:?}"),
+        };
+        assert_eq!(out, &oracle_pixels, "{name}: 8-bit pixels differ");
+        if keep_indices {
+            assert_eq!(out, &pixels, "{name}: pseudo-color indices must be kept");
+        } else {
+            assert_ne!(out, &pixels, "{name}: indexed color must go through RGB");
+        }
+        assert_eq!(doc.display_range, oracle_doc.display_range, "{name}: display range");
+    }
+}
+
+#[test]
+fn parity_convert_to_8bit_gray16_stack_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = distinct_stack_16bit(8, 6, 3);
+    doc.display_range = DisplayRange {
+        min: 500.0,
+        max: 40000.0,
+    };
+    doc.slice_labels = vec![
+        Some("first".into()),
+        Some("second".into()),
+        Some("third".into()),
+    ];
+
+    let oracle = bridge
+        .run_macro_on_image(
+            &doc,
+            "Property.setSliceLabel(\"first\",1); Property.setSliceLabel(\"second\",2); \
+             Property.setSliceLabel(\"third\",3); run(\"8-bit\");",
+        )
+        .unwrap();
+    let oracle_doc = oracle
+        .output_image
+        .expect("oracle must return saved TIFF");
+
+    doc.convert_to_8bit();
+    assert_eq!(doc.slices, oracle_doc.slices);
+    assert_eq!(doc.display_range, oracle_doc.display_range);
+    assert_eq!(doc.slice_labels, oracle_doc.slice_labels);
+    assert_eq!(doc.current_slice, oracle_doc.current_slice);
+}
+
+#[test]
+fn session_convert_to_8bit_records_macro_and_clears_threshold() {
+    let mut doc = convert_gray16_pattern(4, 2);
+    doc.display_range = DisplayRange {
+        min: 0.0,
+        max: 65535.0,
+    };
+    doc.threshold = Some(ThresholdLevels {
+        lower: 10.0,
+        upper: 20.0,
+    });
+    let mut session = Session::new();
+    session.insert_doc(doc);
+    session.macro_recorder.clear();
+
+    session.dispatch(Command::ConvertTo8Bit).unwrap();
+
+    let doc = session.active_doc().unwrap();
+    assert!(matches!(doc.plane(), PixelPlane::Gray8(_)));
+    assert_eq!(doc.display_range, DisplayRange { min: 0.0, max: 255.0 });
+    assert_eq!(
+        doc.threshold, None,
+        "Converter.java 55-56 resets the threshold before converting"
+    );
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"8-bit\");".to_string()],
+        "8-bit must record exactly one macro line without a trailing newline"
+    );
+}
+
+#[test]
+fn convert_to_8bit_is_a_noop_for_gray8() {
+    let mut doc = ImageDocument::new_ramp_8bit("already8.tif", 4, 3).unwrap();
+    doc.display_range = DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    let before = doc.slices.clone();
+    doc.convert_to_8bit();
+    assert_eq!(doc.slices, before);
+    assert_eq!(
+        doc.display_range,
+        DisplayRange {
+            min: 10.0,
+            max: 200.0
+        },
+        "ImageConverter.java 42-45 only swaps the LUT for 8-bit images"
+    );
+}

@@ -581,6 +581,86 @@ fn default_display_range(plane: &PixelPlane) -> DisplayRange {
     }
 }
 
+/// Java's `(int)Math.round(double)`: `floor(value + 0.5)` narrowed through a
+/// long, with NaN mapping to 0 like the JVM cast.
+fn java_round_to_i32(value: f64) -> i32 {
+    ((value + 0.5).floor() as i64) as i32
+}
+
+/// TypeConverter.convertShortToByte (TypeConverter.java 49-63) with scaling.
+fn short_to_byte(pixel: u16, min: i32, scale: f64) -> u8 {
+    let mut value = i32::from(pixel).wrapping_sub(min);
+    if value < 0 {
+        value = 0;
+    }
+    let scaled = (f64::from(value) * scale + 0.5) as i32;
+    if scaled > 255 {
+        255
+    } else {
+        // Java casts to byte, which wraps negative results.
+        scaled as u8
+    }
+}
+
+/// FloatProcessor.create8BitImage (FloatProcessor.java 190-208).
+fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
+    let mut value = f64::from(pixel) - min;
+    if value < 0.0 {
+        value = 0.0;
+    }
+    let scaled = (value * scale + 0.5) as i32;
+    if scaled > 255 {
+        255
+    } else {
+        scaled as u8
+    }
+}
+
+/// TypeConverter.convertRGBToByte (TypeConverter.java 95-117) with
+/// ColorProcessor's default equal weights (ColorProcessor.java 26).
+fn rgb_to_byte(pixel: u32) -> u8 {
+    let r = f64::from((pixel >> 16) & 0xff);
+    let g = f64::from((pixel >> 8) & 0xff);
+    let b = f64::from(pixel & 0xff);
+    let weight = 1.0 / 3.0;
+    (r * weight + g * weight + b * weight + 0.5) as u8
+}
+
+fn lut_rgb(lut: &Lut256, index: u8) -> u32 {
+    let i = index as usize;
+    (u32::from(lut.r[i]) << 16) | (u32::from(lut.g[i]) << 8) | u32::from(lut.b[i])
+}
+
+/// ImageProcessor.isPseudoColorLut (ImageProcessor.java 351-386). The active
+/// threshold case cannot occur because `Converter.java 55-56` resets it first.
+fn is_pseudo_color_lut(lut: &Lut256) -> bool {
+    let mut r2 = i32::from(lut.r[0]);
+    let mut g2 = i32::from(lut.g[0]);
+    let mut b2 = i32::from(lut.b[0]);
+    let mut sum = 0.0;
+    let mut sum2 = 0.0;
+    for i in 0..256 {
+        let r = i32::from(lut.r[i]);
+        let g = i32::from(lut.g[i]);
+        let b = i32::from(lut.b[i]);
+        for (value, previous) in [(r, r2), (g, g2), (b, b2)] {
+            let d = f64::from(value - previous);
+            sum += d;
+            sum2 += d * d;
+        }
+        r2 = r;
+        g2 = g;
+        b2 = b;
+    }
+    let mut std_dev = (768.0 * sum2 - sum * sum) / 768.0;
+    if std_dev > 0.0 {
+        std_dev = (std_dev / 767.0).sqrt();
+    } else {
+        std_dev = 0.0;
+    }
+    std_dev < 20.0 || std_dev as i32 == 67
+}
+
 /// The lower/upper levels of `ImageProcessor.minThreshold`/`maxThreshold`
 /// (original_imagej/ij/process/ImageProcessor.java lines 31-33). Thresholding
 /// never rewrites pixels; only this state (and the display LUT in ImageJ) is
@@ -1181,6 +1261,171 @@ impl ImageDocument {
             Roi::Line(_) => unreachable!("line ROIs are rejected above"),
         };
         Ok(())
+    }
+
+    /// Converts every plane to 8-bit grayscale, matching `Image > Type > 8-bit`
+    /// with `doScaling = true` and `Prefs.calibrateConversions = false`.
+    /// `Converter.java 38-39` sends single images to
+    /// `ImageConverter.convertToGray8` (ImageConverter.java 24-55) and stacks
+    /// to `StackConverter.convertToGray8` (StackConverter.java 26-122).
+    pub fn convert_to_8bit(&mut self) {
+        // Converter.java 55-56 resets the threshold before converting.
+        self.threshold = None;
+        if self.slices.len() > 1 {
+            self.convert_stack_to_8bit();
+            return;
+        }
+        // Undo.setup(Undo.TYPE_CONVERSION, imp) runs for single images only
+        // (Converter.java 100-101).
+        self.save_snapshot();
+        let (converted, new_processor) = match self.slices[0].clone() {
+            PixelPlane::Gray8(pixels) => {
+                // ImageConverter.java 42-45: the default 8-bit LUT is
+                // pseudo-color, so ImageJ only swaps in an identical grayscale
+                // LUT and keeps the display range.
+                (PixelPlane::Gray8(pixels), false)
+            }
+            PixelPlane::Gray16(pixels) => {
+                // ShortProcessor.setMinAndMax rounds the display range
+                // (ShortProcessor.java 272-273); convertShortToByte then
+                // truncates the already integral bounds (TypeConverter.java 54).
+                let min = java_round_to_i32(self.display_range.min);
+                let max = java_round_to_i32(self.display_range.max);
+                let scale = 256.0 / f64::from(max.wrapping_sub(min).wrapping_add(1));
+                (
+                    PixelPlane::Gray8(
+                        pixels
+                            .iter()
+                            .map(|&px| short_to_byte(px, min, scale))
+                            .collect(),
+                    ),
+                    true,
+                )
+            }
+            PixelPlane::Gray32(pixels) => {
+                // FloatProcessor.setMinAndMax stores the bounds as float
+                // (FloatProcessor.java 128-129).
+                let min = f64::from(self.display_range.min as f32);
+                let max = f64::from(self.display_range.max as f32);
+                let scale = 255.0 / (max - min);
+                (
+                    PixelPlane::Gray8(
+                        pixels
+                            .iter()
+                            .map(|&px| float_to_byte(px, min, scale))
+                            .collect(),
+                    ),
+                    true,
+                )
+            }
+            PixelPlane::ColorRgb(pixels) => (
+                PixelPlane::Gray8(pixels.iter().map(|&px| rgb_to_byte(px)).collect()),
+                true,
+            ),
+            PixelPlane::Color256 { pixels, lut } => {
+                if is_pseudo_color_lut(&lut) {
+                    // ImageConverter.java 42-45 keeps the indices and swaps in
+                    // a grayscale LUT.
+                    (PixelPlane::Gray8(pixels), false)
+                } else {
+                    // ImageConverter.java 46-49 builds a ColorProcessor from
+                    // the LUT and converts with the equal-weight RGB formula.
+                    (
+                        PixelPlane::Gray8(
+                            pixels
+                                .iter()
+                                .map(|&index| rgb_to_byte(lut_rgb(&lut, index)))
+                                .collect(),
+                        ),
+                        true,
+                    )
+                }
+            }
+        };
+        self.slices[0] = converted;
+        if new_processor {
+            // A new ByteProcessor starts with the default 0..255 range.
+            self.display_range = DisplayRange {
+                min: 0.0,
+                max: 255.0,
+            };
+        }
+    }
+
+    fn convert_stack_to_8bit(&mut self) {
+        // A whole-stack type conversion does not create an Undo buffer, and
+        // ImageJ's Undo is a no-op afterwards (measured with the 1.54u oracle).
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+
+        let current = self.current_slice_index();
+        let color256 = matches!(self.slices[current], PixelPlane::Color256 { .. });
+        if color256 {
+            // StackConverter.java 40-44 sends COLOR_256 stacks to
+            // convertRGBToGray8 (93-122), even when the LUT is pseudo-color.
+            for plane in &mut self.slices {
+                if let PixelPlane::Color256 { pixels, lut } = plane {
+                    let converted = pixels
+                        .iter()
+                        .map(|&index| rgb_to_byte(lut_rgb(lut, index)))
+                        .collect();
+                    *plane = PixelPlane::Gray8(converted);
+                }
+            }
+            self.display_range = DisplayRange {
+                min: 0.0,
+                max: 255.0,
+            };
+            return;
+        }
+
+        // StackConverter.java 55-56 reads min/max from the current processor
+        // and applies them to every slice (line 70).
+        let min16 = java_round_to_i32(self.display_range.min);
+        let max16 = java_round_to_i32(self.display_range.max);
+        let scale16 = 256.0 / f64::from(max16.wrapping_sub(min16).wrapping_add(1));
+        let min32 = f64::from(self.display_range.min as f32);
+        let max32 = f64::from(self.display_range.max as f32);
+        let scale32 = 255.0 / (max32 - min32);
+
+        let all_gray8 = self
+            .slices
+            .iter()
+            .all(|plane| matches!(plane, PixelPlane::Gray8(_)));
+        self.slices = self
+            .slices
+            .iter()
+            .map(|plane| match plane {
+                // A ByteProcessor converts to itself (TypeConverter.java 35-36).
+                PixelPlane::Gray8(pixels) => PixelPlane::Gray8(pixels.clone()),
+                PixelPlane::Gray16(pixels) => PixelPlane::Gray8(
+                    pixels
+                        .iter()
+                        .map(|&px| short_to_byte(px, min16, scale16))
+                        .collect(),
+                ),
+                PixelPlane::Gray32(pixels) => PixelPlane::Gray8(
+                    pixels
+                        .iter()
+                        .map(|&px| float_to_byte(px, min32, scale32))
+                        .collect(),
+                ),
+                PixelPlane::ColorRgb(pixels) => {
+                    PixelPlane::Gray8(pixels.iter().map(|&px| rgb_to_byte(px)).collect())
+                }
+                PixelPlane::Color256 { .. } => {
+                    unreachable!("COLOR_256 stacks are handled above")
+                }
+            })
+            .collect();
+        if !all_gray8 {
+            // StackConverter.java 77-78 does not set a display range, so the
+            // new ByteProcessors keep their default 0..255.
+            self.display_range = DisplayRange {
+                min: 0.0,
+                max: 255.0,
+            };
+        }
     }
 
     pub fn save_snapshot(&mut self) {
@@ -2347,6 +2592,42 @@ mod tests {
         assert_ne!(doc.plane(), &original);
         assert!(doc.undo());
         assert_eq!(doc.plane(), &original);
+    }
+
+    #[test]
+    fn convert_to_8bit_float_uses_create8bitimage_edge_cases() {
+        // FloatProcessor.create8BitImage (FloatProcessor.java 190-208) clamps
+        // negative values and relies on Java's (int) cast, which maps NaN to 0
+        // and +Infinity to Integer.MAX_VALUE.
+        let mut doc = ImageDocument::new(
+            "float-edge",
+            4,
+            1,
+            PixelPlane::Gray32(vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.5]),
+        )
+        .unwrap();
+        doc.display_range = DisplayRange {
+            min: 0.0,
+            max: 1.0,
+        };
+        doc.convert_to_8bit();
+        assert_eq!(doc.plane(), &PixelPlane::Gray8(vec![0, 255, 0, 128]));
+
+        // max == min makes scale infinite: pixels equal to min become
+        // 0*Infinity = NaN (0), pixels above min become 255.
+        let mut degenerate = ImageDocument::new(
+            "float-degenerate",
+            3,
+            1,
+            PixelPlane::Gray32(vec![4.0, 5.0, 6.0]),
+        )
+        .unwrap();
+        degenerate.display_range = DisplayRange {
+            min: 5.0,
+            max: 5.0,
+        };
+        degenerate.convert_to_8bit();
+        assert_eq!(degenerate.plane(), &PixelPlane::Gray8(vec![0, 0, 255]));
     }
 
     #[test]

@@ -178,3 +178,65 @@ fn shift_x_crops_the_active_image() {
     assert_eq!((doc.width, doc.height), (4, 3));
     assert_eq!(app.session.macro_recorder.last().map(String::as_str), Some("run(\"Crop\");"));
 }
+
+#[test]
+fn image_type_menu_wires_8bit() {
+    let image = MENU_TREE
+        .iter()
+        .find(|node| node.label == "Image")
+        .expect("Image menu");
+    let ij_app::action::MenuKind::Submenu(nodes) = image.kind else {
+        panic!("Image must be a submenu");
+    };
+    let type_menu = nodes
+        .iter()
+        .find(|node| node.label == "Type")
+        .expect("Type submenu");
+    let ij_app::action::MenuKind::Submenu(type_nodes) = type_menu.kind else {
+        panic!("Type must be a submenu");
+    };
+    let eight_bit = type_nodes
+        .iter()
+        .find(|node| node.label == "8-bit")
+        .expect("8-bit item");
+    assert!(matches!(
+        eight_bit.kind,
+        ij_app::action::MenuKind::Item(AppAction::ConvertTo8Bit)
+    ));
+}
+
+#[test]
+fn convert_to_8bit_action_requires_an_image_and_converts_it() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::ConvertTo8Bit).is_err());
+
+    let doc = ImageDocument::new(
+        "gray16",
+        4,
+        2,
+        PixelPlane::Gray16(vec![0, 65535, 1000, 2000, 3000, 4000, 5000, 6000]),
+    )
+    .unwrap();
+    let id = app.session.insert_doc(doc);
+    app.session.get_image_mut(id).unwrap().display_range = ij_core::DisplayRange {
+        min: 0.0,
+        max: 65535.0,
+    };
+    assert!(app.action_enabled(AppAction::ConvertTo8Bit).is_ok());
+
+    app.perform(AppAction::ConvertTo8Bit, &Context::default());
+
+    let doc = app.session.get_image(id).unwrap();
+    assert!(matches!(doc.plane(), PixelPlane::Gray8(_)));
+    assert_eq!(
+        doc.display_range,
+        ij_core::DisplayRange {
+            min: 0.0,
+            max: 255.0
+        }
+    );
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"8-bit\");")
+    );
+}

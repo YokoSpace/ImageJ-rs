@@ -139,6 +139,9 @@ pub enum Command {
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
+    /// `run("8-bit")` (Converter.java 38-39). Converts every slice to 8-bit
+    /// grayscale with scaling enabled and records `run("8-bit");`.
+    ConvertTo8Bit,
     Smooth,
     Sharpen,
     FindEdges,
@@ -723,6 +726,12 @@ impl Session {
                 self.active_doc_mut()?.crop()?;
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"Crop\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::ConvertTo8Bit => {
+                self.active_doc_mut()?.convert_to_8bit();
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"8-bit\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Smooth => {

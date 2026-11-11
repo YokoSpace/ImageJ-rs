@@ -15,6 +15,7 @@ pub enum AppAction {
     Undo,
     Invert,
     Crop,
+    ConvertTo8Bit,
     SelectNone,
     BrightnessContrast,
     Threshold,
@@ -128,10 +129,16 @@ const IMAGE_ADJUST: &[MenuNode] = &[
     item("Threshold...", None, AppAction::Threshold),
 ];
 const IMAGE_STACKS: &[MenuNode] = &[item("Invert Stack", None, AppAction::InvertStack)];
+const IMAGE_TYPE: &[MenuNode] = &[
+    item("8-bit", None, AppAction::ConvertTo8Bit),
+    unsupported("16-bit", None),
+    unsupported("32-bit", None),
+    unsupported("RGB Color", None),
+];
 const IMAGE_MENU: &[MenuNode] = &[
     submenu("Adjust", IMAGE_ADJUST),
     submenu("Stacks", IMAGE_STACKS),
-    unsupported("Type > 8-bit", None),
+    submenu("Type", IMAGE_TYPE),
     unsupported("Duplicate...", None),
     item("Crop", Some("Shift+X"), AppAction::Crop),
 ];
@@ -323,6 +330,9 @@ impl ImageJApp {
             }
             Crop => {
                 let _ = self.crop_active();
+            }
+            ConvertTo8Bit => {
+                let _ = self.convert_to_8bit_active();
             }
             SelectNone => {
                 let _ = self.clear_roi();
