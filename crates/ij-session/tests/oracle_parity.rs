@@ -10373,6 +10373,102 @@ fn parity_duplicate_default_title_matches_java_oracle() {
     assert_eq!(oracle_duplicate_field(&stdout, "DUP_TITLE:"), "ramp-1");
 }
 
+#[test]
+fn session_duplicate_opens_activates_and_records_duplicate_macro() {
+    let source = ImageDocument::new_ramp_8bit("session_dup.tif", 10, 8).unwrap();
+    let path = temp_tiff("session_dup.tif");
+    save_tiff(&path, &source).unwrap();
+    let mut session = Session::new();
+    session.dispatch(Command::OpenTiff { path }).unwrap();
+    let source_id = session.active_image_id().unwrap();
+    session.macro_recorder.clear();
+
+    let outcome = session
+        .dispatch(Command::Duplicate {
+            title: None,
+            duplicate_stack: false,
+            first_slice: None,
+            last_slice: None,
+        })
+        .unwrap();
+    let new_id = match outcome {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("expected ImageOpened, got {other:?}"),
+    };
+    assert_eq!(session.active_image_id(), Some(new_id));
+    assert_ne!(new_id, source_id);
+    assert_eq!(
+        session.get_image(new_id).unwrap().title,
+        "session_dup-1.tif"
+    );
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"Duplicate...\", \"title=session_dup-1.tif\");".to_string()]
+    );
+
+    session
+        .dispatch(Command::Duplicate {
+            title: None,
+            duplicate_stack: false,
+            first_slice: None,
+            last_slice: None,
+        })
+        .unwrap();
+    assert_eq!(
+        session.get_image(new_id).unwrap().title,
+        "session_dup-1.tif"
+    );
+    assert_eq!(
+        session.active_doc().unwrap().title,
+        "session_dup-2.tif"
+    );
+    assert_eq!(
+        session.macro_recorder[1],
+        "run(\"Duplicate...\", \"title=session_dup-2.tif\");"
+    );
+}
+
+#[test]
+fn session_duplicate_range_uses_java_recorder_options() {
+    let mut source = duplicate_stack_input();
+    source.title = "session_stack.tif".to_string();
+    let path = temp_tiff("session_stack.tif");
+    save_tiff(&path, &source).unwrap();
+    let mut session = Session::new();
+    session.dispatch(Command::OpenTiff { path }).unwrap();
+    session.macro_recorder.clear();
+
+    let outcome = session
+        .dispatch(Command::Duplicate {
+            title: Some("range-dup".to_string()),
+            duplicate_stack: true,
+            first_slice: Some(2),
+            last_slice: Some(3),
+        })
+        .unwrap();
+    let new_id = match outcome {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("expected ImageOpened, got {other:?}"),
+    };
+    let doc = session.get_image(new_id).unwrap();
+    assert_eq!(doc.title, "range-dup");
+    assert_eq!(doc.get_dimensions(), [8, 6, 1, 2, 1]);
+    assert_eq!(doc.current_slice, 1);
+    assert_eq!(
+        doc.slices,
+        source.slices[1..3].to_vec(),
+        "range duplicate must copy only slices 2-3"
+    );
+    assert_eq!(doc.slice_labels, source.slice_labels[1..3].to_vec());
+    // GenericDialog records the Title field, then the Duplicate stack
+    // checkbox ("Duplicate stack" -> "duplicate"), then Range (Duplicator.java
+    // 483-527; Recorder.trimKey strips at the first space/colon).
+    assert_eq!(
+        session.macro_recorder,
+        vec!["run(\"Duplicate...\", \"title=range-dup duplicate range=2-3\");".to_string()]
+    );
+}
+
 /// ImageJ's ShortProcessor.setMinAndMax rounds the display range to integers
 /// (original_imagej/ij/process/ShortProcessor.java 267-277), so a 16-bit
 /// conversion sees rounded bounds even when the model stores fractions.

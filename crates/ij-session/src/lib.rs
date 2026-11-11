@@ -5,8 +5,9 @@ pub use ij_bridge::plugin::{
     PluginBridge, PluginBridgeError, PluginFilterInputError, PluginFilterRequest, PluginFilterRun,
 };
 use ij_core::{
-    display_histogram, CoreError, DisplayRange, ImageDocument, MeasurementConfig, MeasurementFlags,
-    MeasurementSummary, PixelPlane, ResultsTable, ThresholdLevels,
+    default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
+    MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ResultsTable,
+    ThresholdLevels,
 };
 use ij_io::{IoError, load_tiff, save_tiff};
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,17 @@ pub enum Command {
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
+    /// `Image > Duplicate...` (Duplicator.java 36-135). `title: None` asks
+    /// for a `WindowManager.getUniqueName`-style title; an explicit title is
+    /// used verbatim. `duplicate_stack` copies the whole stack or the
+    /// `first_slice`..=`last_slice` range (inclusive), otherwise only the
+    /// current slice is copied.
+    Duplicate {
+        title: Option<String>,
+        duplicate_stack: bool,
+        first_slice: Option<u32>,
+        last_slice: Option<u32>,
+    },
     /// `run("8-bit")` (Converter.java 38-39). Converts every slice to 8-bit
     /// grayscale with scaling enabled and records `run("8-bit");`.
     ConvertTo8Bit,
@@ -252,6 +264,16 @@ pub struct HistogramSummary {
     pub min: f64,
     pub max: f64,
     pub mode: f64,
+}
+
+/// Recorder.addQuotes (original_imagej/ij/plugin/frame/Recorder.java 773-780)
+/// wraps option values containing spaces in square brackets.
+fn macro_option_value(value: &str) -> String {
+    if value.contains(' ') {
+        format!("[{value}]")
+    } else {
+        value.to_string()
+    }
 }
 
 fn measurement_macro_options(config: MeasurementConfig) -> String {
@@ -793,6 +815,59 @@ impl Session {
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"Crop\");".into());
                 Ok(CommandOutcome::Updated)
+            }
+            Command::Duplicate {
+                title,
+                duplicate_stack,
+                first_slice,
+                last_slice,
+            } => {
+                let source_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let (new_doc, options) = {
+                    let source = self
+                        .images
+                        .get(&source_id)
+                        .ok_or(SessionError::NoActiveImage)?;
+                    let existing_titles: Vec<&str> =
+                        self.images.values().map(|doc| doc.title.as_str()).collect();
+                    let resolved = title
+                        .unwrap_or_else(|| default_duplicate_title(&existing_titles, &source.title));
+                    let stack_size = source.stack_size() as u32;
+                    // Duplicator.showDialog defaults an empty Range field to
+                    // 1..stackSize and clamps typed values (Duplicator.java
+                    // 530-558).
+                    let range = if duplicate_stack {
+                        let mut first = first_slice.unwrap_or(1).max(1);
+                        let mut last = last_slice.unwrap_or(stack_size).min(stack_size);
+                        if first > last {
+                            first = 1;
+                            last = stack_size;
+                        }
+                        Some((first, last))
+                    } else {
+                        None
+                    };
+                    let new_doc = source.duplicate(resolved.clone(), duplicate_stack, range)?;
+                    // GenericDialog records Title, then the "Duplicate stack"
+                    // checkbox key ("duplicate"), then Range (Recorder.java
+                    // 472-480, trimKey at 545-553). A full-stack range equals
+                    // the unchanged Range default, so smart recording omits it.
+                    let mut options = format!("title={}", macro_option_value(&resolved));
+                    if duplicate_stack && stack_size > 1 {
+                        options.push_str(" duplicate");
+                        if let Some((first, last)) = range {
+                            if first != 1 || last != stack_size {
+                                options.push_str(&format!(" range={first}-{last}"));
+                            }
+                        }
+                    }
+                    (new_doc, options)
+                };
+                let new_id = self.insert_doc(new_doc);
+                self.dirty_images.insert(new_id);
+                self.macro_recorder
+                    .push(format!("run(\"Duplicate...\", \"{options}\");"));
+                Ok(CommandOutcome::ImageOpened(new_id))
             }
             Command::ConvertTo8Bit => {
                 self.active_doc_mut()?.convert_to_8bit();
