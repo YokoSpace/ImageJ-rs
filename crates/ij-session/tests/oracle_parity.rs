@@ -613,6 +613,111 @@ fn parity_analyze_particles_clips_connected_particle_to_source_roi() {
 }
 
 #[test]
+fn parity_analyze_particles_discards_full_image_oval_selection() {
+    let source = ImageDocument::new("full-oval-particle", 8, 8, PixelPlane::Gray8(vec![255; 64])).unwrap();
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&source, r#"
+        makeOval(0,0,8,8); setThreshold(255,255);
+        run("Set Measurements...", "area mean redirect=None decimal=3");
+        run("Analyze Particles...", "size=0-Infinity circularity=0.00-1.00 show=Nothing display clear");
+        print("COUNT="+nResults); print("AREA="+getResult("Area",0));
+        print("SELECTION="+selectionType());
+    "#).unwrap();
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    session.dispatch(Command::MakeOvalRoi { x: 0, y: 0, width: 8, height: 8 }).unwrap();
+    session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+    let selected = session.active_doc().unwrap().clone();
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions::default(), clear_results: true,
+        add_to_manager: false, summarize: false,
+    }).unwrap();
+    let count = practical_workflow_field(&java.stdout, "COUNT=").parse::<usize>().unwrap();
+    let area = practical_workflow_field(&java.stdout, "AREA=").parse::<f64>().unwrap();
+    assert_eq!(session.results.rows.len(), count);
+    assert_eq!(session.results.rows[0].area, area);
+    assert_eq!(practical_workflow_field(&java.stdout, "SELECTION="), "-1");
+    assert!(session.active_doc().unwrap().roi.is_none());
+    assert_eq!(session.active_doc().unwrap().slices, source.slices);
+    let direct = selected.analyze_particles(ParticleAnalysisOptions::default(), MeasurementConfig::default()).unwrap();
+    assert_eq!(direct.len(), count);
+    assert_eq!(direct[0].measurement.area, area);
+}
+
+#[test]
+fn parity_analyze_particles_excludes_curved_source_roi_edges() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (x, y) in [(3, 3), (10, 10), (6, 6)] {
+        let mut pixels = vec![0_u8; 14 * 14];
+        pixels[y * 14 + x] = 255;
+        let source = ImageDocument::new("oval-edge-particle", 14, 14, PixelPlane::Gray8(pixels)).unwrap();
+        for exclude_on_edges in [false, true] {
+            let exclude = if exclude_on_edges { " exclude" } else { "" };
+            let java = bridge.run_macro_on_image(&source, &format!(r#"
+                makeOval(2,2,10,10); setThreshold(255,255);
+                run("Set Measurements...", "area mean redirect=None decimal=3");
+                run("Analyze Particles...", "size=0-Infinity circularity=0.00-1.00 show=Nothing display clear{exclude}");
+                print("COUNT="+nResults); print("SELECTION="+selectionType());
+            "#)).unwrap();
+            let mut session = Session::new();
+            session.insert_doc(source.clone());
+            session.dispatch(Command::MakeOvalRoi { x: 2, y: 2, width: 10, height: 10 }).unwrap();
+            let selection = session.active_doc().unwrap().roi.clone();
+            session.dispatch(Command::SetThreshold { lower: 255.0, upper: 255.0 }).unwrap();
+            session.dispatch(Command::AnalyzeParticles {
+                options: ParticleAnalysisOptions { exclude_on_edges, ..Default::default() },
+                clear_results: true, add_to_manager: false, summarize: false,
+            }).unwrap();
+            assert_eq!(
+                session.results.rows.len(),
+                practical_workflow_field(&java.stdout, "COUNT=").parse::<usize>().unwrap(),
+                "seed=({x},{y}), exclude={exclude_on_edges}"
+            );
+            assert_eq!(practical_workflow_field(&java.stdout, "SELECTION="), "1");
+            assert_eq!(session.active_doc().unwrap().roi, selection);
+            assert_eq!(session.active_doc().unwrap().slices, source.slices);
+        }
+    }
+}
+
+#[test]
+fn parity_analyze_particles_binary_validation_uses_source_roi() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (selection, command, masked_corner) in [
+        ("makeRectangle(3,3,3,3);", Command::MakeRectRoi { x: 3, y: 3, width: 3, height: 3 }, false),
+        ("makeOval(3,3,4,4);", Command::MakeOvalRoi { x: 3, y: 3, width: 4, height: 4 }, true),
+    ] {
+        let mut pixels = vec![0_u8; 10 * 10];
+        pixels[0] = 128;
+        pixels[4 * 10 + 4] = 255;
+        if masked_corner {
+            pixels[3 * 10 + 3] = 128;
+        }
+        let source = ImageDocument::new("selected-binary-particle", 10, 10, PixelPlane::Gray8(pixels)).unwrap();
+        let java = bridge.run_macro_on_image(&source, &format!(r#"
+            setOption("BlackBackground",true); {selection}
+            run("Set Measurements...", "area mean redirect=None decimal=3");
+            run("Analyze Particles...", "size=0-Infinity circularity=0.00-1.00 show=Nothing display clear");
+            print("COUNT="+nResults); print("AREA="+getResult("Area",0));
+            print("MEAN="+getResult("Mean",0));
+        "#)).unwrap();
+        let mut session = Session::new();
+        session.insert_doc(source.clone());
+        session.dispatch(command).unwrap();
+        let selection = session.active_doc().unwrap().roi.clone();
+        session.dispatch(Command::AnalyzeParticles {
+            options: ParticleAnalysisOptions::default(), clear_results: true,
+            add_to_manager: false, summarize: false,
+        }).unwrap();
+        assert_eq!(session.results.rows.len(), practical_workflow_field(&java.stdout, "COUNT=").parse::<usize>().unwrap());
+        assert_eq!(session.results.rows[0].area, practical_workflow_field(&java.stdout, "AREA=").parse::<f64>().unwrap());
+        assert_eq!(session.results.rows[0].mean, practical_workflow_field(&java.stdout, "MEAN=").parse::<f64>().unwrap());
+        assert_eq!(session.active_doc().unwrap().roi, selection);
+        assert_eq!(session.active_doc().unwrap().slices, source.slices);
+    }
+}
+
+#[test]
 fn parity_analyze_particles_calibrated_size_matches_java_oracle() {
     let mut pixels = vec![0_u8; 20 * 20];
     for y in 2..5 { for x in 2..5 { pixels[y * 20 + x] = 255; } }
@@ -885,6 +990,45 @@ fn parity_roi_manager_select_restores_stored_stack_slice() {
 }
 
 #[test]
+fn parity_roi_manager_select_restores_hyperstack_position() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (dimensions, stored, current) in [
+        ((2, 2, 2), (2, 2, 1), (1, 1, 2)),
+        ((2, 2, 2), (1, 1, 1), (2, 2, 2)),
+        ((2, 3, 1), (2, 2, 1), (1, 3, 1)),
+        ((2, 1, 3), (2, 1, 1), (1, 1, 3)),
+        ((1, 3, 2), (1, 2, 1), (1, 1, 2)),
+    ] {
+        let (channels, slices, frames) = dimensions;
+        let (c, z, t) = stored;
+        let (current_c, current_z, current_t) = current;
+        let doc = distinct_stack_8bit(4, 4, channels * slices * frames);
+        let java = bridge.run_macro_on_image(&doc, &format!(
+            "Stack.setDimensions({channels},{slices},{frames}); \
+             Stack.setPosition({c},{z},{t}); makeRectangle(1,1,1,1); roiManager(\"Add\"); \
+             Stack.setPosition({current_c},{current_z},{current_t}); roiManager(\"Select\",0); \
+             Stack.getPosition(c,z,t); print(\"SELECT=\"+c+\",\"+z+\",\"+t+\",\"+getSliceNumber()); \
+             run(\"Select None\");"
+        )).unwrap();
+
+        let mut session = Session::new();
+        session.insert_doc(doc);
+        session.dispatch(Command::SetDimensions { channels, slices, frames }).unwrap();
+        session.dispatch(Command::SetPosition { channel: c, slice: z, frame: t }).unwrap();
+        session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 1, height: 1 }).unwrap();
+        session.dispatch(Command::RoiManagerAdd).unwrap();
+        session.dispatch(Command::SetPosition {
+            channel: current_c, slice: current_z, frame: current_t,
+        }).unwrap();
+        session.dispatch(Command::RoiManagerSelect { index: 0 }).unwrap();
+        let doc = session.active_doc().unwrap();
+        let (c, z, t) = doc.get_position();
+        assert_eq!(format!("SELECT={c},{z},{t},{}", doc.current_slice),
+            oracle_line(&java.stdout, "SELECT="), "{dimensions:?}, {stored:?}");
+    }
+}
+
+#[test]
 fn parity_roi_manager_renamed_stack_roi_keeps_position() {
     let doc = distinct_stack_8bit(4, 4, 3);
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
@@ -987,6 +1131,81 @@ fn parity_roi_manager_measure_stack_slices_and_restore_current_slice() {
     let rust_rows: Vec<(f64, u32)> = session.results.rows.iter()
         .map(|row| (row.mean, row.stack_position.slice.unwrap())).collect();
     assert_eq!(rust_rows, java_rows);
+}
+
+#[test]
+fn parity_roi_manager_measure_hyperstack_positions_and_restore_current_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (dimensions, stored, current) in [
+        ((2, 2, 2), (2, 2, 1), (1, 1, 2)),
+        ((2, 2, 2), (1, 1, 1), (2, 2, 2)),
+        ((2, 3, 1), (2, 2, 1), (1, 3, 1)),
+        ((2, 1, 3), (2, 1, 1), (1, 1, 3)),
+        ((1, 3, 2), (1, 2, 1), (1, 1, 2)),
+    ] {
+        for positions in [vec![stored], vec![stored, (1, 1, 1)]] {
+            let (channels, slices, frames) = dimensions;
+            let (current_c, current_z, current_t) = current;
+            let doc = distinct_stack_8bit(4, 4, channels * slices * frames);
+            let mut macro_text = format!(
+                "Stack.setDimensions({channels},{slices},{frames}); \
+                 run(\"Set Measurements...\",\"area mean stack decimal=3\");"
+            );
+            for &(c, z, t) in &positions {
+                macro_text.push_str(&format!(
+                    "Stack.setPosition({c},{z},{t}); makeRectangle(1,1,1,1); roiManager(\"Add\");"
+                ));
+            }
+            macro_text.push_str(&format!(
+                "Stack.setPosition({current_c},{current_z},{current_t}); roiManager(\"Measure\"); \
+                 Stack.getPosition(c,z,t); \
+                 print(\"AFTER=\"+c+\",\"+z+\",\"+t+\",\"+getSliceNumber()+\",\"+selectionType()); \
+                 run(\"Select None\");"
+            ));
+            let java = bridge.run_macro_on_image(&doc, &macro_text).unwrap();
+            let headings: Vec<&str> = java.stdout.lines()
+                .find(|line| line.contains("\tArea\tMean\t")).unwrap()
+                .split('\t').map(str::trim).collect();
+            let java_rows: Vec<BTreeMap<String, String>> = java.stdout.lines().filter_map(|line| {
+                let columns: Vec<&str> = line.split('\t').collect();
+                if columns.len() == headings.len() && columns[0].parse::<usize>().is_ok() {
+                    Some(headings.iter().zip(columns).skip(1)
+                        .map(|(heading, value)| (heading.to_string(), value.to_string())).collect())
+                } else {
+                    None
+                }
+            }).collect();
+            assert_eq!(java_rows.len(), positions.len(), "{}", java.stdout);
+
+            let mut session = Session::new();
+            session.insert_doc(doc);
+            session.dispatch(Command::SetDimensions { channels, slices, frames }).unwrap();
+            session.dispatch(Command::SetMeasurements {
+                flags: MeasurementFlags::AREA | MeasurementFlags::MEAN | MeasurementFlags::STACK_POSITION,
+                precision: 3,
+            }).unwrap();
+            for &(c, z, t) in &positions {
+                session.dispatch(Command::SetPosition { channel: c, slice: z, frame: t }).unwrap();
+                session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 1, height: 1 }).unwrap();
+                session.dispatch(Command::RoiManagerAdd).unwrap();
+            }
+            session.dispatch(Command::SetPosition {
+                channel: current_c, slice: current_z, frame: current_t,
+            }).unwrap();
+            session.dispatch(Command::RoiManagerMeasure { indices: vec![] }).unwrap();
+            assert_eq!(session.results.rows.len(), positions.len());
+            for (row, expected) in session.results.rows.iter().zip(&java_rows) {
+                assert_eq!(row.mean, expected["Mean"].parse::<f64>().unwrap(),
+                    "{dimensions:?}, {positions:?}");
+                assert_stack_columns(row, expected);
+            }
+            let doc = session.active_doc().unwrap();
+            let (c, z, t) = doc.get_position();
+            let selection_type = if doc.roi.is_none() { -1 } else { 0 };
+            assert_eq!(format!("AFTER={c},{z},{t},{},{selection_type}", doc.current_slice),
+                oracle_line(&java.stdout, "AFTER="), "{dimensions:?}, {positions:?}");
+        }
+    }
 }
 
 #[test]
@@ -17680,7 +17899,7 @@ fn session_binary_morphology_whole_stack_records_stack_option() {
         .unwrap();
     assert_eq!(
         session.macro_recorder.last().unwrap(),
-        "run(\"Dilate\", \"iterations=2 count=2 black stack\");"
+        "run(\"Options...\", \"iterations=2 count=2 black stack do=Dilate\");"
     );
 }
 
@@ -18344,4 +18563,57 @@ fn parity_calculator_records_java_style_macro_and_replays_identically() {
         };
         assert_math_pixels(&expected, &replayed, &format!("replay {options}"));
     }
+}
+
+#[test]
+fn parity_binary_morphology_nondefault_macro_replays_in_java() {
+    let mut pixels = vec![0u8; 9 * 9];
+    for y in 1..8 {
+        for x in 1..8 {
+            pixels[y * 9 + x] = 255;
+        }
+    }
+    let doc = ImageDocument::new("binary-recording", 9, 9, PixelPlane::Gray8(pixels)).unwrap();
+    let mut session = Session::new();
+    session.insert_doc(doc.clone());
+    session.dispatch(Command::BinaryErode {
+        iterations: 2,
+        count: 1,
+        black_background: true,
+        whole_stack: false,
+    }).unwrap();
+    let recorded = session.macro_recorder.join("\n");
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let replayed = bridge.run_macro_on_image(&doc, &recorded).unwrap();
+    assert_eq!(session.active_doc().unwrap().slices, replayed.output_image.unwrap().slices, "{recorded}");
+}
+
+#[test]
+fn parity_particle_macro_replays_white_background_preference() {
+    let mut pixels = vec![0u8; 10 * 10];
+    for y in 4..6 {
+        for x in 4..6 {
+            pixels[y * 10 + x] = 255;
+        }
+    }
+    let doc = ImageDocument::new("particle-recording", 10, 10, PixelPlane::Gray8(pixels)).unwrap();
+    let mut session = Session::new();
+    session.insert_doc(doc.clone());
+    session.dispatch(Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions { black_background: false, ..Default::default() },
+        clear_results: true,
+        add_to_manager: false,
+        summarize: false,
+    }).unwrap();
+    let recorded = session.macro_recorder.join("\n");
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let java = bridge.run_macro_on_image(&doc, &format!(
+        "{recorded}\nprint(\"RECORDED_COUNT=\"+nResults); print(\"RECORDED_AREA=\"+getResult(\"Area\",0));"
+    )).unwrap();
+    let count = oracle_line(&java.stdout, "RECORDED_COUNT=")
+        .strip_prefix("RECORDED_COUNT=").unwrap().parse::<usize>().unwrap();
+    let area = oracle_line(&java.stdout, "RECORDED_AREA=")
+        .strip_prefix("RECORDED_AREA=").unwrap().parse::<f64>().unwrap();
+    assert_eq!(count, session.results.rows.len(), "{recorded}");
+    assert_eq!(area, session.results.rows[0].area, "{recorded}");
 }

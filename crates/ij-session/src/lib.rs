@@ -30,6 +30,36 @@ pub struct NamedRoi {
     pub slice: u32,
     #[serde(default)]
     pub stack_positioned: bool,
+    #[serde(default)]
+    pub hyperstack_position: Option<[u32; 3]>,
+}
+
+impl NamedRoi {
+    fn restore_position(&self, doc: &mut ImageDocument) -> Result<(), CoreError> {
+        let position = if self.stack_positioned && self.hyperstack_position.is_none() {
+            self.slice as i32
+        } else {
+            0
+        };
+        if doc.is_hyperstack() {
+            if let Some([c, z, t]) = self.hyperstack_position {
+                doc.set_position(c as i32, z as i32, t as i32);
+            } else if doc.n_slices == 1 {
+                doc.set_position(doc.position[0] as i32, 1, position);
+            } else {
+                let channel = doc.position[0] as i32;
+                // RoiManager.java 714 uses the current channel for both C and T.
+                doc.set_position(channel, position, channel);
+            }
+        } else if let Some([_, z, _]) = self.hyperstack_position {
+            if z > 0 && doc.n_slices as usize == doc.stack_size() {
+                doc.set_slice(z as i32)?;
+            }
+        } else if position > 0 {
+            doc.set_slice(position)?;
+        }
+        Ok(())
+    }
 }
 
 /// One row of ImageJ's separate Analyze Particles `Summary` table.
@@ -1342,6 +1372,7 @@ impl Session {
                     source_image: image_id,
                     slice: doc.current_slice,
                     stack_positioned: doc.stack_size() > 1,
+                    hyperstack_position: doc.is_hyperstack().then_some(doc.position),
                 };
                 self.roi_manager.push(entry);
                 self.roi_manager_selected.clear();
@@ -1353,9 +1384,7 @@ impl Session {
                     return Ok(CommandOutcome::Updated);
                 };
                 let doc = self.active_doc_mut()?;
-                if entry.stack_positioned {
-                    doc.set_slice(entry.slice as i32)?;
-                }
+                entry.restore_position(doc)?;
                 let mut roi = entry.roi;
                 let (x, y, width, height) = roi.bounds();
                 if x >= doc.width as i32
@@ -1406,12 +1435,13 @@ impl Session {
                 let doc = self.active_doc()?;
                 let current_slice = doc.current_slice;
                 let change_slices = doc.stack_size() > 1
-                    && entries.iter().any(|entry| entry.stack_positioned && entry.slice > 1);
+                    && entries.iter().any(|entry| entry.hyperstack_position.is_some()
+                        || (entry.stack_positioned && entry.slice > 1));
                 for entry in &entries {
                     let row = {
                         let doc = self.active_doc_mut()?;
-                        if change_slices && entry.stack_positioned {
-                            doc.set_slice(entry.slice as i32)?;
+                        if change_slices {
+                            entry.restore_position(doc)?;
                         }
                         doc.roi = Some(entry.roi.clone());
                         doc.measure_with_config(config)?
@@ -2154,6 +2184,19 @@ impl Session {
             }
             Command::AnalyzeParticles { options, clear_results, add_to_manager, summarize } => {
                 let image_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+                let full_image_roi = {
+                    let doc = self.active_doc()?;
+                    doc.roi.as_ref().is_some_and(|roi| {
+                        let (x, y, w, h) = roi.bounds();
+                        x == 0 && y == 0 && w == doc.width as i32 && h == doc.height as i32
+                    })
+                };
+                if full_image_roi {
+                    // ParticleAnalyzer.setup removes even irregular full-bounds
+                    // selections with ImagePlus.deleteRoi (lines 258-263).
+                    self.save_roi();
+                    self.active_doc_mut()?.clear_roi();
+                }
                 let particles = self.active_doc()?.analyze_particles(options, self.results.config)?;
                 let summary = if summarize {
                     Some(summarize_particles(self.active_doc()?, &particles, self.results.config)?)
@@ -2172,6 +2215,9 @@ impl Session {
                             source_image: image_id,
                             slice: doc.current_slice,
                             stack_positioned: doc.stack_size() > 1,
+                            hyperstack_position: doc.is_hyperstack()
+                                .then(|| doc.convert_index_to_position(doc.current_slice as i32))
+                                .transpose()?,
                         });
                     }
                     self.results.push(particle.measurement);
@@ -2191,6 +2237,12 @@ impl Session {
                 if options.include_holes { macro_options.push_str(" include"); }
                 if add_to_manager { macro_options.push_str(" add"); }
                 if summarize { macro_options.push_str(" summarize"); }
+                // ParticleAnalyzer reads Prefs.blackBackground, which is not
+                // part of the Analyze Particles dialog options.
+                self.macro_recorder.push(format!(
+                    "setOption(\"BlackBackground\",{});",
+                    options.black_background
+                ));
                 self.macro_recorder.push(format!("run(\"Analyze Particles...\", \"{macro_options}\");"));
                 Ok(CommandOutcome::Updated)
             }
@@ -2591,27 +2643,24 @@ impl Session {
             }
             is_stack = doc.stack_size() > 1;
         }
-        // Defaults stay unrecorded (the menu command records plain
-        // `run("Erode");`); stack/slice mirrors the Math commands'
-        // IJ.setupDialog outcome (recorder records the `stack` token,
-        // PlugInFilterRunner.java line 126 records nothing on replay).
-        let mut parameters = iterations == 1 && count == 1 && black_background;
-        let mut options = String::new();
-        if !parameters {
-            let mut recorded = format!("iterations={iterations} count={count}");
-            if black_background {
-                recorded.push_str(" black");
-            }
-            options = recorded;
-        }
+        // Binary.showDialog reads iterations/count/background only through
+        // `Options...`, not through `run("Erode", "iterations=...")`.
+        let nondefault = iterations != 1 || count != 1 || !black_background;
+        let mut options = if nondefault {
+            let mut value = format!("iterations={iterations} count={count}");
+            if black_background { value.push_str(" black"); }
+            value
+        } else { String::new() };
         if is_stack {
             if !options.is_empty() {
                 options.push(' ');
             }
             options.push_str(if whole_stack { "stack" } else { "slice" });
-            parameters = false;
         }
-        if parameters {
+        if nondefault {
+            options.push_str(&format!(" do={op_name}"));
+            self.macro_recorder.push(format!("run(\"Options...\", \"{options}\");"));
+        } else if options.is_empty() {
             self.macro_recorder.push(format!("run(\"{op_name}\");"));
         } else {
             self.macro_recorder

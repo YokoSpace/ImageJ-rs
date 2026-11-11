@@ -64,13 +64,35 @@ impl ImageDocument {
                 "RGB particle analysis requires a threshold mask",
             ));
         }
+        // ParticleAnalyzer.setup (258-263) discards even a nonrectangular ROI
+        // when its bounds cover the whole image.
+        let source_roi = self.roi.as_ref().filter(|roi| {
+            roi.is_area() && roi.bounds() != (0, 0, self.width as i32, self.height as i32)
+        });
+        let (left, top, width, height) = source_roi
+            .map(|roi| roi.clipped_bounds(self.width, self.height))
+            .transpose()?
+            .unwrap_or((0, 0, self.width, self.height));
+        let source_mask = source_roi
+            .map(|roi| roi.raster_mask(self.width, self.height))
+            .transpose()?
+            .flatten();
+        let max_x = left + width;
+        let max_y = top + height;
         let levels = match self.threshold {
             Some(levels) => levels,
             None => {
                 let PixelPlane::Gray8(values) = self.plane() else {
                     return Err(CoreError::InvalidOperation("A threshold has not been set"));
                 };
-                if values.iter().any(|&v| v != 0 && v != 255) {
+                // ImagePlus.getRawStatistics (1111-1116) respects the area ROI
+                // used by ParticleAnalyzer.setThresholdLevels (823-824).
+                if (top..max_y).any(|y| {
+                    (left..max_x).any(|x| {
+                        source_mask.as_ref().is_none_or(|mask| mask.contains(x, y))
+                            && !matches!(values[(y * self.width + x) as usize], 0 | 255)
+                    })
+                }) {
                     return Err(CoreError::InvalidOperation("A threshold has not been set"));
                 }
                 let foreground = if options.black_background { 255.0 } else { 0.0 };
@@ -87,17 +109,6 @@ impl ImageDocument {
                 PixelPlane::Gray8(_) | PixelPlane::Color256 { .. }
             );
         let mut work = self.clone();
-        let source_roi = self.roi.as_ref().filter(|roi| roi.is_area());
-        let (left, top, width, height) = source_roi
-            .map(|roi| roi.clipped_bounds(self.width, self.height))
-            .transpose()?
-            .unwrap_or((0, 0, self.width, self.height));
-        let source_mask = source_roi
-            .map(|roi| roi.raster_mask(self.width, self.height))
-            .transpose()?
-            .flatten();
-        let max_x = left + width;
-        let max_y = top + height;
         if source_roi.is_some() {
             // ParticleAnalyzer.java 590-603 erases the processor outside the
             // source selection before tracing. Filtering seeds alone lets a
@@ -177,7 +188,17 @@ impl ImageDocument {
                 let on_edge = rx <= left as i32
                     || ry <= top as i32
                     || rx + rw >= max_x as i32
-                    || ry + rh >= max_y as i32;
+                    || ry + rh >= max_y as i32
+                    || source_mask.as_ref().is_some_and(|source| {
+                        // ParticleAnalyzer.java 899-913 checks traced vertices
+                        // and pixels beside each segment against the source ROI.
+                        points.iter().enumerate().any(|(i, &(x2, y2))| {
+                            let (x1, y1) = points[(i + points.len() - 1) % points.len()];
+                            !source.contains(x2 as u32, y2 as u32)
+                                || (x1 == x2 && !source.contains(x1 as u32, (y1 - 1) as u32))
+                                || (y1 == y2 && !source.contains((x1 - 1) as u32, y1 as u32))
+                        })
+                    });
                 if measurement.pixel_count as f64 >= min_size
                     && (measurement.pixel_count as f64) <= max_size
                     && circularity >= options.min_circularity
