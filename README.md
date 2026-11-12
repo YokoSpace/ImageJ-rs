@@ -6,6 +6,16 @@
 
 This is a development project, not a complete replacement for ImageJ or Fiji. There is no packaged release yet; build it from source.
 
+## Gaussian blur: 2.3× faster in a measured stack workload
+
+**4.29 ms in Rust vs 9.88 ms in Java**, with matching pixel fingerprints in every run of this benchmark. Peak process memory was **29.9 MiB vs 196.9 MiB**, an 85% reduction.
+
+![Gaussian blur benchmark comparing Java and Rust processing time and peak process memory for 8-bit, 16-bit, 32-bit, and single-image workloads](docs/benchmarks/gaussian/gaussian-comparison.png)
+
+The headline result uses a 1024×768, four-slice, 8-bit noise stack with σ=2. Both engines have a worker budget of 14 on an Apple M4 Pro running macOS. Values are medians of five processes, each with three warmups and ten measured operations, using a Rust release build and ImageJ 1.54u on OpenJDK 27.
+
+RSS includes each runtime and temporary buffers. Parallel Rust uses more memory than its sequential path. These results cover the Gaussian blur workloads shown, and performance varies by machine and input size. See the [measurement details, raw samples, and reproduction commands](docs/benchmarks/gaussian/README.md).
+
 ## Try the desktop app
 
 You need a recent Rust toolchain, Python 3, `zsh`, and a JDK providing `java`, `javac`, and `jar`. Development and verification currently take place on macOS with JDK 27. Other platforms and JDK versions have not been verified.

@@ -1,0 +1,265 @@
+{
+  "settings": {
+    "cases": [
+      "gaussian"
+    ],
+    "width": 1024,
+    "height": 768,
+    "slices": 4,
+    "iterations": 10,
+    "warmup": 3,
+    "runs": 5,
+    "profile": "release",
+    "type": 8,
+    "sigma": 2.0,
+    "input": "noise",
+    "seed": 2685821657736338717,
+    "java_threads": null,
+    "rust_threads": null
+  },
+  "environment": {
+    "platform": "macOS-26.3-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.13.12",
+    "java": "openjdk version \"27.0.1.0.3\" 2026-10-24\nOpenJDK Runtime Environment Homebrew (build 27.0.1.0.3)\nOpenJDK 64-Bit Server VM Homebrew (build 27.0.1.0.3, mixed mode, sharing)",
+    "rustc": "rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)",
+    "git_commit": "b0e24c433b83c594fb52a30784b03e764b34f53b",
+    "git_dirty": true
+  },
+  "summary": [
+    {
+      "case": "gaussian",
+      "java_ms_per_op": 9.8829625,
+      "rust_ms_per_op": 4.2873417,
+      "java_peak_rss_mib": 196.875,
+      "rust_peak_rss_mib": 29.90625,
+      "speed_ratio_java_over_rust": 2.3051492490090073,
+      "java_threads_resolved": 14,
+      "rust_threads_resolved": 14,
+      "rust_thread_policy": "session-default",
+      "machine_threads": 14
+    }
+  ],
+  "samples": [
+    {
+      "case": "gaussian",
+      "type": 8,
+      "sigma": 2.0,
+      "input": "noise",
+      "seed": 2685821657736338717,
+      "width": 1024,
+      "height": 768,
+      "slices": 4,
+      "iterations": 10,
+      "elapsed_ns": 99057625,
+      "fingerprint": "d2108bf699e9482b",
+      "threads": {
+        "requested": null,
+        "resolved": 14,
+        "policy": "prefs"
+      },
+      "machine_threads": 14,
+      "peak_rss_mib": 196.921875,
+      "engine": "java",
+      "run": 1
+    },
+    {
+      "case": "gaussian",
+      "elapsed_ns": 46115541,
+      "fingerprint": "d2108bf699e9482b",
+      "height": 768,
+      "input": "noise",
+      "iterations": 10,
+      "machine_threads": 14,
+      "seed": 2685821657736338717,
+      "sigma": 2.0,
+      "slices": 4,
+      "threads": {
+        "policy": "session-default",
+        "requested": null,
+        "resolved": 14
+      },
+      "type": 8,
+      "width": 1024,
+      "peak_rss_mib": 32.9375,
+      "engine": "rust",
+      "run": 1
+    },
+    {
+      "case": "gaussian",
+      "elapsed_ns": 42873417,
+      "fingerprint": "d2108bf699e9482b",
+      "height": 768,
+      "input": "noise",
+      "iterations": 10,
+      "machine_threads": 14,
+      "seed": 2685821657736338717,
+      "sigma": 2.0,
+      "slices": 4,
+      "threads": {
+        "policy": "session-default",
+        "requested": null,
+        "resolved": 14
+      },
+      "type": 8,
+      "width": 1024,
+      "peak_rss_mib": 29.921875,
+      "engine": "rust",
+      "run": 2
+    },
+    {
+      "case": "gaussian",
+      "type": 8,
+      "sigma": 2.0,
+      "input": "noise",
+      "seed": 2685821657736338717,
+      "width": 1024,
+      "height": 768,
+      "slices": 4,
+      "iterations": 10,
+      "elapsed_ns": 98829625,
+      "fingerprint": "d2108bf699e9482b",
+      "threads": {
+        "requested": null,
+        "resolved": 14,
+        "policy": "prefs"
+      },
+      "machine_threads": 14,
+      "peak_rss_mib": 196.875,
+      "engine": "java",
+      "run": 2
+    },
+    {
+      "case": "gaussian",
+      "type": 8,
+      "sigma": 2.0,
+      "input": "noise",
+      "seed": 2685821657736338717,
+      "width": 1024,
+      "height": 768,
+      "slices": 4,
+      "iterations": 10,
+      "elapsed_ns": 97914500,
+      "fingerprint": "d2108bf699e9482b",
+      "threads": {
+        "requested": null,
+        "resolved": 14,
+        "policy": "prefs"
+      },
+      "machine_threads": 14,
+      "peak_rss_mib": 196.625,
+      "engine": "java",
+      "run": 3
+    },
+    {
+      "case": "gaussian",
+      "elapsed_ns": 44767791,
+      "fingerprint": "d2108bf699e9482b",
+      "height": 768,
+      "input": "noise",
+      "iterations": 10,
+      "machine_threads": 14,
+      "seed": 2685821657736338717,
+      "sigma": 2.0,
+      "slices": 4,
+      "threads": {
+        "policy": "session-default",
+        "requested": null,
+        "resolved": 14
+      },
+      "type": 8,
+      "width": 1024,
+      "peak_rss_mib": 29.90625,
+      "engine": "rust",
+      "run": 3
+    },
+    {
+      "case": "gaussian",
+      "elapsed_ns": 42449541,
+      "fingerprint": "d2108bf699e9482b",
+      "height": 768,
+      "input": "noise",
+      "iterations": 10,
+      "machine_threads": 14,
+      "seed": 2685821657736338717,
+      "sigma": 2.0,
+      "slices": 4,
+      "threads": {
+        "policy": "session-default",
+        "requested": null,
+        "resolved": 14
+      },
+      "type": 8,
+      "width": 1024,
+      "peak_rss_mib": 29.875,
+      "engine": "rust",
+      "run": 4
+    },
+    {
+      "case": "gaussian",
+      "type": 8,
+      "sigma": 2.0,
+      "input": "noise",
+      "seed": 2685821657736338717,
+      "width": 1024,
+      "height": 768,
+      "slices": 4,
+      "iterations": 10,
+      "elapsed_ns": 99632500,
+      "fingerprint": "d2108bf699e9482b",
+      "threads": {
+        "requested": null,
+        "resolved": 14,
+        "policy": "prefs"
+      },
+      "machine_threads": 14,
+      "peak_rss_mib": 196.640625,
+      "engine": "java",
+      "run": 4
+    },
+    {
+      "case": "gaussian",
+      "type": 8,
+      "sigma": 2.0,
+      "input": "noise",
+      "seed": 2685821657736338717,
+      "width": 1024,
+      "height": 768,
+      "slices": 4,
+      "iterations": 10,
+      "elapsed_ns": 98519250,
+      "fingerprint": "d2108bf699e9482b",
+      "threads": {
+        "requested": null,
+        "resolved": 14,
+        "policy": "prefs"
+      },
+      "machine_threads": 14,
+      "peak_rss_mib": 197.828125,
+      "engine": "java",
+      "run": 5
+    },
+    {
+      "case": "gaussian",
+      "elapsed_ns": 42454417,
+      "fingerprint": "d2108bf699e9482b",
+      "height": 768,
+      "input": "noise",
+      "iterations": 10,
+      "machine_threads": 14,
+      "seed": 2685821657736338717,
+      "sigma": 2.0,
+      "slices": 4,
+      "threads": {
+        "policy": "session-default",
+        "requested": null,
+        "resolved": 14
+      },
+      "type": 8,
+      "width": 1024,
+      "peak_rss_mib": 29.90625,
+      "engine": "rust",
+      "run": 5
+    }
+  ]
+}
