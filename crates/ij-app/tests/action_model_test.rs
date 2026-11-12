@@ -543,3 +543,48 @@ fn convert_to_rgb_action_converts_with_display_range_and_records() {
         Some("run(\"RGB Color\");")
     );
 }
+
+#[test]
+fn create_mask_action_creates_mask_window_and_records_macro() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::CreateMask).is_err());
+    let id = app.open_ramp_8bit("source", 8, 8).unwrap();
+    assert!(app.action_enabled(AppAction::CreateMask).is_err());
+    app.session
+        .dispatch(ij_session::Command::MakeRectRoi { x: 2, y: 2, width: 4, height: 4 })
+        .unwrap();
+    assert!(app.action_enabled(AppAction::CreateMask).is_ok());
+
+    app.perform(AppAction::CreateMask, &Context::default());
+    let active = app.session.active_doc().unwrap();
+    assert_eq!(active.title, "Mask");
+    assert_ne!(app.session.active_image_id(), Some(id));
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Create Mask\");")
+    );
+}
+
+#[test]
+fn create_selection_action_creates_roi_and_records_macro() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::CreateSelection).is_err());
+    let _id = app.open_ramp_8bit("source", 8, 8).unwrap();
+    // Ramp is not binary and has no threshold => action should be disabled / error
+    assert!(app.action_enabled(AppAction::CreateSelection).is_err());
+
+    // Set threshold so action becomes enabled
+    app.session
+        .active_doc_mut()
+        .unwrap()
+        .threshold = Some(ij_core::ThresholdLevels { lower: 50.0, upper: 200.0 });
+    assert!(app.action_enabled(AppAction::CreateSelection).is_ok());
+
+    app.perform(AppAction::CreateSelection, &Context::default());
+    assert!(app.session.active_doc().unwrap().roi.is_some());
+    assert_eq!(app.status_message, "Create Selection");
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Create Selection\");")
+    );
+}

@@ -4,7 +4,12 @@ use ij_core::PixelPlane;
 
 /// ImageJ's Edit > Clear / Fill / Draw entries (Menus.java 148-151): Clear
 /// has no shortcut, Fill is bound to unmodified F and Draw to unmodified D.
-const EDIT_MENU_ITEMS: &[(&str, &str)] = &[("Clear", ""), ("Fill", "F"), ("Draw", "D")];
+const EDIT_MENU_ITEMS: &[(&str, &str)] = &[
+    ("Clear", ""),
+    ("Clear Outside", ""),
+    ("Fill", "F"),
+    ("Draw", "D"),
+];
 
 fn edit_menu_matches() -> Vec<(String, String)> {
     for top in MENU_TREE {
@@ -110,4 +115,9 @@ fn perform_clear_fill_and_draw_reaches_the_active_image() {
         Some(20),
         "Draw must not touch (6,6)"
     );
+
+    // Clear Outside fills everything outside the selection with background gray
+    app.perform(AppAction::ClearOutside, &egui::Context::default());
+    assert_eq!(gray_pixel(&app, 1, 1), Some(20), "Clear Outside leaves interior intact");
+    assert_eq!(gray_pixel(&app, 0, 0), Some(200), "Clear Outside fills exterior with background");
 }
