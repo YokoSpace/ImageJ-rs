@@ -25,6 +25,7 @@ pub use threshold_palette::{
     FLOAT_NEG_LIMIT, FLOAT_POS_LIMIT, NO_THRESHOLD_PLOT_BIN, THRESHOLD_SLIDER_RANGE,
 };
 pub use wand::{Wand, WandMode};
+pub use edit::{CREATE_SELECTION_NOT_MASK_OR_THRESHOLDED, CREATE_SELECTION_REQUIRES_SHAPE_ROI};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

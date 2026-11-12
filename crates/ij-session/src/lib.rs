@@ -301,6 +301,9 @@ pub enum Command {
     /// `run("Create Mask")` — Selection("mask") creates an 8-bit binary mask
     /// from the active ROI or active threshold (Selection.java 584-648).
     CreateMask,
+    /// `run("Create Selection")` — Selection("from") creates a selection from
+    /// a binary mask or thresholded image (Selection.java 650-672, ThresholdToSelection.java).
+    CreateSelection,
     /// `run("Draw")` — Filler("draw") draws the selection outline with the
     /// foreground color (Filler.java 116-121).
     Draw,
@@ -1581,6 +1584,14 @@ impl Session {
                 let id = self.insert_doc(mask_doc);
                 self.macro_recorder.push("run(\"Create Mask\");".into());
                 Ok(CommandOutcome::ImageOpened(id))
+            }
+            Command::CreateSelection => {
+                let doc = self.active_doc_mut()?;
+                doc.create_selection(true)?;
+                self.mark_active_dirty();
+                self.macro_recorder
+                    .push("run(\"Create Selection\");".into());
+                Ok(CommandOutcome::Updated)
             }
             Command::Draw => {
                 let color = self.foreground_color;

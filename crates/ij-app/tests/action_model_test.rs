@@ -564,3 +564,29 @@ fn create_mask_action_creates_mask_window_and_records_macro() {
         Some("run(\"Create Mask\");")
     );
 }
+
+#[test]
+fn create_selection_action_creates_roi_and_records_macro() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::CreateSelection).is_err());
+    let _id = app.open_ramp_8bit("source", 8, 8).unwrap();
+    // Ramp is not binary and has no threshold => action should be disabled / error
+    assert!(app.action_enabled(AppAction::CreateSelection).is_err());
+
+    // Set threshold so action becomes enabled
+    app.session
+        .active_doc_mut()
+        .unwrap()
+        .threshold = Some(ij_core::ThresholdLevels { lower: 50.0, upper: 200.0 });
+    assert!(app.action_enabled(AppAction::CreateSelection).is_ok());
+
+    app.perform(AppAction::CreateSelection, &Context::default());
+    assert!(app.session.active_doc().unwrap().roi.is_some());
+    assert_eq!(app.status_message, "Create Selection");
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Create Selection\");")
+    );
+}
+
+

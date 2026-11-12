@@ -11,8 +11,8 @@
 //! 409-411).
 
 use crate::{
-    CoreError, DisplayRange, ImageDocument, Lut256, PixelPlane, Roi, Wand, WandMode,
-    java_round, java_round_to_i32,
+    CoreError, DisplayRange, ImageDocument, Lut256, PixelPlane, PolygonRoi, RectRoi, Roi, Wand,
+    WandMode, java_round, java_round_to_i32,
 };
 
 /// ImageProcessor.getBestIndex (ImageProcessor.java 248-285) for the default
@@ -785,5 +785,403 @@ impl ImageDocument {
         }
         Ok(mask_doc)
     }
+
+    /// Returns `true` if this image processor is an 8-bit image with only values
+    /// 0 and 255, matching ByteProcessor.isBinary() (ByteProcessor.java 1282-1288)
+    /// and ImageProcessor.isBinary() (ImageProcessor.java 2842-2844).
+    pub fn is_binary(&self) -> bool {
+        match self.plane() {
+            PixelPlane::Gray8(pixels) => pixels.iter().all(|&p| p == 0 || p == 255),
+            _ => false,
+        }
+    }
+
+    /// Checks whether the active plane has an inverting LUT matching
+    /// ImageProcessor.isInvertedLut (ImageProcessor.java 299-318).
+    pub fn is_inverted_lut(&self) -> bool {
+        match self.plane() {
+            PixelPlane::Color256 { lut, .. } => {
+                if lut.r.len() < 256 || lut.g.len() < 256 || lut.b.len() < 256 {
+                    return false;
+                }
+                let mut has_ascending = false;
+                for i in 1..255 {
+                    let v1 = lut.r[i - 1] as i32 + lut.g[i - 1] as i32 + lut.b[i - 1] as i32;
+                    let v2 = lut.r[i] as i32 + lut.g[i] as i32 + lut.b[i] as i32;
+                    if v1 < v2 {
+                        return false;
+                    }
+                    if v1 > v2 {
+                        has_ascending = true;
+                    }
+                }
+                has_ascending
+            }
+            _ => false,
+        }
+    }
+
+    /// `Selection.createSelectionFromMask(imp)` (Selection.java 650-672) and
+    /// `ThresholdToSelection.convert(ip)` (ThresholdToSelection.java 41-416).
+    pub fn create_selection(&mut self, black_background: bool) -> Result<(), CoreError> {
+        let (min, max) = match self.threshold {
+            Some(thresh) => (thresh.lower, thresh.upper),
+            None => {
+                if !self.is_binary() {
+                    return Err(CoreError::InvalidOperation(
+                        CREATE_SELECTION_NOT_MASK_OR_THRESHOLDED,
+                    ));
+                }
+                let mut threshold = if self.is_inverted_lut() { 255.0 } else { 0.0 };
+                if black_background {
+                    threshold = if threshold == 255.0 { 0.0 } else { 255.0 };
+                }
+                (threshold, threshold)
+            }
+        };
+
+        let w = self.width as usize;
+        let h = self.height as usize;
+        if w == 0 || h == 0 {
+            self.roi = None;
+            return Ok(());
+        }
+
+        let selected = |x: usize, y: usize| -> bool {
+            let v = match self.plane() {
+                PixelPlane::Gray8(pixels) => pixels[y * w + x] as f64,
+                PixelPlane::Gray16(pixels) => pixels[y * w + x] as f64,
+                PixelPlane::Gray32(pixels) => pixels[y * w + x] as f64,
+                PixelPlane::Color256 { pixels, .. } => pixels[y * w + x] as f64,
+                PixelPlane::ColorRgb(pixels) => {
+                    let rgb = pixels[y * w + x];
+                    let r = ((rgb >> 16) & 0xff) as f64;
+                    let g = ((rgb >> 8) & 0xff) as f64;
+                    let b = (rgb & 0xff) as f64;
+                    0.299 * r + 0.587 * g + 0.114 * b
+                }
+            };
+            v >= min && v <= max
+        };
+
+        let mut prev_row = vec![false; w + 2];
+        let mut this_row = vec![false; w + 2];
+        let mut outline: Vec<Option<OutlineRef>> = vec![None; w + 1];
+        let mut polygons = Vec::new();
+
+        for y in 0..=h {
+            std::mem::swap(&mut prev_row, &mut this_row);
+            let mut x_after_lower_right_corner: i32 = -1;
+            let mut o_after_lower_right_corner: Option<OutlineRef> = None;
+
+            this_row[1] = if y < h { selected(0, y) } else { false };
+            for x in 0..=w {
+                if y < h && x < w.saturating_sub(1) {
+                    this_row[x + 2] = selected(x + 1, y);
+                } else if x < w.saturating_sub(1) {
+                    this_row[x + 2] = false;
+                }
+
+                if this_row[x + 1] {
+                    // Selected pixel (x, y)
+                    if !prev_row[x + 1] {
+                        // Upper edge of selected area
+                        if outline[x].is_none() {
+                            if outline[x + 1].is_none() {
+                                let o = std::rc::Rc::new(std::cell::RefCell::new(Outline::new()));
+                                o.borrow_mut().append((x + 1) as i32, y as i32);
+                                o.borrow_mut().append(x as i32, y as i32);
+                                outline[x] = Some(std::rc::Rc::clone(&o));
+                                outline[x + 1] = Some(o);
+                            } else {
+                                outline[x] = outline[x + 1].take();
+                                outline[x].as_ref().unwrap().borrow_mut().append(x as i32, y as i32);
+                            }
+                        } else if outline[x + 1].is_none() {
+                            if x as i32 == x_after_lower_right_corner {
+                                outline[x + 1] = outline[x].take();
+                                outline[x] = o_after_lower_right_corner.clone();
+                                outline[x].as_ref().unwrap().borrow_mut().append(x as i32, y as i32);
+                                outline[x + 1].as_ref().unwrap().borrow_mut().prepend((x + 1) as i32, y as i32);
+                            } else {
+                                outline[x + 1] = outline[x].take();
+                                outline[x + 1].as_ref().unwrap().borrow_mut().prepend((x + 1) as i32, y as i32);
+                            }
+                        } else if is_same(&outline[x], &outline[x + 1]) {
+                            if x < w.saturating_sub(1)
+                                && y < h
+                                && x as i32 != x_after_lower_right_corner
+                                && !this_row[x + 2]
+                                && prev_row[x + 2]
+                            {
+                                outline[x] = None;
+                                outline[x + 1].as_ref().unwrap().borrow_mut().prepend((x + 1) as i32, y as i32);
+                                x_after_lower_right_corner = (x + 1) as i32;
+                                o_after_lower_right_corner = outline[x + 1].clone();
+                            } else {
+                                polygons.push(outline[x].as_ref().unwrap().borrow().get_polygon());
+                                outline[x + 1] = None;
+                                outline[x] = if x as i32 == x_after_lower_right_corner {
+                                    o_after_lower_right_corner.clone()
+                                } else {
+                                    None
+                                };
+                            }
+                        } else {
+                            // Merge
+                            let right = outline[x + 1].take().unwrap();
+                            let left = outline[x].clone().unwrap();
+                            left.borrow_mut().prepend_outline(&right.borrow());
+                            for x1 in 0..=w {
+                                if x1 != x + 1 && outline[x1].as_ref().map_or(false, |o| std::rc::Rc::ptr_eq(o, &right)) {
+                                    outline[x1] = Some(std::rc::Rc::clone(&left));
+                                    outline[x + 1] = None;
+                                    outline[x] = if x as i32 == x_after_lower_right_corner {
+                                        o_after_lower_right_corner.clone()
+                                    } else {
+                                        None
+                                    };
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !this_row[x] {
+                        // Left edge
+                        if let Some(o) = &outline[x] {
+                            o.borrow_mut().append(x as i32, (y + 1) as i32);
+                        }
+                    }
+                } else {
+                    // Deselected pixel (x, y)
+                    if prev_row[x + 1] {
+                        // Lower edge of selected area
+                        if outline[x].is_none() {
+                            if outline[x + 1].is_none() {
+                                let o = std::rc::Rc::new(std::cell::RefCell::new(Outline::new()));
+                                o.borrow_mut().append(x as i32, y as i32);
+                                o.borrow_mut().append((x + 1) as i32, y as i32);
+                                outline[x] = Some(std::rc::Rc::clone(&o));
+                                outline[x + 1] = Some(o);
+                            } else {
+                                outline[x] = outline[x + 1].take();
+                                outline[x].as_ref().unwrap().borrow_mut().prepend(x as i32, y as i32);
+                            }
+                        } else if outline[x + 1].is_none() {
+                            if x as i32 == x_after_lower_right_corner {
+                                outline[x + 1] = outline[x].take();
+                                outline[x] = o_after_lower_right_corner.clone();
+                                outline[x].as_ref().unwrap().borrow_mut().prepend(x as i32, y as i32);
+                                outline[x + 1].as_ref().unwrap().borrow_mut().append((x + 1) as i32, y as i32);
+                            } else {
+                                outline[x + 1] = outline[x].take();
+                                outline[x + 1].as_ref().unwrap().borrow_mut().append((x + 1) as i32, y as i32);
+                            }
+                        } else if is_same(&outline[x], &outline[x + 1]) {
+                            if x < w.saturating_sub(1)
+                                && y < h
+                                && x as i32 != x_after_lower_right_corner
+                                && this_row[x + 2]
+                                && !prev_row[x + 2]
+                            {
+                                outline[x] = None;
+                                outline[x + 1].as_ref().unwrap().borrow_mut().append((x + 1) as i32, y as i32);
+                                x_after_lower_right_corner = (x + 1) as i32;
+                                o_after_lower_right_corner = outline[x + 1].clone();
+                            } else {
+                                polygons.push(outline[x].as_ref().unwrap().borrow().get_polygon());
+                                outline[x + 1] = None;
+                                outline[x] = if x as i32 == x_after_lower_right_corner {
+                                    o_after_lower_right_corner.clone()
+                                } else {
+                                    None
+                                };
+                            }
+                        } else {
+                            if x < w.saturating_sub(1)
+                                && y < h
+                                && x as i32 != x_after_lower_right_corner
+                                && this_row[x + 2]
+                                && !prev_row[x + 2]
+                            {
+                                outline[x].as_ref().unwrap().borrow_mut().append((x + 1) as i32, y as i32);
+                                outline[x + 1].as_ref().unwrap().borrow_mut().prepend((x + 1) as i32, y as i32);
+                                x_after_lower_right_corner = (x + 1) as i32;
+                                o_after_lower_right_corner = outline[x].clone();
+                                outline[x] = None;
+                            } else {
+                                let right = outline[x + 1].take().unwrap();
+                                let left = outline[x].clone().unwrap();
+                                left.borrow_mut().append_outline(&right.borrow());
+                                for x1 in 0..=w {
+                                    if x1 != x + 1 && outline[x1].as_ref().map_or(false, |o| std::rc::Rc::ptr_eq(o, &right)) {
+                                        outline[x1] = Some(std::rc::Rc::clone(&left));
+                                        outline[x + 1] = None;
+                                        outline[x] = if x as i32 == x_after_lower_right_corner {
+                                            o_after_lower_right_corner.clone()
+                                        } else {
+                                            None
+                                        };
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if this_row[x] {
+                        // Right edge
+                        if let Some(o) = &outline[x] {
+                            o.borrow_mut().prepend(x as i32, (y + 1) as i32);
+                        }
+                    }
+                }
+            }
+        }
+
+        if polygons.is_empty() {
+            self.roi = None;
+            return Ok(());
+        }
+
+        if polygons.len() > 1 {
+            return Err(CoreError::InvalidOperation(
+                CREATE_SELECTION_REQUIRES_SHAPE_ROI,
+            ));
+        }
+
+        let (xs, ys) = polygons.remove(0);
+        let n = xs.len();
+        if n < 3 {
+            self.roi = None;
+            return Ok(());
+        }
+
+        // ShapeRoi.guessType (ShapeRoi.java 533-556)
+        let mut polygon_length = 0.0;
+        for i in 0..n {
+            let next = (i + 1) % n;
+            let dx = (xs[next] - xs[i]).abs() as f64;
+            let dy = (ys[next] - ys[i]).abs() as f64;
+            polygon_length += dx + dy;
+        }
+        let long_edges = polygon_length / (n as f64 * (n as f64).sqrt()) >= 2.0;
+
+        if n == 4 && long_edges {
+            let min_x = *xs.iter().min().unwrap();
+            let max_x = *xs.iter().max().unwrap();
+            let min_y = *ys.iter().min().unwrap();
+            let max_y = *ys.iter().max().unwrap();
+            self.roi = Some(Roi::Rect(RectRoi {
+                x: min_x,
+                y: min_y,
+                width: max_x - min_x,
+                height: max_y - min_y,
+            }));
+        } else {
+            self.roi = Some(Roi::Polygon(PolygonRoi {
+                xpoints: xs,
+                ypoints: ys,
+            }));
+        }
+
+        Ok(())
+    }
 }
+
+#[derive(Debug, Clone)]
+struct Outline {
+    pts: std::collections::VecDeque<(i32, i32)>,
+}
+
+fn collinear(p1: (i32, i32), p2: (i32, i32), p3: (i32, i32)) -> bool {
+    (p2.0 as i64 - p1.0 as i64) * (p3.1 as i64 - p2.1 as i64)
+        == (p2.1 as i64 - p1.1 as i64) * (p3.0 as i64 - p2.0 as i64)
+}
+
+impl Outline {
+    fn new() -> Self {
+        Self {
+            pts: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn append(&mut self, x: i32, y: i32) {
+        let len = self.pts.len();
+        if len >= 2 && collinear(self.pts[len - 2], self.pts[len - 1], (x, y)) {
+            self.pts[len - 1] = (x, y);
+        } else {
+            self.pts.push_back((x, y));
+        }
+    }
+
+    fn prepend(&mut self, x: i32, y: i32) {
+        let len = self.pts.len();
+        if len >= 2 && collinear(self.pts[1], self.pts[0], (x, y)) {
+            self.pts[0] = (x, y);
+        } else {
+            self.pts.push_front((x, y));
+        }
+    }
+
+    fn append_outline(&mut self, other: &Outline) {
+        for &(x, y) in &other.pts {
+            self.pts.push_back((x, y));
+        }
+    }
+
+    fn prepend_outline(&mut self, other: &Outline) {
+        for &(x, y) in other.pts.iter().rev() {
+            self.pts.push_front((x, y));
+        }
+    }
+
+    fn get_polygon(&self) -> (Vec<i32>, Vec<i32>) {
+        let mut v: Vec<(i32, i32)> = self.pts.iter().copied().collect();
+        if v.len() < 3 {
+            let xs = v.iter().map(|p| p.0).collect();
+            let ys = v.iter().map(|p| p.1).collect();
+            return (xs, ys);
+        }
+
+        let mut changed = true;
+        while changed && v.len() >= 3 {
+            changed = false;
+            let n = v.len();
+            let mut next_v = Vec::with_capacity(n);
+            for i in 0..n {
+                let prev = if i == 0 { v[n - 1] } else { v[i - 1] };
+                let curr = v[i];
+                let next = if i + 1 == n { v[0] } else { v[i + 1] };
+                if collinear(prev, curr, next) {
+                    changed = true;
+                } else {
+                    next_v.push(curr);
+                }
+            }
+            v = next_v;
+        }
+
+        let xs = v.iter().map(|p| p.0).collect();
+        let ys = v.iter().map(|p| p.1).collect();
+        (xs, ys)
+    }
+}
+
+type OutlineRef = std::rc::Rc<std::cell::RefCell<Outline>>;
+
+fn is_same(a: &Option<OutlineRef>, b: &Option<OutlineRef>) -> bool {
+    match (a, b) {
+        (Some(ra), Some(rb)) => std::rc::Rc::ptr_eq(ra, rb),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+
+pub const CREATE_SELECTION_NOT_MASK_OR_THRESHOLDED: &str =
+    "This command creates a composite selection from\na mask (8-bit binary image) or from an image\nthresholded using Image>Adjust>Threshold\nThe current image is not a mask and has not\nbeen thresholded.";
+
+pub const CREATE_SELECTION_REQUIRES_SHAPE_ROI: &str =
+    "Composite selection from multiple outlines requires ShapeRoi";
+
 

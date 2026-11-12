@@ -32,6 +32,7 @@ pub enum AppAction {
     RestoreSelection,
     AddToRoiManager,
     CreateMask,
+    CreateSelection,
     RoiManager,
     BrightnessContrast,
     Threshold,
@@ -181,6 +182,7 @@ const EDIT_SELECTION: &[MenuNode] = &[
     item("Restore Selection", Some("Shift+E"), AppAction::RestoreSelection),
     item("Add to Manager", Some("T"), AppAction::AddToRoiManager),
     item("Create Mask", None, AppAction::CreateMask),
+    item("Create Selection", None, AppAction::CreateSelection),
 ];
 const EDIT_MENU: &[MenuNode] = &[
     item("Undo", Some("Z"), AppAction::Undo),
@@ -580,6 +582,9 @@ impl ImageJApp {
                     CreateMask if doc.roi.is_none() && doc.threshold.is_none() => {
                         Err("Area selection, overlay or thresholded image required".into())
                     }
+                    CreateSelection if !doc.is_binary() && doc.threshold.is_none() => {
+                        Err(ij_core::CREATE_SELECTION_NOT_MASK_OR_THRESHOLDED.into())
+                    }
                     // Thresholder.applyThreshold rejects RGB/indexed images;
                     // stacks run the "Convert Stack to Binary" dialog
                     // (Thresholder.java 54-147).
@@ -742,6 +747,17 @@ impl ImageJApp {
                     Err(e) => {
                         self.status_message = format!("Create Mask failed: {e}");
                         self.dialogs.last_error = Some(format!("Create Mask failed: {e}"));
+                    }
+                }
+            }
+            CreateSelection => {
+                match self.session.dispatch(Command::CreateSelection) {
+                    Ok(_) => {
+                        self.status_message = "Create Selection".to_string();
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Create Selection failed: {e}");
+                        self.dialogs.last_error = Some(format!("Create Selection failed: {e}"));
                     }
                 }
             }
