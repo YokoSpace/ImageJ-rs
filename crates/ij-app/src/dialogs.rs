@@ -146,6 +146,9 @@ pub struct DialogState {
     /// ThresholdAdjuster's "16-bit histogram" checkbox; only meaningful for
     /// 16-bit images.
     pub threshold_16bit: bool,
+    /// ThresholdAdjuster's "Stack histogram" checkbox (ThresholdAdjuster.java
+    /// 216); only meaningful when the active image is a stack.
+    pub threshold_stack: bool,
     pub last_error: Option<String>,
     pub show_plugin_filter: bool,
     pub plugin_filter_class: String,
@@ -180,6 +183,7 @@ impl DialogState {
             threshold_method: "IsoData".into(),
             threshold_dark_bg: false,
             threshold_16bit: false,
+            threshold_stack: false,
             last_error: None,
             show_plugin_filter: false,
             plugin_filter_class: String::new(),

@@ -2094,7 +2094,7 @@ impl ImageDocument {
         method: AutoThresholdMethod,
         dark_background: bool,
     ) -> Result<crate::ThresholdLevels, CoreError> {
-        self.set_auto_threshold_with_options(method, dark_background, false)
+        self.set_auto_threshold_with_options(method, dark_background, false, false)
     }
 
     /// Port of `ImageProcessor.setAutoThreshold(String)` including the
@@ -2103,18 +2103,21 @@ impl ImageDocument {
     /// only exposes for 16-bit images (ThresholdAdjuster.java line 503).
     /// Requesting it for 8-bit data is rejected instead of silently changing
     /// the bilevel `addOne` rule.
+    ///
+    /// `whole_stack` is the method string's "stack" keyword, which routes
+    /// through `IJ.setStackThreshold` (IJ.java lines 1505-1547) instead of the
+    /// per-processor path. Without it a multi-slice document thresholds only
+    /// the current slice's processor, exactly like
+    /// `IJ.setAutoThreshold` -> `ip.setAutoThreshold` (IJ.java 1495-1503).
     pub fn set_auto_threshold_with_options(
         &mut self,
         method: AutoThresholdMethod,
         dark_background: bool,
         histogram_16: bool,
+        whole_stack: bool,
     ) -> Result<crate::ThresholdLevels, CoreError> {
-        // Threshold state lives on each ImageProcessor, so a stack needs one
-        // level pair per slice. This increment only models a single value.
-        if self.slices.len() > 1 {
-            return Err(CoreError::UnsupportedThresholdStack {
-                stack_size: self.slices.len(),
-            });
+        if whole_stack {
+            return self.set_stack_auto_threshold(method, dark_background, histogram_16);
         }
         let (levels, reset_display_range) = match self.plane() {
             PixelPlane::Gray8(pixels) => {
@@ -2146,10 +2149,10 @@ impl ImageDocument {
                     pixel_type: "8-bit color (indexed)",
                 });
             }
-            PixelPlane::Gray32(_) => {
-                return Err(CoreError::UnsupportedThreshold {
-                    pixel_type: "32-bit float",
-                });
+            PixelPlane::Gray32(pixels) => {
+                let (levels, range) =
+                    self.auto_threshold_gray32(pixels, method, dark_background, histogram_16)?;
+                (levels, Some(range))
             }
             PixelPlane::ColorRgb(_) => {
                 return Err(CoreError::UnsupportedThreshold { pixel_type: "RGB" });
@@ -2280,6 +2283,381 @@ impl ImageDocument {
             lower: java_round(lower),
             upper: java_round(upper),
         })
+    }
+
+    /// 32-bit `ImageProcessor.setAutoThreshold(Method, boolean, int)` path
+    /// (ImageProcessor.java lines 631-675): `resetMinAndMax()` uses
+    /// FloatProcessor.findMinAndMax, which skips NaN pixels and leaves
+    /// min=max=NaN on an all-NaN plane (FloatProcessor.java lines 92-114),
+    /// `convertToByte(true)` builds the histogram from create8BitImage output
+    /// (FloatProcessor.java lines 190-208), and `scaleAndSetThreshold` maps
+    /// the 0-255 levels with the 32-bit full-range snaps
+    /// (ImageProcessor.java lines 752-774). FloatProcessor.setThreshold
+    /// stores the raw doubles without clamping or rounding
+    /// (FloatProcessor.java lines 1061-1090).
+    ///
+    /// `histogram16` can never be set on a 32-bit processor
+    /// (ImageProcessor.java line 599), so the "16" keyword only drops
+    /// `addOne` (line 600).
+    fn auto_threshold_gray32(
+        &self,
+        pixels: &[f32],
+        method: AutoThresholdMethod,
+        dark_background: bool,
+        histogram_16: bool,
+    ) -> Result<(crate::ThresholdLevels, crate::DisplayRange), CoreError> {
+        let (min, max) = gray32_min_max(pixels);
+        let histogram = self.threshold_histogram_gray32_as_byte(pixels, min, max);
+        let add_one = !histogram_16;
+        let threshold = auto_threshold_histogram_bins(method, &histogram, add_one)?;
+        let (mut lower, upper) = if dark_background {
+            (
+                threshold as f64 + if add_one { 1.0 } else { 0.0 },
+                255.0,
+            )
+        } else {
+            (0.0, threshold as f64)
+        };
+        if lower > 255.0 {
+            lower = 255.0;
+        }
+        let (lower, upper) = if max > min {
+            let lower = if lower == 0.0 {
+                // ImageProcessor.java line 760: Math.min(min, -1e30).
+                min.min(-1e30)
+            } else {
+                min + (lower / 255.0) * (max - min)
+            };
+            let upper = if upper == 255.0 {
+                // ImageProcessor.java line 767: Math.max(max, 1e30).
+                max.max(1e30)
+            } else {
+                min + (upper / 255.0) * (max - min)
+            };
+            (lower, upper)
+        } else {
+            // ImageProcessor.java line 771; also covers NaN min/max, where
+            // `max > min` is false.
+            (min, min)
+        };
+        Ok((
+            crate::ThresholdLevels { lower, upper },
+            crate::DisplayRange { min, max },
+        ))
+    }
+
+    /// The 256-bin histogram of `convertToByte(true)` output over the ROI.
+    /// FloatProcessor.create8BitImage computes
+    /// `(int)((pixel-min)*scale+0.5)` clamped to 255 (FloatProcessor.java
+    /// lines 190-208); a NaN pixel casts to 0 like the JVM `(int)NaN`.
+    fn threshold_histogram_gray32_as_byte(
+        &self,
+        pixels: &[f32],
+        min: f64,
+        max: f64,
+    ) -> Vec<i64> {
+        let mut histogram = vec![0i64; 256];
+        let region = self.threshold_region();
+        if region.width == 0 || region.height == 0 {
+            return histogram;
+        }
+        let scale = 255.0 / (max - min);
+        for y in region.y..(region.y + region.height) {
+            let base = (y * self.width + region.x) as usize;
+            for offset in 0..region.width as usize {
+                let x = region.x + offset as u32;
+                if region.mask.as_ref().is_some_and(|m| !m.contains(x, y)) {
+                    continue;
+                }
+                let mut value = pixels[base + offset] as f64 - min;
+                if value < 0.0 {
+                    value = 0.0;
+                }
+                let mut ivalue = (value * scale + 0.5) as i32;
+                if ivalue > 255 {
+                    ivalue = 255;
+                }
+                histogram[ivalue as usize] += 1;
+            }
+        }
+        histogram
+    }
+
+    /// `IJ.setStackThreshold` (original_imagej/ij/IJ.java lines 1505-1547):
+    /// the method string's "stack" keyword. A fresh `AutoThresholder` keeps
+    /// the default `bilevelSubractOne = true` (AutoThresholder.java line 9),
+    /// `StackStatistics` aggregates the ROI histograms of every slice, and
+    /// for non-hist16 modes the 0-255 levels scale linearly over the stack
+    /// min/max with `ip.setMinAndMax(min, max)` — without the 32-bit +-1e30
+    /// snap that `scaleAndSetThreshold` applies (IJ.java 1538-1545).
+    fn set_stack_auto_threshold(
+        &mut self,
+        method: AutoThresholdMethod,
+        dark_background: bool,
+        histogram_16: bool,
+    ) -> Result<crate::ThresholdLevels, CoreError> {
+        // The 65536-bin or float-range histogram that StackStatistics builds
+        // for this bit depth, plus the (stats.min, stats.max) that drive the
+        // level scaling and setMinAndMax.
+        enum StackHistogram {
+            Bin8(Vec<i64>),
+            Stats16 {
+                histogram: Vec<i64>,
+                histogram16: Vec<i64>,
+                min: f64,
+                max: f64,
+            },
+            Stats32 {
+                histogram: Vec<i64>,
+                min: f64,
+                max: f64,
+            },
+        }
+        let stats = match self.plane() {
+            PixelPlane::Gray8(_) => {
+                // StackStatistics.sum8BitHistograms (StackStatistics.java
+                // 143-177): per-slice 256-bin ROI histograms, summed.
+                let mut histogram = vec![0i64; 256];
+                for slice in &self.slices {
+                    let PixelPlane::Gray8(pixels) = slice else {
+                        return Err(CoreError::UnsupportedThreshold {
+                            pixel_type: "mixed stack",
+                        });
+                    };
+                    for (bin, count) in self
+                        .threshold_histogram_gray8(pixels)
+                        .iter()
+                        .enumerate()
+                    {
+                        histogram[bin] += count;
+                    }
+                }
+                StackHistogram::Bin8(histogram)
+            }
+            PixelPlane::Gray16(_) => {
+                // StackStatistics.sum16BitHistograms (StackStatistics.java
+                // 253-283): the combined 65536-bin ROI histogram, then
+                // get16BitStatistics's 256-bin rebin over [min,max]
+                // (StackStatistics.java 291-326).
+                let region = self.threshold_region();
+                let mut histogram16 = vec![0i64; 65536];
+                for slice in &self.slices {
+                    let PixelPlane::Gray16(pixels) = slice else {
+                        return Err(CoreError::UnsupportedThreshold {
+                            pixel_type: "mixed stack",
+                        });
+                    };
+                    self.count_gray16_histogram(pixels, &region, &mut histogram16);
+                }
+                // getRaw16BitMinAndMax (StackStatistics.java 286-290): an
+                // all-zero histogram leaves min=65535, max=0.
+                let mut min = 0usize;
+                while min < 65535 && histogram16[min] == 0 {
+                    min += 1;
+                }
+                let mut max = 65535usize;
+                while max > 0 && histogram16[max] == 0 {
+                    max -= 1;
+                }
+                // get16BitStatistics (StackStatistics.java 291-326).
+                let n_bins = 256usize;
+                let bin_size = (max as f64 - min as f64 + 1.0) / n_bins as f64;
+                let scale = 1.0 / bin_size;
+                let mut histogram = vec![0i64; n_bins];
+                for (i, &count) in histogram16.iter().enumerate().take(max + 1).skip(min) {
+                    if count == 0 {
+                        continue;
+                    }
+                    let mut index = (scale * (i as f64 - min as f64)) as usize;
+                    if index >= n_bins {
+                        index = n_bins - 1;
+                    }
+                    histogram[index] += count;
+                }
+                StackHistogram::Stats16 {
+                    histogram,
+                    histogram16,
+                    min: min as f64,
+                    max: max as f64,
+                }
+            }
+            PixelPlane::Gray32(_) => {
+                // StackStatistics.doCalculations for 32-bit
+                // (StackStatistics.java 30-142): the first pass scans the
+                // stack min/max over the ROI with +-Float.MAX_VALUE limits,
+                // so NaN and +-Inf pixels never count; the second pass bins
+                // finite values into 256 bins over [min,max].
+                let region = self.threshold_region();
+                let mut min = f64::MAX;
+                let mut max = f64::MIN;
+                for slice in &self.slices {
+                    let PixelPlane::Gray32(pixels) = slice else {
+                        return Err(CoreError::UnsupportedThreshold {
+                            pixel_type: "mixed stack",
+                        });
+                    };
+                    if region.width == 0 || region.height == 0 {
+                        continue;
+                    }
+                    for y in region.y..(region.y + region.height) {
+                        let base = (y * self.width + region.x) as usize;
+                        for offset in 0..region.width as usize {
+                            let x = region.x + offset as u32;
+                            if region.mask.as_ref().is_some_and(|m| !m.contains(x, y)) {
+                                continue;
+                            }
+                            let v = pixels[base + offset] as f64;
+                            // StackStatistics.java 92-98: v >= -Float.MAX_VALUE
+                            // && v <= Float.MAX_VALUE excludes NaN and +-Inf.
+                            if v >= -(f32::MAX as f64) && v <= f32::MAX as f64 {
+                                if v < min {
+                                    min = v;
+                                }
+                                if v > max {
+                                    max = v;
+                                }
+                            }
+                        }
+                    }
+                }
+                let n_bins = 256usize;
+                let scale = n_bins as f64 / (max - min);
+                let mut histogram = vec![0i64; n_bins];
+                for slice in &self.slices {
+                    let PixelPlane::Gray32(pixels) = slice else {
+                        unreachable!();
+                    };
+                    if region.width == 0 || region.height == 0 {
+                        continue;
+                    }
+                    for y in region.y..(region.y + region.height) {
+                        let base = (y * self.width + region.x) as usize;
+                        for offset in 0..region.width as usize {
+                            let x = region.x + offset as u32;
+                            if region.mask.as_ref().is_some_and(|m| !m.contains(x, y)) {
+                                continue;
+                            }
+                            let v = pixels[base + offset] as f64;
+                            if v >= -(f32::MAX as f64)
+                                && v <= f32::MAX as f64
+                                && v >= min
+                                && v <= max
+                            {
+                                let mut index = (scale * (v - min)) as i64;
+                                if index >= n_bins as i64 {
+                                    index = n_bins as i64 - 1;
+                                }
+                                histogram[index as usize] += 1;
+                            }
+                        }
+                    }
+                }
+                StackHistogram::Stats32 {
+                    histogram,
+                    min,
+                    max,
+                }
+            }
+            PixelPlane::Color256 { .. } => {
+                return Err(CoreError::UnsupportedThreshold {
+                    pixel_type: "8-bit color (indexed)",
+                });
+            }
+            PixelPlane::ColorRgb(_) => {
+                return Err(CoreError::UnsupportedThreshold { pixel_type: "RGB" });
+            }
+        };
+
+        let add_one = !histogram_16;
+        let (histogram, tmax, stack_min, stack_max, use_hist16): (&[i64], f64, f64, f64, bool) =
+            match &stats {
+                StackHistogram::Bin8(histogram) => (histogram, 255.0, 0.0, 255.0, false),
+                StackHistogram::Stats16 {
+                    histogram,
+                    histogram16,
+                    min,
+                    max,
+                } => {
+                    if histogram_16 {
+                        (histogram16, 65535.0, *min, *max, true)
+                    } else {
+                        (histogram, 255.0, *min, *max, false)
+                    }
+                }
+                StackHistogram::Stats32 {
+                    histogram,
+                    min,
+                    max,
+                } => (histogram, 255.0, *min, *max, false),
+            };
+        // IJ.setStackThreshold builds a fresh AutoThresholder, so the bilevel
+        // shortcut always subtracts one regardless of the "16" keyword
+        // (IJ.java 1516, AutoThresholder.java 9).
+        let threshold = auto_threshold_histogram_bins(method, &histogram, true)?;
+        let (mut lower, upper) = if dark_background {
+            (
+                threshold as f64 + if add_one { 1.0 } else { 0.0 },
+                tmax,
+            )
+        } else {
+            (0.0, threshold as f64)
+        };
+        if !use_hist16 {
+            if lower > 255.0 {
+                lower = 255.0;
+            }
+            let (lower, upper) = if stack_max > stack_min {
+                (
+                    stack_min + (lower / 255.0) * (stack_max - stack_min),
+                    stack_min + (upper / 255.0) * (stack_max - stack_min),
+                )
+            } else {
+                (stack_min, stack_min)
+            };
+            // IJ.java 1545: ip.setMinAndMax(min, max). FloatProcessor casts
+            // to float (FloatProcessor.java 125-128), ShortProcessor rounds
+            // to int (ShortProcessor.java 268-273), ByteProcessor keeps the
+            // 0-255 range.
+            self.display_range = match self.plane() {
+                PixelPlane::Gray32(_) => crate::DisplayRange {
+                    min: stack_min as f32 as f64,
+                    max: stack_max as f32 as f64,
+                },
+                PixelPlane::Gray16(_) => crate::DisplayRange {
+                    min: java_round(stack_min),
+                    max: java_round(stack_max),
+                },
+                _ => crate::DisplayRange {
+                    min: stack_min,
+                    max: stack_max,
+                },
+            };
+            let levels = crate::ThresholdLevels { lower, upper };
+            self.threshold = Some(self.clamp_threshold_levels(levels));
+            return Ok(self.threshold.unwrap());
+        }
+        let levels = crate::ThresholdLevels { lower, upper };
+        self.threshold = Some(self.clamp_threshold_levels(levels));
+        Ok(self.threshold.unwrap())
+    }
+
+    /// Applies the `setThreshold` clamping of the current plane's processor:
+    /// ByteProcessor keeps [0,255] (ByteProcessor.java 480-486),
+    /// ShortProcessor rounds and keeps [0,65535] (ShortProcessor.java
+    /// 1130-1166), FloatProcessor stores the raw doubles
+    /// (FloatProcessor.java 1061-1090).
+    fn clamp_threshold_levels(&self, levels: crate::ThresholdLevels) -> crate::ThresholdLevels {
+        match self.plane() {
+            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => crate::ThresholdLevels {
+                lower: levels.lower.max(0.0),
+                upper: levels.upper.min(255.0),
+            },
+            PixelPlane::Gray16(_) => crate::ThresholdLevels {
+                lower: java_round(levels.lower.max(0.0)),
+                upper: java_round(levels.upper.min(65535.0)),
+            },
+            _ => levels,
+        }
     }
 
     /// `ByteProcessor.getHistogram()` over the processor's ROI and mask
@@ -2547,6 +2925,32 @@ pub(crate) fn gray16_min_max(pixels: &[u16]) -> (u16, u16) {
         max = max.max(value);
     }
     (min, max)
+}
+
+/// `FloatProcessor.findMinAndMax` (FloatProcessor.java lines 92-114): seeds
+/// min/max from the first non-NaN pixel, so an all-NaN plane keeps
+/// min=max=NaN and any later NaN is skipped by the ordered comparisons.
+pub(crate) fn gray32_min_max(pixels: &[f32]) -> (f64, f64) {
+    let mut min = f32::NAN;
+    let mut max = f32::NAN;
+    let mut index = 0;
+    while index < pixels.len() {
+        if !pixels[index].is_nan() {
+            min = pixels[index];
+            max = pixels[index];
+            index += 1;
+            break;
+        }
+        index += 1;
+    }
+    for &value in &pixels[index..] {
+        if value < min {
+            min = value;
+        } else if value > max {
+            max = value;
+        }
+    }
+    (min as f64, max as f64)
 }
 
 /// `AutoThresholder.Otsu` (AutoThresholder.java lines 850-904). `max_bcv < bcv`

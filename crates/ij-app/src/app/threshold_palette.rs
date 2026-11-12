@@ -73,16 +73,18 @@ impl ImageJApp {
         let levels = doc.threshold;
         let has_threshold = levels.is_some();
         let counts = display_histogram(doc).counts;
-        let can_auto = bit_depth != 32 && doc.stack_size() == 1;
         if bit_depth != 16 {
             self.dialogs.threshold_16bit = false;
+        }
+        if doc.stack_size() <= 1 {
+            self.dialogs.threshold_stack = false;
         }
 
         let mut state = ui.ctx().data(|data| {
             data.get_temp::<PaletteState>(egui::Id::new(PALETTE_STATE))
                 .unwrap_or_default()
         });
-        let auto_on_open = state.image_id != Some(id) && levels.is_none() && can_auto;
+        let auto_on_open = state.image_id != Some(id) && levels.is_none();
         if state.image_id != Some(id) || state.last_levels != levels {
             state.image_id = Some(id);
             state.last_levels = levels;
@@ -170,6 +172,16 @@ impl ImageJApp {
             )
             .on_disabled_hover_text("Requires a 16-bit image")
             .changed();
+        // ThresholdAdjuster.java line 216: "Stack histogram" checkbox; the
+        // "stack" keyword only aggregates when the image has slices
+        // (entireStack, line 499-501).
+        auto_changed |= ui
+            .add_enabled(
+                doc.stack_size() > 1,
+                egui::Checkbox::new(&mut self.dialogs.threshold_stack, "Stack histogram"),
+            )
+            .on_disabled_hover_text("Requires a stack")
+            .changed();
         ui.horizontal(|ui| {
             ui.label("Lower:");
             ui.add(egui::DragValue::new(&mut state.lower_input).speed(1.0));
@@ -179,16 +191,11 @@ impl ImageJApp {
         let mut action = None;
         ui.horizontal(|ui| {
             for label in ["Auto", "Reset", "Set", "Apply"] {
-                let enabled = label != "Auto" || can_auto;
-                let response = ui.add_enabled(enabled, egui::Button::new(label));
+                let response = ui.add(egui::Button::new(label));
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(egui::Id::new((PALETTE_STATE, label)), response.rect)
                 });
-                if label == "Auto" && !can_auto {
-                    response.on_disabled_hover_text(
-                        "Auto threshold is not supported on 32-bit images or stacks yet",
-                    );
-                } else if response.clicked() {
+                if response.clicked() {
                     action = Some(label);
                 }
             }
@@ -239,13 +246,15 @@ impl ImageJApp {
                     &self.dialogs.threshold_method.clone(),
                     self.dialogs.threshold_dark_bg,
                     self.dialogs.threshold_16bit,
+                    self.dialogs.threshold_stack,
                 );
             }
-            _ if (auto_changed || auto_on_open) && can_auto => {
+            _ if auto_changed || auto_on_open => {
                 let _ = self.auto_threshold_active_with_options(
                     &self.dialogs.threshold_method.clone(),
                     self.dialogs.threshold_dark_bg,
                     self.dialogs.threshold_16bit,
+                    self.dialogs.threshold_stack,
                 );
             }
             _ => {}

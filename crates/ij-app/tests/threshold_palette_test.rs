@@ -297,7 +297,7 @@ fn gray32_palette_allows_manual_threshold_and_applies_java_mask() {
 
     render_palette(&ctx, &mut app, vec![]);
     click_button(&ctx, &mut app, "Auto");
-    assert!(app.session.get_image(id).unwrap().threshold.is_none());
+    assert!(app.session.get_image(id).unwrap().threshold.is_some());
     assert!(app.dialogs.last_error.is_none());
     drag_lower_slider(&ctx, &mut app);
     let levels = app.session.get_image(id).unwrap().threshold.unwrap();
@@ -337,11 +337,16 @@ fn set_without_existing_threshold_uses_display_range() {
     .unwrap();
     for doc in [float, stack] {
         // ThresholdAdjuster.doSet starts with the display range when no
-        // threshold is set (ThresholdAdjuster.java 749-755, 583-590).
-        let expected = doc.display_range;
+        // threshold is set (ThresholdAdjuster.java 749-755, 583-590). Reset
+        // calls resetThreshold -> resetMinAndMax, which collapses the range
+        // to the data min/max, so read it after clicking Reset.
         let ctx = Context::default();
         let mut app = ImageJApp::new();
         let id = open_document(&mut app, doc);
+        click_button(&ctx, &mut app, "Reset");
+        let image = app.session.get_image(id).unwrap();
+        assert!(image.threshold.is_none());
+        let expected = image.display_range;
         click_button(&ctx, &mut app, "Set");
         let levels = app.session.get_image(id).unwrap().threshold.unwrap();
         assert_eq!((levels.lower, levels.upper), (expected.min, expected.max));
@@ -374,7 +379,7 @@ fn stack_palette_manual_threshold_opens_binary_dialog_and_applies_java_mask() {
 
         render_palette(&ctx, &mut app, vec![]);
         click_button(&ctx, &mut app, "Auto");
-        assert!(app.session.get_image(id).unwrap().threshold.is_none());
+        assert!(app.session.get_image(id).unwrap().threshold.is_some());
         assert!(app.dialogs.last_error.is_none());
         drag_lower_slider(&ctx, &mut app);
         let levels = app.session.get_image(id).unwrap().threshold.unwrap();

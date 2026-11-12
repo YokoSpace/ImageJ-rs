@@ -153,6 +153,7 @@ fn any_document_change_during_a_run_invalidates_the_ticket() {
                     method: "IsoData".into(),
                     dark_background: false,
                     histogram_16: false,
+                    stack: false,
                 })
                 .unwrap();
             }),

@@ -66,6 +66,7 @@ fn reset_threshold_is_a_session_command_that_records_the_macro() {
             method: "IsoData".into(),
             dark_background: false,
             histogram_16: false,
+            stack: false,
         })
         .unwrap();
     assert!(session.active_doc().unwrap().threshold.is_some());

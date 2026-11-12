@@ -1269,7 +1269,7 @@ impl ImageJApp {
         method: &str,
         dark_background: bool,
     ) -> Result<(), SessionError> {
-        self.auto_threshold_active_with_options(method, dark_background, false)
+        self.auto_threshold_active_with_options(method, dark_background, false, false)
     }
 
     pub fn auto_threshold_active_with_options(
@@ -1277,6 +1277,7 @@ impl ImageJApp {
         method: &str,
         dark_background: bool,
         histogram_16: bool,
+        stack: bool,
     ) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("AutoThreshold") {
             return Err(err);
@@ -1285,6 +1286,7 @@ impl ImageJApp {
             method: method.to_string(),
             dark_background,
             histogram_16,
+            stack,
         }) {
             Ok(o) => o,
             Err(e) => {

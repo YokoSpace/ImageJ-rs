@@ -296,18 +296,17 @@ fn threshold_and_bc_ui_guards_unsupported_images() {
     assert!(app.session.get_image(id).unwrap().threshold.is_none());
     assert_eq!(app.status_message, "Threshold reset");
 
-    // 3. Multi-slice stack: AutoThreshold returns error
+    // 3. Multi-slice stack: AutoThreshold thresholds the current slice
+    // (IJ.setAutoThreshold routes non-"stack" method strings to the current
+    // processor, IJ.java 1495-1503).
     let plane1 = PixelPlane::Gray8(vec![0; 16]);
     let plane2 = PixelPlane::Gray8(vec![255; 16]);
     let stack_doc = ImageDocument::new_stack("stack", 4, 4, vec![plane1, plane2]).unwrap();
     let stack_id = app.session.insert_doc(stack_doc);
     app.set_active_window(stack_id).unwrap();
 
-    let stack_err = app.auto_threshold_active("IsoData", false);
-    assert!(
-        stack_err.is_err(),
-        "AutoThreshold on multi-slice stack must error"
-    );
+    app.auto_threshold_active("IsoData", false).unwrap();
+    assert!(app.session.get_image(stack_id).unwrap().threshold.is_some());
 
     // 4. RGB image: AutoThreshold returns error
     let rgb_plane = PixelPlane::ColorRgb(vec![0; 16]);
@@ -346,7 +345,7 @@ fn sixteen_bit_threshold_goes_through_session_with_histogram_option() {
     );
 
     // Explicit 16-bit histogram mode goes through the same session command.
-    app.auto_threshold_active_with_options("Otsu", false, true)
+    app.auto_threshold_active_with_options("Otsu", false, true, false)
         .unwrap();
     let doc = app.session.get_image(id).unwrap();
     assert_eq!(

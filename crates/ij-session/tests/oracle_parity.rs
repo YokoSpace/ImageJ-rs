@@ -8183,6 +8183,7 @@ fn session_auto_threshold_records_macro_and_sets_state() {
             method: "Otsu".into(),
             dark_background: false,
             histogram_16: false,
+            stack: false,
         })
         .unwrap();
     match outcome {
@@ -8201,6 +8202,7 @@ fn session_auto_threshold_records_macro_and_sets_state() {
             method: "IsoData".into(),
             dark_background: true,
             histogram_16: false,
+            stack: false,
         })
         .unwrap();
     assert_eq!(
@@ -8241,6 +8243,7 @@ fn auto_threshold_rejects_unimplemented_methods() {
                 method: method.into(),
                 dark_background: false,
                 histogram_16: false,
+                stack: false,
             })
             .unwrap_err();
         let message = error.to_string();
@@ -8253,11 +8256,7 @@ fn auto_threshold_rejects_unimplemented_methods() {
 
 #[test]
 fn auto_threshold_rejects_unsupported_pixel_types() {
-    let cases: [(ImageDocument, &str); 3] = [
-        (
-            ImageDocument::new_ramp_32bit("f.tif", 4, 4).unwrap(),
-            "32-bit float",
-        ),
+    let cases: [(ImageDocument, &str); 2] = [
         (
             ImageDocument::new(
                 "c.tif",
@@ -8286,6 +8285,7 @@ fn auto_threshold_rejects_unsupported_pixel_types() {
                 method: "Otsu".into(),
                 dark_background: false,
                 histogram_16: false,
+                stack: false,
             })
             .unwrap_err();
         assert!(
@@ -8296,7 +8296,9 @@ fn auto_threshold_rejects_unsupported_pixel_types() {
 }
 
 #[test]
-fn auto_threshold_rejects_stacks_instead_of_silently_using_one_slice() {
+fn auto_threshold_on_stack_thresholds_current_slice_or_whole_stack() {
+    // IJ.setAutoThreshold routes "stack" method strings to setStackThreshold
+    // and everything else to the current processor (IJ.java 1495-1503).
     let stack = ImageDocument::new_stack(
         "stack.tif",
         4,
@@ -8311,16 +8313,25 @@ fn auto_threshold_rejects_stacks_instead_of_silently_using_one_slice() {
     save_tiff(&path, &stack).unwrap();
     let mut session = Session::new();
     session.dispatch(Command::OpenTiff { path }).unwrap();
-    for histogram_16 in [false, true] {
-        let error = session
-            .dispatch(Command::AutoThreshold {
-                method: "Otsu".into(),
-                dark_background: false,
-                histogram_16,
-            })
-            .unwrap_err();
-        assert!(error.to_string().contains("stack"), "{error}");
-    }
+    // The per-slice path works on a stack; only the "16" option on 8-bit
+    // remains rejected.
+    session
+        .dispatch(Command::AutoThreshold {
+            method: "Otsu".into(),
+            dark_background: false,
+            histogram_16: false,
+            stack: false,
+        })
+        .unwrap();
+    let error = session
+        .dispatch(Command::AutoThreshold {
+            method: "Otsu".into(),
+            dark_background: false,
+            histogram_16: true,
+            stack: false,
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("16-bit histogram"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -8408,7 +8419,7 @@ fn assert_auto_threshold_16_matches_oracle(
         oracle_auto_threshold_16(bridge, doc, prelude, method_and_options);
     let mut rust = doc.clone();
     let levels = rust
-        .set_auto_threshold_with_options(method, dark_background, histogram_16)
+        .set_auto_threshold_with_options(method, dark_background, histogram_16, false)
         .unwrap();
     assert_eq!(
         (levels.lower, levels.upper),
@@ -8689,7 +8700,7 @@ fn parity_16bit_empty_mask_roi_matches_java_oracle() {
 
     let mut rust = doc.clone();
     let error = rust
-        .set_auto_threshold_with_options(ij_core::AutoThresholdMethod::Otsu, false, true)
+        .set_auto_threshold_with_options(ij_core::AutoThresholdMethod::Otsu, false, true, false)
         .unwrap_err();
     assert!(matches!(
         error,
@@ -8886,6 +8897,7 @@ fn session_auto_threshold_16bit_default_records_macro_and_resets_display_range()
             method: "Otsu".into(),
             dark_background: false,
             histogram_16: false,
+            stack: false,
         })
         .unwrap();
     match outcome {
@@ -8925,6 +8937,7 @@ fn session_auto_threshold_16bit_hist16_records_option_without_dirtying() {
             method: "Otsu".into(),
             dark_background: false,
             histogram_16: true,
+            stack: false,
         })
         .unwrap();
     match outcome {
@@ -8958,6 +8971,7 @@ fn session_auto_threshold_16bit_hist16_records_option_without_dirtying() {
             method: "IsoData".into(),
             dark_background: true,
             histogram_16: true,
+            stack: false,
         })
         .unwrap();
     assert_eq!(
@@ -8981,11 +8995,656 @@ fn auto_threshold_rejects_16bit_histogram_option_on_8bit_images() {
             method: "Otsu".into(),
             dark_background: false,
             histogram_16: true,
+            stack: false,
         })
         .unwrap_err();
     assert!(
         error.to_string().contains("16-bit histogram"),
         "unexpected error: {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P4.1a: AutoThreshold for 32-bit float images and whole stacks.
+//
+// The 32-bit single-image path is ImageProcessor.setAutoThreshold(Method, ...)
+// (original_imagej/ij/process/ImageProcessor.java lines 631-675):
+// resetMinAndMax() calls FloatProcessor.findMinAndMax, which skips NaN pixels
+// and leaves min=max=NaN on an all-NaN plane (FloatProcessor.java lines
+// 92-114). convertToByte(true) maps pixels through create8BitImage with
+// scale 255/(max-min); NaN casts to int 0 (FloatProcessor.java lines 190-208).
+// scaleAndSetThreshold then maps the 0-255 levels with the 32-bit full-range
+// snaps lower==0 -> Math.min(min,-1e30) and upper==255 -> Math.max(max,1e30)
+// (ImageProcessor.java lines 752-774), and FloatProcessor.setThreshold stores
+// the raw doubles without clamping (FloatProcessor.java lines 1061-1090).
+//
+// The "stack" keyword routes through IJ.setStackThreshold
+// (original_imagej/ij/IJ.java lines 1505-1547): a fresh AutoThresholder keeps
+// the default bilevelSubractOne=true, StackStatistics sums or rebins the
+// per-slice ROI histograms (StackStatistics.java lines 143-200, 253-283,
+// 30-142), and for non-hist16 modes the levels scale linearly over the stack
+// min/max with ip.setMinAndMax(min,max) and no +-1e30 snap.
+// ---------------------------------------------------------------------------
+
+fn pattern_32bit(title: &str, width: u32, height: u32, values: &[f32]) -> ImageDocument {
+    assert_eq!(values.len(), (width * height) as usize);
+    ImageDocument::new(title, width, height, PixelPlane::Gray32(values.to_vec())).unwrap()
+}
+
+/// Runs `setAutoThreshold` in the oracle and reads back the threshold levels
+/// plus the current processor's display range via printed values, so NaN and
+/// Infinity survive exactly (TIFF round-tripping them is not guaranteed).
+fn oracle_auto_threshold_levels(
+    bridge: &JavaOracleBridge,
+    doc: &ImageDocument,
+    prelude: &str,
+    method_and_options: &str,
+) -> (f64, f64, f64, f64, ImageDocument) {
+    let out = bridge
+        .run_macro_on_image(
+            doc,
+            &format!(
+                "{prelude} setAutoThreshold(\"{method_and_options}\"); \
+                 getThreshold(l1,l2); getMinAndMax(mn,mx); \
+                 print(\"THRESH \"+d2s(l1,15)+\" \"+d2s(l2,15)+\" RANGE \"+d2s(mn,15)+\" \"+d2s(mx,15));"
+            ),
+        )
+        .unwrap();
+    let line = out
+        .stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("THRESH "))
+        .unwrap_or_else(|| panic!("oracle printed no THRESH line:\n{}", out.stdout));
+    let numbers: Vec<f64> = line
+        .trim()
+        .split_whitespace()
+        .filter_map(|token| token.parse::<f64>().ok())
+        .collect();
+    assert_eq!(
+        numbers.len(),
+        4,
+        "expected 4 numbers in oracle THRESH/RANGE line: {line:?}"
+    );
+    (
+        numbers[0],
+        numbers[1],
+        numbers[2],
+        numbers[3],
+        out.output_image.expect("oracle must return saved TIFF"),
+    )
+}
+
+fn assert_f64_close(actual: f64, expected: f64, what: &str) {
+    if expected.is_nan() {
+        assert!(actual.is_nan(), "{what}: expected NaN, got {actual}");
+        return;
+    }
+    if expected.is_infinite() {
+        assert_eq!(actual, expected, "{what}: expected {expected}");
+        return;
+    }
+    // The oracle prints through d2s(,15), which keeps ~16 significant
+    // digits; a relative epsilon of 1e-9 separates any formula error from
+    // print rounding without weakening the comparison.
+    let tolerance = 1e-9 * expected.abs().max(1.0);
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{what}: expected {expected}, got {actual}"
+    );
+}
+
+fn assert_f64_pair_eq(actual: (f64, f64), expected: (f64, f64), what: &str) {
+    assert_f64_close(actual.0, expected.0, &format!("{what} (lower)"));
+    assert_f64_close(actual.1, expected.1, &format!("{what} (upper)"));
+}
+
+/// NaN != NaN under derived PartialEq, so compare float planes pixel-wise.
+fn assert_planes_identical(actual: &[PixelPlane], expected: &[PixelPlane]) {
+    assert_eq!(actual.len(), expected.len(), "slice count changed");
+    for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+        match (a, e) {
+            (PixelPlane::Gray32(ap), PixelPlane::Gray32(ep)) => {
+                assert_eq!(ap.len(), ep.len(), "slice {i} length changed");
+                for (j, (x, y)) in ap.iter().zip(ep).enumerate() {
+                    assert!(
+                        x == y || (x.is_nan() && y.is_nan()),
+                        "slice {i} pixel {j}: {x} vs {y}"
+                    );
+                }
+            }
+            _ => assert_eq!(a, e, "slice {i} differs"),
+        }
+    }
+}
+
+/// 32-bit processors store display min/max as floats; Java's getMinAndMax
+/// therefore returns the f64 of the f32 value (FloatProcessor.java 125-153).
+fn assert_32bit_threshold_matches_oracle(
+    bridge: &JavaOracleBridge,
+    doc: &ImageDocument,
+    prelude: &str,
+    method_and_options: &str,
+    method: ij_core::AutoThresholdMethod,
+    dark_background: bool,
+    histogram_16: bool,
+    whole_stack: bool,
+) {
+    let (lower, upper, dmin, dmax, _out_doc) =
+        oracle_auto_threshold_levels(bridge, doc, prelude, method_and_options);
+    let mut rust = doc.clone();
+    let levels = rust
+        .set_auto_threshold_with_options(method, dark_background, histogram_16, whole_stack)
+        .unwrap();
+    assert_f64_pair_eq(
+        (levels.lower, levels.upper),
+        (lower, upper),
+        &format!("threshold for {method_and_options:?} (prelude {prelude:?})"),
+    );
+    // Display range: cast through f32 like FloatProcessor's float fields.
+    assert_f64_pair_eq(
+        (
+            rust.display_range.min as f32 as f64,
+            rust.display_range.max as f32 as f64,
+        ),
+        (dmin, dmax),
+        &format!("display range for {method_and_options:?}"),
+    );
+    assert_planes_identical(&rust.slices, &doc.slices);
+}
+
+fn assert_stack_threshold_matches_oracle(
+    bridge: &JavaOracleBridge,
+    doc: &ImageDocument,
+    prelude: &str,
+    method_and_options: &str,
+    method: ij_core::AutoThresholdMethod,
+    dark_background: bool,
+    histogram_16: bool,
+) {
+    let (lower, upper, dmin, dmax, _out_doc) =
+        oracle_auto_threshold_levels(bridge, doc, prelude, method_and_options);
+    let mut rust = doc.clone();
+    let levels = rust
+        .set_auto_threshold_with_options(method, dark_background, histogram_16, true)
+        .unwrap();
+    assert_f64_pair_eq(
+        (levels.lower, levels.upper),
+        (lower, upper),
+        &format!("stack threshold for {method_and_options:?} (prelude {prelude:?})"),
+    );
+    let bit_depth = doc.plane().bit_depth();
+    let (rust_min, rust_max) = if bit_depth == 32 {
+        (
+            rust.display_range.min as f32 as f64,
+            rust.display_range.max as f32 as f64,
+        )
+    } else {
+        (rust.display_range.min, rust.display_range.max)
+    };
+    assert_f64_pair_eq(
+        (rust_min, rust_max),
+        (dmin, dmax),
+        &format!("stack display range for {method_and_options:?}"),
+    );
+    assert_planes_identical(&rust.slices, &doc.slices);
+}
+
+#[test]
+fn parity_32bit_auto_threshold_ramp_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new_ramp_32bit("ramp32.tif", 16, 16).unwrap();
+    for (options, method, dark, hist16) in [
+        ("Otsu", ij_core::AutoThresholdMethod::Otsu, false, false),
+        ("IsoData", ij_core::AutoThresholdMethod::IsoData, false, false),
+        ("Otsu dark", ij_core::AutoThresholdMethod::Otsu, true, false),
+        ("IsoData dark", ij_core::AutoThresholdMethod::IsoData, true, false),
+        // A "16" keyword on a 32-bit image keeps the 256-bin histogram but
+        // drops addOne (ImageProcessor.java lines 598-600).
+        ("Otsu 16-bit", ij_core::AutoThresholdMethod::Otsu, false, true),
+        ("Otsu dark 16-bit", ij_core::AutoThresholdMethod::Otsu, true, true),
+    ] {
+        assert_32bit_threshold_matches_oracle(
+            &bridge, &doc, "", options, method, dark, hist16, false,
+        );
+    }
+}
+
+#[test]
+fn parity_32bit_auto_threshold_negative_values_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Negative and sub-unit values exercise the float display range.
+    let mut values = vec![0f32; 48];
+    for y in 0..6u32 {
+        for x in 0..8u32 {
+            values[(y * 8 + x) as usize] = -2.5 + (x * 8 + y) as f32 * 0.1;
+        }
+    }
+    let doc = pattern_32bit("neg32.tif", 8, 6, &values);
+    for (options, method, dark) in [
+        ("Otsu", ij_core::AutoThresholdMethod::Otsu, false),
+        ("IsoData", ij_core::AutoThresholdMethod::IsoData, false),
+        ("Otsu dark", ij_core::AutoThresholdMethod::Otsu, true),
+    ] {
+        assert_32bit_threshold_matches_oracle(
+            &bridge, &doc, "", options, method, dark, false, false,
+        );
+    }
+}
+
+#[test]
+fn parity_32bit_auto_threshold_nan_pixels_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut values = vec![0f32; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            values[(y * 16 + x) as usize] = x as f32 / 16.0;
+        }
+    }
+    // NaN pixels are skipped by findMinAndMax (FloatProcessor.java 98-110)
+    // but bin to 0 in create8BitImage's (int)(NaN*scale+0.5) cast.
+    values[0] = f32::NAN;
+    values[17] = f32::NAN;
+    values[34] = f32::NAN;
+    let doc = pattern_32bit("nan32.tif", 16, 16, &values);
+    for (options, method, dark) in [
+        ("Otsu", ij_core::AutoThresholdMethod::Otsu, false),
+        ("IsoData", ij_core::AutoThresholdMethod::IsoData, false),
+        ("Otsu dark", ij_core::AutoThresholdMethod::Otsu, true),
+    ] {
+        assert_32bit_threshold_matches_oracle(
+            &bridge,
+            &doc,
+            "setPixel(0,0,0/0); setPixel(1,1,0/0); setPixel(2,2,0/0);",
+            options,
+            method,
+            dark,
+            false,
+            false,
+        );
+    }
+}
+
+#[test]
+fn parity_32bit_auto_threshold_all_nan_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = pattern_32bit("allnan32.tif", 8, 8, &vec![f32::NAN; 64]);
+    // findMinAndMax leaves min=max=NaN, so scaleAndSetThreshold stores
+    // NaN levels (ImageProcessor.java 771 else-branch).
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "run(\"Add...\", \"value=\"+(0/0));",
+        "Otsu",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn parity_32bit_auto_threshold_constant_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = pattern_32bit("const32.tif", 8, 8, &vec![5.0f32; 64]);
+    // max==min collapses the levels to the constant (ImageProcessor.java 771).
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "",
+        "Otsu",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn parity_32bit_auto_threshold_roi_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut values = vec![0f32; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            values[(y * 16 + x) as usize] = ((x * 7 + y * 11) % 64) as f32 * 0.05;
+        }
+    }
+    let mut doc = pattern_32bit("roi32.tif", 16, 16, &values);
+    doc.set_rect_roi(3, 2, 8, 9).unwrap();
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "makeRectangle(3, 2, 8, 9);",
+        "Otsu",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn parity_32bit_single_slice_stack_keyword_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // The "stack" keyword reaches IJ.setStackThreshold even on one slice;
+    // unlike scaleAndSetThreshold it writes the literal stack min/max, so the
+    // lower level is 0 rather than -1e30 (IJ.java 1538-1545).
+    let doc = ImageDocument::new_ramp_32bit("ramp32stack.tif", 16, 16).unwrap();
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "",
+        "Otsu stack",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        true,
+    );
+}
+
+#[test]
+fn parity_8bit_stack_auto_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Slice 2 sits lower than the ramp, so the summed stack histogram differs
+    // from slice 1's own histogram.
+    let mut slice2 = vec![0u8; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            slice2[(y * 16 + x) as usize] = ((x * 3 + y * 7) % 96) as u8;
+        }
+    }
+    let slice3 = vec![200u8; 256];
+    let doc = ImageDocument::new_stack(
+        "stack8.tif",
+        16,
+        16,
+        vec![
+            match ImageDocument::new_ramp_8bit("s", 16, 16).unwrap().plane() {
+                PixelPlane::Gray8(v) => PixelPlane::Gray8(v.clone()),
+                _ => unreachable!(),
+            },
+            PixelPlane::Gray8(slice2),
+            PixelPlane::Gray8(slice3),
+        ],
+    )
+    .unwrap();
+    for (options, method, dark) in [
+        ("Otsu stack", ij_core::AutoThresholdMethod::Otsu, false),
+        ("IsoData stack", ij_core::AutoThresholdMethod::IsoData, false),
+        ("Otsu dark stack", ij_core::AutoThresholdMethod::Otsu, true),
+    ] {
+        assert_stack_threshold_matches_oracle(&bridge, &doc, "", options, method, dark, false);
+    }
+}
+
+#[test]
+fn parity_8bit_stack_roi_auto_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut slice2 = vec![255u8; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            slice2[(y * 16 + x) as usize] = ((x * 11 + y * 5) % 128) as u8;
+        }
+    }
+    let mut doc = ImageDocument::new_stack(
+        "stack8roi.tif",
+        16,
+        16,
+        vec![
+            PixelPlane::Gray8(vec![10; 256]),
+            PixelPlane::Gray8(slice2),
+        ],
+    )
+    .unwrap();
+    doc.set_rect_roi(2, 2, 10, 10).unwrap();
+    assert_stack_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "makeRectangle(2, 2, 10, 10);",
+        "Otsu stack",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn parity_16bit_stack_auto_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Slice 2 halves the ramp, so the stack range stays slice 1's 0..61440
+    // while slice 2 peaks at 30720.
+    let mut slice2 = vec![0u16; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            let ramp = (((x as f64 * 65536.0) / 16.0) + 0.5) as u16;
+            slice2[(y * 16 + x) as usize] = ramp / 2;
+        }
+    }
+    let doc = ImageDocument::new_stack(
+        "stack16.tif",
+        16,
+        16,
+        vec![
+            match ImageDocument::new_ramp_16bit("s", 16, 16).unwrap().plane() {
+                PixelPlane::Gray16(v) => PixelPlane::Gray16(v.clone()),
+                _ => unreachable!(),
+            },
+            PixelPlane::Gray16(slice2),
+        ],
+    )
+    .unwrap();
+    for (options, method, dark, hist16) in [
+        ("Otsu stack", ij_core::AutoThresholdMethod::Otsu, false, false),
+        ("IsoData stack", ij_core::AutoThresholdMethod::IsoData, false, false),
+        ("Otsu dark stack", ij_core::AutoThresholdMethod::Otsu, true, false),
+        ("Otsu stack 16-bit", ij_core::AutoThresholdMethod::Otsu, false, true),
+        (
+            "Otsu dark stack 16-bit",
+            ij_core::AutoThresholdMethod::Otsu,
+            true,
+            true,
+        ),
+    ] {
+        assert_stack_threshold_matches_oracle(&bridge, &doc, "", options, method, dark, hist16);
+    }
+}
+
+#[test]
+fn parity_32bit_stack_auto_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Slice 2 doubles the ramp; the whole-stack histogram spans 0..1.875.
+    let mut slice2 = vec![0f32; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            slice2[(y * 16 + x) as usize] = (x as f32 / 16.0) * 2.0;
+        }
+    }
+    let doc = ImageDocument::new_stack(
+        "stack32.tif",
+        16,
+        16,
+        vec![
+            match ImageDocument::new_ramp_32bit("s", 16, 16).unwrap().plane() {
+                PixelPlane::Gray32(v) => PixelPlane::Gray32(v.clone()),
+                _ => unreachable!(),
+            },
+            PixelPlane::Gray32(slice2),
+        ],
+    )
+    .unwrap();
+    for (options, method, dark) in [
+        ("Otsu stack", ij_core::AutoThresholdMethod::Otsu, false),
+        ("IsoData stack", ij_core::AutoThresholdMethod::IsoData, false),
+        ("Otsu dark stack", ij_core::AutoThresholdMethod::Otsu, true),
+    ] {
+        assert_stack_threshold_matches_oracle(&bridge, &doc, "", options, method, dark, false);
+    }
+}
+
+#[test]
+fn parity_32bit_stack_all_nan_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let doc = ImageDocument::new_stack(
+        "stack32nan.tif",
+        8,
+        8,
+        vec![
+            PixelPlane::Gray32(vec![f32::NAN; 64]),
+            PixelPlane::Gray32(vec![f32::NAN; 64]),
+        ],
+    )
+    .unwrap();
+    // StackStatistics keeps roiMin=Double.MAX_VALUE/roiMax=-Double.MAX_VALUE;
+    // the float display range collapses to (+Inf,-Inf) and both levels take
+    // the raw min (StackStatistics.java 80-103, IJ.java 1538-1545).
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "run(\"Add...\", \"value=\"+(0/0)+\" stack\");",
+        "Otsu stack",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        true,
+    );
+}
+
+#[test]
+fn parity_32bit_stack_nan_slices_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // One slice all-NaN, the other ramp: StackStatistics sees only slice 2's
+    // range (NaN fails the v>=minThreshold && v<=maxThreshold scan,
+    // StackStatistics.java 92-98).
+    let doc = ImageDocument::new_stack(
+        "stack32nanslice.tif",
+        16,
+        16,
+        vec![
+            PixelPlane::Gray32(vec![f32::NAN; 256]),
+            match ImageDocument::new_ramp_32bit("s", 16, 16).unwrap().plane() {
+                PixelPlane::Gray32(v) => PixelPlane::Gray32(v.clone()),
+                _ => unreachable!(),
+            },
+        ],
+    )
+    .unwrap();
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "run(\"Add...\", \"value=\"+(0/0)+\" slice\");",
+        "Otsu stack",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        true,
+    );
+}
+
+#[test]
+fn parity_stack_per_slice_auto_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Without the "stack" keyword ImageProcessor.setAutoThreshold applies to
+    // the current processor only (IJ.java 1496-1501), even inside a stack.
+    let mut slice2 = vec![0f32; 256];
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            slice2[(y * 16 + x) as usize] = (x as f32 / 16.0) * 4.0;
+        }
+    }
+    let mut doc = ImageDocument::new_stack(
+        "stack32slice.tif",
+        16,
+        16,
+        vec![
+            match ImageDocument::new_ramp_32bit("s", 16, 16).unwrap().plane() {
+                PixelPlane::Gray32(v) => PixelPlane::Gray32(v.clone()),
+                _ => unreachable!(),
+            },
+            PixelPlane::Gray32(slice2),
+        ],
+    )
+    .unwrap();
+    doc.set_position_from_index(2).unwrap();
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "setSlice(2);",
+        "Otsu",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        false,
+    );
+    // And a plain per-slice threshold on slice 1 of a stack.
+    let mut doc = doc.clone();
+    doc.set_position_from_index(1).unwrap();
+    assert_32bit_threshold_matches_oracle(
+        &bridge,
+        &doc,
+        "setSlice(1);",
+        "Otsu",
+        ij_core::AutoThresholdMethod::Otsu,
+        false,
+        false,
+        false,
+    );
+}
+
+#[test]
+fn parity_8bit_stack_per_slice_auto_threshold_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = ImageDocument::new_stack(
+        "stack8slice.tif",
+        16,
+        16,
+        vec![
+            PixelPlane::Gray8(vec![30; 256]),
+            match ImageDocument::new_ramp_8bit("s", 16, 16).unwrap().plane() {
+                PixelPlane::Gray8(v) => PixelPlane::Gray8(v.clone()),
+                _ => unreachable!(),
+            },
+        ],
+    )
+    .unwrap();
+    doc.set_position_from_index(2).unwrap();
+    let (lower, upper, _mn, _mx, _d) =
+        oracle_auto_threshold_levels(&bridge, &doc, "setSlice(2);", "Otsu");
+    let mut rust = doc.clone();
+    let levels = rust
+        .set_auto_threshold_with_options(ij_core::AutoThresholdMethod::Otsu, false, false, false)
+        .unwrap();
+    assert_eq!((levels.lower, levels.upper), (lower, upper));
+}
+
+#[test]
+fn session_auto_threshold_stack_records_stack_option() {
+    let mut session = Session::new();
+    session.insert_doc(
+        ImageDocument::new_stack(
+            "stack8",
+            8,
+            8,
+            vec![
+                PixelPlane::Gray8(vec![10; 64]),
+                PixelPlane::Gray8(vec![200; 64]),
+            ],
+        )
+        .unwrap(),
+    );
+
+    let outcome = session
+        .dispatch(Command::AutoThreshold {
+            method: "Otsu".into(),
+            dark_background: false,
+            histogram_16: false,
+            stack: true,
+        })
+        .unwrap();
+    assert!(matches!(outcome, CommandOutcome::Thresholded(_)));
+    // ThresholdAdjuster.autoSetLevels appends " stack" after " 16-bit"
+    // (ThresholdAdjuster.java line 508).
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("setAutoThreshold(\"Otsu stack\");")
     );
 }
 

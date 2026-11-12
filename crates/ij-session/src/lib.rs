@@ -456,13 +456,18 @@ pub enum Command {
     /// grayscale only.
     Despeckle,
     /// `ImageProcessor.setAutoThreshold(String)`; only "IsoData" and "Otsu"
-    /// are implemented, for single-slice 8-bit and 16-bit grayscale images.
+    /// are implemented, for 8-bit, 16-bit and 32-bit grayscale images.
     /// `histogram_16` is ImageJ's "16" keyword (the ThresholdAdjuster's
     /// 16-bit histogram checkbox) and is rejected for 8-bit images.
+    /// `stack` is the "stack" keyword (ThresholdAdjuster's "Stack histogram"
+    /// checkbox), which aggregates the whole stack through
+    /// `IJ.setStackThreshold` (original_imagej/ij/IJ.java 1505-1547); without
+    /// it only the current slice is thresholded.
     AutoThreshold {
         method: String,
         dark_background: bool,
         histogram_16: bool,
+        stack: bool,
     },
     /// Interactive threshold slider update; never recorded as a macro command.
     PreviewThreshold {
@@ -2003,24 +2008,31 @@ impl Session {
                 method,
                 dark_background,
                 histogram_16,
+                stack,
             } => {
                 let parsed = ij_core::AutoThresholdMethod::parse(&method)?;
                 let (levels, display_range_changed) = {
                     let doc = self.active_doc_mut()?;
                     let display_range_before = doc.display_range;
-                    let levels =
-                        doc.set_auto_threshold_with_options(parsed, dark_background, histogram_16)?;
+                    let levels = doc.set_auto_threshold_with_options(
+                        parsed,
+                        dark_background,
+                        histogram_16,
+                        stack,
+                    )?;
                     (levels, doc.display_range != display_range_before)
                 };
-                // 16-bit default mode calls resetMinAndMax(), which changes
-                // the display range that FileSaver persists (ImageProcessor
-                // .java lines 642-647). Threshold state itself is not saved.
+                // resetMinAndMax() / ip.setMinAndMax(stackMin, stackMax)
+                // change the display range that FileSaver persists
+                // (ImageProcessor.java lines 642-647, IJ.java 1545).
+                // Threshold state itself is not saved.
                 if display_range_changed {
                     self.mark_active_dirty();
                 }
                 // ThresholdAdjuster.autoSetLevels builds
-                // `method + (dark?" dark":"") + (hist16?" 16-bit":"")` and
-                // records it with Recorder.record("setAutoThreshold", ...)
+                // `method + (dark?" dark":"") + (hist16?" 16-bit":"")
+                // + (stack?" stack":"")` and records it with
+                // Recorder.record("setAutoThreshold", ...)
                 // (ThresholdAdjuster.java lines 502-528).
                 let mut options = parsed.as_str().to_string();
                 if dark_background {
@@ -2028,6 +2040,9 @@ impl Session {
                 }
                 if histogram_16 {
                     options.push_str(" 16-bit");
+                }
+                if stack {
+                    options.push_str(" stack");
                 }
                 self.macro_recorder
                     .push(format!("setAutoThreshold(\"{options}\");"));
