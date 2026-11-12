@@ -543,3 +543,24 @@ fn convert_to_rgb_action_converts_with_display_range_and_records() {
         Some("run(\"RGB Color\");")
     );
 }
+
+#[test]
+fn create_mask_action_creates_mask_window_and_records_macro() {
+    let mut app = ImageJApp::new();
+    assert!(app.action_enabled(AppAction::CreateMask).is_err());
+    let id = app.open_ramp_8bit("source", 8, 8).unwrap();
+    assert!(app.action_enabled(AppAction::CreateMask).is_err());
+    app.session
+        .dispatch(ij_session::Command::MakeRectRoi { x: 2, y: 2, width: 4, height: 4 })
+        .unwrap();
+    assert!(app.action_enabled(AppAction::CreateMask).is_ok());
+
+    app.perform(AppAction::CreateMask, &Context::default());
+    let active = app.session.active_doc().unwrap();
+    assert_eq!(active.title, "Mask");
+    assert_ne!(app.session.active_image_id(), Some(id));
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Create Mask\");")
+    );
+}

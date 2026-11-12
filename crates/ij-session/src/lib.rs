@@ -298,6 +298,9 @@ pub enum Command {
         #[serde(default)]
         whole_stack: bool,
     },
+    /// `run("Create Mask")` — Selection("mask") creates an 8-bit binary mask
+    /// from the active ROI or active threshold (Selection.java 584-648).
+    CreateMask,
     /// `run("Draw")` — Filler("draw") draws the selection outline with the
     /// foreground color (Filler.java 116-121).
     Draw,
@@ -1535,6 +1538,49 @@ impl Session {
                         .push("run(\"Clear Outside\");".into());
                 }
                 Ok(CommandOutcome::Updated)
+            }
+            Command::CreateMask => {
+                let (mask_doc, from_threshold) = {
+                    let doc = self.active_doc()?;
+                    let is_select_all_rect = matches!(
+                        &doc.roi,
+                        Some(Roi::Rect(r))
+                            if r.x <= 0
+                                && r.y <= 0
+                                && r.width >= doc.width as i32
+                                && r.height >= doc.height as i32
+                    );
+                    let from_thresh = (doc.roi.is_none() || is_select_all_rect) && doc.threshold.is_some();
+                    (doc.create_mask()?, from_thresh)
+                };
+
+                // Selection.java 605-612: if ROI mask and a "Mask" window already
+                // exists with 8-bit depth and same dimensions, OR into it.
+                if !from_threshold {
+                    if let Some(existing_id) = self.image_id_by_title("Mask") {
+                        let existing = self.images.get_mut(&existing_id).unwrap();
+                        if existing.stack_size() == 1
+                            && existing.width == mask_doc.width
+                            && existing.height == mask_doc.height
+                        {
+                            if let (PixelPlane::Gray8(dest), PixelPlane::Gray8(src)) =
+                                (&mut existing.slices[0], &mask_doc.slices[0])
+                            {
+                                for (d, s) in dest.iter_mut().zip(src.iter()) {
+                                    *d |= *s;
+                                }
+                                self.active_image = Some(existing_id);
+                                self.mark_active_dirty();
+                                self.macro_recorder.push("run(\"Create Mask\");".into());
+                                return Ok(CommandOutcome::ImageOpened(existing_id));
+                            }
+                        }
+                    }
+                }
+
+                let id = self.insert_doc(mask_doc);
+                self.macro_recorder.push("run(\"Create Mask\");".into());
+                Ok(CommandOutcome::ImageOpened(id))
             }
             Command::Draw => {
                 let color = self.foreground_color;

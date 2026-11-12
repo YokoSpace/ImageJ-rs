@@ -31,6 +31,7 @@ pub enum AppAction {
     SelectNone,
     RestoreSelection,
     AddToRoiManager,
+    CreateMask,
     RoiManager,
     BrightnessContrast,
     Threshold,
@@ -179,6 +180,7 @@ const EDIT_SELECTION: &[MenuNode] = &[
     item("Select None", Some("Shift+A"), AppAction::SelectNone),
     item("Restore Selection", Some("Shift+E"), AppAction::RestoreSelection),
     item("Add to Manager", Some("T"), AppAction::AddToRoiManager),
+    item("Create Mask", None, AppAction::CreateMask),
 ];
 const EDIT_MENU: &[MenuNode] = &[
     item("Undo", Some("Z"), AppAction::Undo),
@@ -575,6 +577,9 @@ impl ImageJApp {
                         Some(_) => Err("Line or rectangular selection required.".into()),
                     },
                     AddToRoiManager if doc.roi.is_none() => Err("Selection required".into()),
+                    CreateMask if doc.roi.is_none() && doc.threshold.is_none() => {
+                        Err("Area selection, overlay or thresholded image required".into())
+                    }
                     // Thresholder.applyThreshold rejects RGB/indexed images;
                     // stacks run the "Convert Stack to Binary" dialog
                     // (Thresholder.java 54-147).
@@ -727,6 +732,17 @@ impl ImageJApp {
             AddToRoiManager => {
                 if self.session.dispatch(Command::RoiManagerAdd).is_ok() {
                     self.show_roi_manager_window = true;
+                }
+            }
+            CreateMask => {
+                match self.session.dispatch(Command::CreateMask) {
+                    Ok(_) => {
+                        self.status_message = "Create Mask".to_string();
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Create Mask failed: {e}");
+                        self.dialogs.last_error = Some(format!("Create Mask failed: {e}"));
+                    }
                 }
             }
             RoiManager => {

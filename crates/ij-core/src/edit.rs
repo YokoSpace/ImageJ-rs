@@ -672,5 +672,118 @@ impl ImageDocument {
         }
         Ok(())
     }
+
+    /// `Edit > Selection > Create Mask` (Selection.java 584-648): creates an
+    /// 8-bit binary mask (values 0 and 255) from the active ROI or active
+    /// threshold.
+    pub fn create_mask(&self) -> Result<ImageDocument, CoreError> {
+        let is_select_all_rect = matches!(
+            &self.roi,
+            Some(Roi::Rect(r))
+                if r.x <= 0
+                    && r.y <= 0
+                    && r.width >= self.width as i32
+                    && r.height >= self.height as i32
+        );
+        // Selection.java 588-595: if no ROI or select-all ROI, create from threshold.
+        if (self.roi.is_none() || is_select_all_rect) && self.threshold.is_some() {
+            self.create_threshold_mask()
+        } else if self.roi.is_some() {
+            self.create_roi_mask()
+        } else {
+            Err(CoreError::InvalidOperation(
+                "Area selection, overlay or thresholded image required",
+            ))
+        }
+    }
+
+    /// `imp.createThresholdMask()` (ImagePlus.java 1069-1073, Thresholder.java 423-430).
+    pub fn create_threshold_mask(&self) -> Result<ImageDocument, CoreError> {
+        let Some(threshold) = &self.threshold else {
+            return Err(CoreError::InvalidOperation(
+                "Area selection, overlay or thresholded image required",
+            ));
+        };
+        let (width, height) = (self.width, self.height);
+        let plane = &self.slices[self.current_slice_index()];
+        let mut pixels = vec![0u8; (width * height) as usize];
+        for (i, p) in pixels.iter_mut().enumerate() {
+            let val = plane.sample_f64(i);
+            if val >= threshold.lower && val <= threshold.upper {
+                *p = 255;
+            }
+        }
+        let mut mask_doc = ImageDocument::new("mask", width, height, PixelPlane::Gray8(pixels))?;
+        mask_doc.threshold = Some(crate::ThresholdLevels {
+            lower: 255.0,
+            upper: 255.0,
+        });
+        if self.calibration.scaled() {
+            mask_doc.calibration.pixel_width = self.calibration.pixel_width;
+            mask_doc.calibration.pixel_height = self.calibration.pixel_height;
+            mask_doc.calibration.set_unit(&self.calibration.unit);
+        }
+        Ok(mask_doc)
+    }
+
+    /// `imp.createRoiMask()` (ImagePlus.java 1034-1060).
+    pub fn create_roi_mask(&self) -> Result<ImageDocument, CoreError> {
+        let Some(roi) = &self.roi else {
+            return Err(CoreError::InvalidOperation(
+                "Area selection, overlay or thresholded image required",
+            ));
+        };
+        let (width, height) = (self.width, self.height);
+        let mut pixels = vec![0u8; (width * height) as usize];
+
+        match roi {
+            Roi::Rect(rect) => {
+                let x0 = rect.x.max(0) as u32;
+                let y0 = rect.y.max(0) as u32;
+                let x1 = (rect.x + rect.width).clamp(0, width as i32) as u32;
+                let y1 = (rect.y + rect.height).clamp(0, height as i32) as u32;
+                if x1 > x0 && y1 > y0 {
+                    for y in y0..y1 {
+                        let row = (y * width) as usize;
+                        for x in x0..x1 {
+                            pixels[row + x as usize] = 255;
+                        }
+                    }
+                }
+            }
+            Roi::Oval(_) | Roi::Polygon(_) => {
+                if let Ok(Some(mask)) = roi.raster_mask(width, height) {
+                    for ly in 0..mask.height {
+                        let row = ((mask.y + ly) * width) as usize;
+                        for lx in 0..mask.width {
+                            if mask.pixels[(ly * mask.width + lx) as usize] {
+                                pixels[row + (mask.x + lx) as usize] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            Roi::Line(_) | Roi::Polyline(_) | Roi::Angle(_) | Roi::Point(_) => {
+                let mut plot = |x: i32, y: i32| {
+                    if x >= 0 && y >= 0 && (x as u32) < width && (y as u32) < height {
+                        pixels[(y as u32 * width + x as u32) as usize] = 255;
+                    }
+                };
+                raster_roi_outline(roi, image_line_clip(width, height), &mut plot);
+            }
+        }
+
+        let mut mask_doc = ImageDocument::new("Mask", width, height, PixelPlane::Gray8(pixels))?;
+        mask_doc.threshold = Some(crate::ThresholdLevels {
+            lower: 255.0,
+            upper: 255.0,
+        });
+        if self.calibration.scaled() {
+            mask_doc.calibration.pixel_width = self.calibration.pixel_width;
+            mask_doc.calibration.pixel_height = self.calibration.pixel_height;
+            mask_doc.calibration.set_unit(&self.calibration.unit);
+        }
+        Ok(mask_doc)
+    }
 }
 

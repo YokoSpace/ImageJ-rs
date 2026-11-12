@@ -18837,3 +18837,209 @@ fn parity_clear_outside_rect_and_non_rect_all_types() {
     assert_eq!(session_oob.active_doc().unwrap().slices, oracle_oob.slices);
 }
 
+#[test]
+fn parity_create_mask_roi_and_threshold_parity() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // 1. Rect ROI: title "Mask", threshold [255, 255], pixels match Java
+    let doc_rect = ImageDocument::new(
+        "sample",
+        10,
+        10,
+        PixelPlane::Gray8((0..100u8).collect()),
+    ).unwrap();
+    let oracle_rect = bridge
+        .run_macro_on_image(
+            &doc_rect,
+            "makeRectangle(2, 2, 4, 4); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_rect = Session::new();
+    session_rect.insert_doc(doc_rect);
+    session_rect.dispatch(Command::MakeRectRoi { x: 2, y: 2, width: 4, height: 4 }).unwrap();
+    session_rect.dispatch(Command::CreateMask).unwrap();
+    let active = session_rect.active_doc().unwrap();
+    assert_eq!(active.title, "Mask");
+    assert_eq!(active.threshold, Some(ThresholdLevels { lower: 255.0, upper: 255.0 }));
+    assert_eq!(active.slices, oracle_rect.slices);
+    assert_eq!(session_rect.macro_recorder.last().unwrap(), "run(\"Create Mask\");");
+
+    // 2. Oval ROI
+    let doc_oval = ImageDocument::new(
+        "sample_oval",
+        12,
+        12,
+        PixelPlane::Gray8((0..144u8).collect()),
+    ).unwrap();
+    let oracle_oval = bridge
+        .run_macro_on_image(
+            &doc_oval,
+            "makeOval(2, 2, 8, 8); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_oval = Session::new();
+    session_oval.insert_doc(doc_oval);
+    session_oval.dispatch(Command::MakeOvalRoi { x: 2, y: 2, width: 8, height: 8 }).unwrap();
+    session_oval.dispatch(Command::CreateMask).unwrap();
+    assert_eq!(session_oval.active_doc().unwrap().slices, oracle_oval.slices);
+
+    // 3. Polygon ROI
+    let doc_poly = ImageDocument::new(
+        "sample_poly",
+        10,
+        10,
+        PixelPlane::Gray8((0..100u8).collect()),
+    ).unwrap();
+    let oracle_poly = bridge
+        .run_macro_on_image(
+            &doc_poly,
+            "makePolygon(1,1, 8,2, 7,7, 2,6); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_poly = Session::new();
+    session_poly.insert_doc(doc_poly);
+    session_poly.dispatch(Command::MakePolygonRoi { points: vec![(1, 1), (8, 2), (7, 7), (2, 6)] }).unwrap();
+    session_poly.dispatch(Command::CreateMask).unwrap();
+    assert_eq!(session_poly.active_doc().unwrap().slices, oracle_poly.slices);
+
+    // 4. Line ROI: draws stroke with 255
+    let doc_line = ImageDocument::new(
+        "sample_line",
+        10,
+        10,
+        PixelPlane::Gray8((0..100u8).collect()),
+    ).unwrap();
+    let oracle_line = bridge
+        .run_macro_on_image(
+            &doc_line,
+            "makeLine(1, 1, 8, 8); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_line = Session::new();
+    session_line.insert_doc(doc_line);
+    session_line.dispatch(Command::MakeLineRoi { x1: 1, y1: 1, x2: 8, y2: 8 }).unwrap();
+    session_line.dispatch(Command::CreateMask).unwrap();
+    assert_eq!(session_line.active_doc().unwrap().slices, oracle_line.slices);
+
+    // 5. 8-bit Threshold (no ROI): title "mask", threshold [255, 255]
+    let doc_thresh = ImageDocument::new(
+        "sample_thresh",
+        10,
+        10,
+        PixelPlane::Gray8((0..100u8).collect()),
+    ).unwrap();
+    let oracle_thresh = bridge
+        .run_macro_on_image(
+            &doc_thresh,
+            "setThreshold(30, 70); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_thresh = Session::new();
+    session_thresh.insert_doc(doc_thresh);
+    session_thresh.dispatch(Command::SetThreshold { lower: 30.0, upper: 70.0 }).unwrap();
+    session_thresh.dispatch(Command::CreateMask).unwrap();
+    let active_thresh = session_thresh.active_doc().unwrap();
+    assert_eq!(active_thresh.title, "mask");
+    assert_eq!(active_thresh.threshold, Some(ThresholdLevels { lower: 255.0, upper: 255.0 }));
+    assert_eq!(active_thresh.slices, oracle_thresh.slices);
+
+    // 6. 16-bit Threshold
+    let doc_thresh16 = ImageDocument::new(
+        "sample_thresh16",
+        8,
+        8,
+        PixelPlane::Gray16((0..64u32).map(|i| (i * 500) as u16).collect()),
+    ).unwrap();
+    let oracle_thresh16 = bridge
+        .run_macro_on_image(
+            &doc_thresh16,
+            "setThreshold(2000, 10000); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_thresh16 = Session::new();
+    session_thresh16.insert_doc(doc_thresh16);
+    session_thresh16.dispatch(Command::SetThreshold { lower: 2000.0, upper: 10000.0 }).unwrap();
+    session_thresh16.dispatch(Command::CreateMask).unwrap();
+    assert_eq!(session_thresh16.active_doc().unwrap().slices, oracle_thresh16.slices);
+
+    // 7. 32-bit Float Threshold
+    let doc_thresh32 = ImageDocument::new(
+        "sample_thresh32",
+        8,
+        8,
+        PixelPlane::Gray32((0..64u32).map(|i| i as f32 * 2.5).collect()),
+    ).unwrap();
+    let oracle_thresh32 = bridge
+        .run_macro_on_image(
+            &doc_thresh32,
+            "setThreshold(10.0, 50.0); run(\"Create Mask\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return mask TIFF");
+    let mut session_thresh32 = Session::new();
+    session_thresh32.insert_doc(doc_thresh32);
+    session_thresh32.dispatch(Command::SetThreshold { lower: 10.0, upper: 50.0 }).unwrap();
+    session_thresh32.dispatch(Command::CreateMask).unwrap();
+    assert_eq!(session_thresh32.active_doc().unwrap().slices, oracle_thresh32.slices);
+
+    // 8. Existing "Mask" image OR merge (Selection.java 605-612)
+    let doc_merge = ImageDocument::new(
+        "source",
+        8,
+        8,
+        PixelPlane::Gray8(vec![0; 64]),
+    ).unwrap();
+    let mut session_merge = Session::new();
+    let src_id = session_merge.insert_doc(doc_merge);
+    session_merge.dispatch(Command::MakeRectRoi { x: 0, y: 0, width: 2, height: 2 }).unwrap();
+    session_merge.dispatch(Command::CreateMask).unwrap();
+    let mask_id = session_merge.active_image_id().unwrap();
+    assert_eq!(session_merge.active_doc().unwrap().title, "Mask");
+    // Switch back to source, select different region, create mask again
+    session_merge.set_active_image(src_id).unwrap();
+    session_merge.dispatch(Command::MakeRectRoi { x: 4, y: 4, width: 2, height: 2 }).unwrap();
+    session_merge.dispatch(Command::CreateMask).unwrap();
+    assert_eq!(session_merge.active_image_id(), Some(mask_id));
+    let merged_mask = session_merge.active_doc().unwrap();
+    let PixelPlane::Gray8(pixels) = &merged_mask.slices[0] else { panic!() };
+    // Both rect regions (0,0) and (4,4) must be 255
+    assert_eq!(pixels[0], 255);
+    assert_eq!(pixels[4 * 8 + 4], 255);
+    assert_eq!(pixels[2 * 8 + 2], 0);
+
+    // 9. Error when neither ROI nor threshold exists
+    let doc_none = ImageDocument::new("none", 8, 8, PixelPlane::Gray8(vec![0; 64])).unwrap();
+    let mut session_err = Session::new();
+    session_err.insert_doc(doc_none);
+    let err = session_err.dispatch(Command::CreateMask).unwrap_err();
+    assert!(err.to_string().contains("Area selection, overlay or thresholded image required"));
+
+    // 10. Spatial calibration copied from source
+    let mut doc_cal = ImageDocument::new("cal", 8, 8, PixelPlane::Gray8(vec![0; 64])).unwrap();
+    doc_cal.calibration.pixel_width = 0.25;
+    doc_cal.calibration.pixel_height = 0.25;
+    doc_cal.calibration.unit = "mm".to_string();
+    let mut session_cal = Session::new();
+    session_cal.insert_doc(doc_cal);
+    session_cal.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 3, height: 3 }).unwrap();
+    session_cal.dispatch(Command::CreateMask).unwrap();
+    let cal_mask = session_cal.active_doc().unwrap();
+    assert_eq!(cal_mask.calibration.pixel_width, 0.25);
+    assert_eq!(cal_mask.calibration.pixel_height, 0.25);
+    assert_eq!(cal_mask.calibration.unit, "mm");
+}
+
+
