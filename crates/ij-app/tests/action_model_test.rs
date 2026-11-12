@@ -53,6 +53,66 @@ fn menu_has_the_classic_top_level_order() {
 }
 
 #[test]
+fn image_transform_menu_dispatches_flip_and_rotate() {
+    use ij_app::action::MenuKind;
+    let image = MENU_TREE.iter().find(|node| node.label == "Image").unwrap();
+    let MenuKind::Submenu(image_nodes) = image.kind else { panic!("Image menu") };
+    let transform = image_nodes.iter().find(|node| node.label == "Transform").unwrap();
+    let MenuKind::Submenu(transform_nodes) = transform.kind else { panic!("Transform menu") };
+    for (label, action) in [
+        ("Flip Horizontally", AppAction::FlipHorizontal),
+        ("Flip Vertically", AppAction::FlipVertical),
+        ("Rotate 90 Degrees Right", AppAction::Rotate90Right),
+        ("Rotate 90 Degrees Left", AppAction::Rotate90Left),
+    ] {
+        let item = transform_nodes.iter().find(|node| node.label == label).unwrap();
+        assert!(matches!(item.kind, MenuKind::Item(a) if a == action), "{label}");
+    }
+
+    let mut app = ImageJApp::new();
+    let id = app.session.insert_doc(ImageDocument::new(
+        "transform", 3, 2, PixelPlane::Gray8(vec![1, 2, 3, 4, 5, 6]),
+    ).unwrap());
+    app.perform(AppAction::FlipHorizontal, &Context::default());
+    assert_eq!(app.session.get_image(id).unwrap().plane(), &PixelPlane::Gray8(vec![3, 2, 1, 6, 5, 4]));
+    assert_eq!(app.session.macro_recorder.last().unwrap(), "run(\"Flip Horizontally\");");
+    app.perform(AppAction::Rotate90Right, &Context::default());
+    assert_eq!((app.session.get_image(id).unwrap().width, app.session.get_image(id).unwrap().height), (2, 3));
+}
+
+#[test]
+fn flip_stack_action_prompts_and_honours_cancel_or_all() {
+    use ij_app::stack_process::{StackProcessChoice, StackProcessOutcome};
+    let mut app = ImageJApp::new();
+    let original = ImageDocument::new_stack(
+        "stack", 3, 1,
+        vec![
+            PixelPlane::Gray8(vec![1, 2, 3]),
+            PixelPlane::Gray8(vec![4, 5, 6]),
+        ],
+    ).unwrap();
+    let id = app.session.insert_doc(original.clone());
+    app.perform(AppAction::FlipHorizontal, &Context::default());
+    assert!(app.pending_stack_process.is_some());
+    assert_eq!(app.session.get_image(id).unwrap(), &original);
+    assert_eq!(
+        app.resolve_stack_process(StackProcessChoice::Cancel).unwrap(),
+        StackProcessOutcome::Cancelled
+    );
+    assert_eq!(app.session.get_image(id).unwrap(), &original);
+
+    app.perform(AppAction::FlipHorizontal, &Context::default());
+    assert_eq!(
+        app.resolve_stack_process(StackProcessChoice::All).unwrap(),
+        StackProcessOutcome::Applied
+    );
+    let result = app.session.get_image(id).unwrap();
+    assert_eq!(result.slices[0], PixelPlane::Gray8(vec![3, 2, 1]));
+    assert_eq!(result.slices[1], PixelPlane::Gray8(vec![6, 5, 4]));
+    assert_eq!(app.session.macro_recorder.last().unwrap(), "run(\"Flip Horizontally\", \"stack\");");
+}
+
+#[test]
 fn crop_requires_an_area_selection() {
     let mut app = ImageJApp::new();
     assert!(app.action_enabled(AppAction::Crop).is_err());

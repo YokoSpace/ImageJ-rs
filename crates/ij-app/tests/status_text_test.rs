@@ -96,6 +96,8 @@ fn gray8_calibrated_spatial() {
         pixel_depth: 1.0,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     // x=3 -> 1.50 (3), y=4 -> 2 (4)
     assert_eq!(
@@ -127,6 +129,8 @@ fn three_slice_stack_z_coordinates() {
         pixel_depth: 1.5,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     assert_eq!(
         pixel_status(&doc, 3, 4),

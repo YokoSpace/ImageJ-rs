@@ -357,6 +357,8 @@ fn prepare_uses_the_bridge_preflight_validator_before_any_child_can_start() {
         pixel_depth: 1.0,
         unit: "um".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     cases.push(("non-default calibration", calibration));
 

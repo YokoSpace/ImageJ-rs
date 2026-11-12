@@ -21,10 +21,12 @@ Phase 2 の [共通ルール](roadmap_phase2_ui_fidelity.md#0-全タスク共通
 | P4.1a | 32-bit float とスタック全体の `Threshold > Auto`。`ij/plugin/frame/ThresholdAdjuster.java`, `ij/process/AutoThresholder.java`, `ij/process/FloatProcessor.java` | NaN、表示範囲、各スライス、全スタック集計の規則を Java と比較し、同じしきい値と適用結果を得る。 |
 | P4.1b | `File > New > Image...`。`ij/plugin/NewImage.java`, `ij/gui/GenericDialog.java` | 名前、型、塗りつぶし、幅、高さ、スライス数、既定値、Cancel、マクロ記録が一致する。P4.1a の `VERIFY_ALL_OK` 後に着手する。 |
 | P4.2a | `Image > Transform > Flip Horizontally/Vertically`, `Rotate 90 Degrees Right/Left`。`ij/plugin/Transformer.java`, `ij/process/*Processor.java` | 8/16/32-bit/RGB と ROI・スタックの Java 差分テストで画素、寸法、Undo が一致する。 |
-| P4.2b | `Image > Transform > Rotate...` と `Image > Adjust > Size...`。`ij/plugin/Rotator.java`, `ij/plugin/Scaler.java`, 各 Processor | 補間、背景、キャンバス、寸法・校正、Cancel とマクロ引数を Java と比較する。P4.2a の `VERIFY_ALL_OK` 後に着手する。 |
+| P4.2b | `Image > Transform > Rotate...` と `Image > Adjust > Size...`。`ij/plugin/filter/Rotator.java`, `ij/plugin/Resizer.java`, `ij/plugin/Scaler.java`（記録処理）, 各 Processor | 補間、背景、キャンバス、寸法・校正、Cancel とマクロ引数を Java と比較する。P4.2a の `VERIFY_ALL_OK` 後に着手する。 |
 | P4.3a | `Edit > Selection > Create Mask / Create Selection / Clear Outside`。`ij/plugin/Selection.java`, `ij/plugin/filter/Filler.java` | 二値・しきい値・非矩形 ROI の各規則と元画像への影響が一致する。対象が複数 ROI 型へ広がる場合は小単位に分ける。 |
 
 P4.1 は Devin SWE-2、P4.2 は Mistral Vibe `ds-flash`、P4.3 は Antigravity で並行する。各担当は Java の根拠、失敗テスト、最終検証結果とコミットを提出する。ブランチ整理は統合担当が実施する。
+
+Wave 1 の P4.1a/b、P4.2a/b、P4.3a は実装・Java 差分テスト済み。制限: 16/32-bit の白画像の表示 LUT 反転、複数領域・穴を含む ShapeRoi、Size のハイパースタック深さ変更は未対応。詳細は各差分テストと実装を参照。
 
 ## 2. 後続 Wave
 

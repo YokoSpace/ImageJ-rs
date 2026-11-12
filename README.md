@@ -23,7 +23,7 @@ To open a TIFF at startup:
 cargo run --release -p ij-app -- /path/to/image.tif
 ```
 
-You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick tour without an image file, choose **File → New → Image... (8-bit Ramp)**, draw a rectangle, and select **Analyze → Measure** to see the Results window. The TIFF reader handles PackBits, Deflate, and LZW compression for its supported image types. The app is still being developed, so save a copy of valuable images before editing them.
+You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick tour without an image file, choose **File → New → Image...**, select an 8-bit ramp, draw a rectangle, and select **Analyze → Measure** to see the Results window. The TIFF reader handles PackBits, Deflate, and LZW compression for its supported image types. The app is still being developed, so save a copy of valuable images before editing them.
 
 ## What works today
 
@@ -32,12 +32,13 @@ You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick t
 - All 14 toolbar tools are enabled, including point, angle, segmented and freehand lines, Text, and Color Picker. The ROI Manager can store, select, delete, and measure selections.
 - Display range, Brightness & Contrast, threshold controls with live histogram previews and mask conversion, binary Erode/Dilate/Open/Close, measurements, and macro recording for supported commands.
 - Edit → Cut, Copy, Paste, Clear, Fill, and Draw with foreground and background colors, ROI masks, and Undo.
+- File → New → Image, Edit → Clear Outside and Selection → Create Mask/Create Selection, Image → Transform flips and rotations, and Image → Adjust → Size. Auto Threshold supports 32-bit float images and stack histograms.
 - Crop, Duplicate, 8-bit/16-bit/32-bit/RGB type conversion, Set Measurements, Set Scale, Analyze Particles, Histogram, Plot Profile, 14 Process → Math operations, and Image Calculator. Supported filters, math operations, and binary conversions can process stacks.
 - TIFF, PNG, and JPEG opening and saving, plus Results table export. PNG and TIFF preserve pixels on supported lossless round trips; JPEG uses lossy compression.
 - Hyperstack C/Z/T navigation, slice animation, and the ImageJ-style native macOS menu bar (the in-window menu is used on other platforms).
 - A Java compatibility path for a **limited subset** of classic ImageJ plug-ins and an API for Rust image plug-ins, described below.
 
-The [Phase 3 daily workflow](docs/roadmap_phase3_practical_workflows.md) is implemented for the supported image types. The project remains narrower than ImageJ: some TIFF variants, advanced plug-in APIs and dialogs, and specialized image commands are not yet supported. Text uses a small built-in bitmap font, and automatic threshold selection is unavailable for 32-bit images and stacks. The [Phase 2 roadmap](docs/roadmap_phase2_ui_fidelity.md) records earlier UI work.
+The [Phase 3 daily workflow](docs/roadmap_phase3_practical_workflows.md) and [Phase 4 Wave 1](docs/roadmap_phase4_completeness.md) are implemented for the tested image types. The project remains narrower than ImageJ: some TIFF variants, advanced plug-in APIs and dialogs, and specialized image commands are not yet supported. Text uses a small built-in bitmap font. Disjoint or holed masks that require ImageJ's composite ShapeRoi remain unsupported.
 
 ## Classic ImageJ plug-ins
 

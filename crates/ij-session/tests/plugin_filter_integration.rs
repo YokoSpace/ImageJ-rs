@@ -333,6 +333,8 @@ fn session_filter_unsupported_inputs_leave_state_unchanged() {
         pixel_depth: 1.0,
         unit: "um".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     cases.push(("non-default calibration", calibration));
 

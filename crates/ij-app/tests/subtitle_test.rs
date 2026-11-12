@@ -113,6 +113,8 @@ fn calibrated_dimensions_and_units() {
         pixel_depth: 1.0,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     assert_eq!(
         ImageView::create_subtitle(&doc_mm),
@@ -128,6 +130,8 @@ fn calibrated_dimensions_and_units() {
         pixel_depth: 1.0,
         unit: "micron".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     assert_eq!(
         ImageView::create_subtitle(&doc_micron),
@@ -142,6 +146,8 @@ fn calibrated_dimensions_and_units() {
         pixel_depth: 1.0,
         unit: "inch".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     assert_eq!(
         ImageView::create_subtitle(&doc_inch),
@@ -260,6 +266,8 @@ fn oracle_ui_probe_subtitle_parity() {
         pixel_depth: 1.0,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     let rust_sub = ImageView::create_subtitle(&doc_mm);
     let out = bridge

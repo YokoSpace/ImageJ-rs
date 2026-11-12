@@ -236,6 +236,7 @@ pub struct PendingStackBinaryDialog {
 
 impl ImageJApp {
     pub fn render_dialogs(&mut self, ctx: &egui::Context) {
+        self.render_transform_dialogs(ctx);
         if let Some(dialog) = self.dialogs.math.as_ref() {
             let title = dialog.operation.name();
             let mut cancel = false;

@@ -124,6 +124,8 @@ fn calibrated_images_prefill_known_distance_aspect_and_unit() {
         pixel_depth: 1.0,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     doc.set_line_roi(0, 0, 30, 40);
 
@@ -237,6 +239,8 @@ fn remove_scale_button_restores_pixel_calibration() {
         pixel_depth: 1.0,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     app.perform(AppAction::SetScale, &ctx);
     assert_eq!(app.set_scale.distance, 2.0);
@@ -252,6 +256,8 @@ fn remove_scale_button_restores_pixel_calibration() {
             pixel_depth: 1.0,
             unit: "mm".to_string(),
             invert_y: false,
+            x_origin: 0.0,
+            y_origin: 0.0,
         },
         "ScaleDialog applies field changes only after OK"
     );
@@ -275,6 +281,8 @@ fn cancel_after_remove_scale_button_preserves_calibration() {
         pixel_depth: 1.0,
         unit: "mm".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     app.session.active_doc_mut().unwrap().calibration = scaled.clone();
     app.perform(AppAction::SetScale, &ctx);

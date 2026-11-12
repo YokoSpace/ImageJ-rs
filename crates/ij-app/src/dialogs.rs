@@ -1,6 +1,25 @@
 use ij_bridge::plugin_discovery::{DiscoveredPlugin, PluginCatalog, PluginKind, PluginSource};
 use ij_session::ImageId;
 use std::path::PathBuf;
+use ij_core::transform::{Interpolation, RotateOptions};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RotateDialog {
+    pub source: ImageId,
+    pub options: RotateOptions,
+    pub can_enlarge: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizeDialog {
+    pub source: ImageId,
+    pub width: u32,
+    pub height: u32,
+    pub depth: Option<u32>,
+    pub constrain: bool,
+    pub average_when_downsizing: bool,
+    pub interpolation: Interpolation,
+}
 
 /// Editable state of `Image > Duplicate...`.
 ///
@@ -180,6 +199,10 @@ impl Default for MathDefaults {
 
 #[derive(Debug, Clone, Default)]
 pub struct DialogState {
+    pub rotate: Option<RotateDialog>,
+    pub rotate_defaults: RotateOptions,
+    pub size: Option<SizeDialog>,
+    pub size_defaults: Option<SizeDialog>,
     pub show_about: bool,
     pub show_gaussian_blur: bool,
     pub gaussian_blur_sigma: f64,
@@ -221,6 +244,10 @@ pub struct DialogState {
 impl DialogState {
     pub fn new() -> Self {
         Self {
+            rotate: None,
+            rotate_defaults: RotateOptions::default(),
+            size: None,
+            size_defaults: None,
             show_about: false,
             show_gaussian_blur: false,
             gaussian_blur_sigma: 2.0,

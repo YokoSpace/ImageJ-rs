@@ -23,6 +23,12 @@ pub enum AppAction {
     Revert,
     Undo,
     Invert,
+    FlipHorizontal,
+    FlipVertical,
+    Rotate90Right,
+    Rotate90Left,
+    Rotate,
+    Size,
     Duplicate,
     Crop,
     ConvertTo8Bit,
@@ -203,6 +209,7 @@ const EDIT_MENU: &[MenuNode] = &[
 ];
 
 const IMAGE_ADJUST: &[MenuNode] = &[
+    item("Size...", None, AppAction::Size),
     item(
         "Brightness/Contrast...",
         None,
@@ -217,10 +224,18 @@ const IMAGE_TYPE: &[MenuNode] = &[
     item("32-bit", None, AppAction::ConvertTo32Bit),
     item("RGB Color", None, AppAction::ConvertToRgb),
 ];
+const IMAGE_TRANSFORM: &[MenuNode] = &[
+    item("Rotate... ", None, AppAction::Rotate),
+    item("Flip Horizontally", None, AppAction::FlipHorizontal),
+    item("Flip Vertically", None, AppAction::FlipVertical),
+    item("Rotate 90 Degrees Right", None, AppAction::Rotate90Right),
+    item("Rotate 90 Degrees Left", None, AppAction::Rotate90Left),
+];
 const IMAGE_MENU: &[MenuNode] = &[
     submenu("Adjust", IMAGE_ADJUST),
     submenu("Stacks", IMAGE_STACKS),
     submenu("Type", IMAGE_TYPE),
+    submenu("Transform", IMAGE_TRANSFORM),
     item("Duplicate...", Some("Shift+D"), AppAction::Duplicate),
     item("Crop", Some("Shift+X"), AppAction::Crop),
 ];
@@ -712,6 +727,20 @@ impl ImageJApp {
             Invert => {
                 let _ = self.invert_active();
             }
+            FlipHorizontal => {
+                let _ = self.flip_horizontal_active();
+            }
+            FlipVertical => {
+                let _ = self.flip_vertical_active();
+            }
+            Rotate90Right => {
+                let _ = self.rotate_90_active(true);
+            }
+            Rotate90Left => {
+                let _ = self.rotate_90_active(false);
+            }
+            Rotate => self.open_rotate_dialog(),
+            Size => self.open_size_dialog(),
             Duplicate => {
                 self.open_duplicate_dialog();
             }
