@@ -3070,7 +3070,7 @@ impl ImageDocument {
 
     /// `run("Gaussian Blur...", "sigma=N stack")`.
     pub fn gaussian_blur_stack(&mut self, sigma: f64) -> Result<(), CoreError> {
-        self.filter_all_slices("Gaussian Blur", |doc| doc.gaussian_blur(sigma))
+        self.gaussian_blur_stack_with_workers(sigma, 0)
     }
 
     /// `run("Median...", "stack radius=N")`.

@@ -7737,6 +7737,465 @@ fn parity_32bit_gaussian_blur_interior_rect_roi_matches_java_oracle() {
 }
 
 // ---------------------------------------------------------------------------
+// Gaussian Blur execution worker-count regression.
+//
+// `gaussian_blur`/`gaussian_blur_stack` run with a worker budget taken from
+// `std::thread::available_parallelism` (the Java default is
+// `Prefs.getThreads() == Runtime.availableProcessors`, Prefs.java 690-698).
+// The explicit `*_with_workers` variants pin that budget: `workers=1` is the
+// sequential path, `workers=0` is the auto default, and larger values bound a
+// scoped worker set over stack slices and over the lines inside a slice, with
+// the same line-count and task-size caps as blur1Direction
+// (GaussianBlur.java 273-276). Every worker count must be bit-identical to
+// the sequential path and to the Java oracle.
+// ---------------------------------------------------------------------------
+
+/// Deterministic noise plus sparse impulses: every kernel footprint contains
+/// high-frequency content, so a missed or double-processed line changes the
+/// output.
+fn gaussian_noise_8bit(width: u32, height: u32) -> ImageDocument {
+    let mut pixels = vec![0u8; (width * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let i = y * width + x;
+            pixels[i as usize] =
+                ((i.wrapping_mul(2_654_435_761).wrapping_add(16_807) >> 13) & 0xff) as u8;
+        }
+    }
+    if width > 10 && height > 8 {
+        pixels[(2 * width + 3) as usize] = 255;
+        pixels[(5 * width + 8) as usize] = 255;
+        pixels[(7 * width + 1) as usize] = 0;
+    }
+    ImageDocument::new("gaussian_noise8.tif", width, height, PixelPlane::Gray8(pixels)).unwrap()
+}
+
+fn gaussian_noise_16bit(width: u32, height: u32) -> ImageDocument {
+    let mut pixels = vec![0u16; (width * height) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let i = y * width + x;
+            pixels[i as usize] =
+                ((i.wrapping_mul(2_654_435_761).wrapping_add(2_139_567_181) >> 16) & 0xffff)
+                    as u16;
+        }
+    }
+    if width > 10 && height > 8 {
+        pixels[(3 * width + 4) as usize] = 65_535;
+        pixels[(6 * width + 9) as usize] = 0;
+    }
+    ImageDocument::new("gaussian_noise16.tif", width, height, PixelPlane::Gray16(pixels)).unwrap()
+}
+
+/// Fractional values plus NaN and +-inf impulses. `f32::eq` is
+/// reflexive-incomplete for NaN, so comparisons go through the bit-exact
+/// helpers below.
+fn gaussian_impulse_32bit(width: u32, height: u32) -> ImageDocument {
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) as f32;
+            pixels.push(i * 0.211 + 0.0013 * x as f32 - 2.7);
+        }
+    }
+    if width > 12 && height > 9 {
+        let at = |x: u32, y: u32| (y * width + x) as usize;
+        pixels[at(3, 2)] = 4096.5;
+        pixels[at(9, 6)] = f32::NAN;
+        pixels[at(5, 7)] = f32::INFINITY;
+        pixels[at(11, 1)] = f32::NEG_INFINITY;
+        pixels[at(0, 0)] = -17.25;
+    }
+    ImageDocument::new("gaussian_impulse32.tif", width, height, PixelPlane::Gray32(pixels)).unwrap()
+}
+
+/// `assert_eq!` on planes reports a difference for any Gray32 image
+/// containing NaN; compare raw bits instead.
+fn assert_planes_bit_identical(a: &PixelPlane, b: &PixelPlane, context: &str) {
+    if let (PixelPlane::Gray32(pa), PixelPlane::Gray32(pb)) = (a, b) {
+        let ba: Vec<u32> = pa.iter().map(|v| v.to_bits()).collect();
+        let bb: Vec<u32> = pb.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(ba, bb, "{context}");
+    } else {
+        assert_eq!(a, b, "{context}");
+    }
+}
+
+/// The Java TIFF round trip canonicalizes NaN payloads (`writeFloat` goes
+/// through `Float.floatToIntBits`), so oracle comparisons accept any NaN
+/// where the oracle produced a NaN.
+fn assert_plane_matches_oracle_nan_aware(rust: &PixelPlane, oracle: &PixelPlane, context: &str) {
+    if let (PixelPlane::Gray32(pa), PixelPlane::Gray32(pb)) = (rust, oracle) {
+        assert_eq!(pa.len(), pb.len(), "{context}");
+        for (i, (&a, &b)) in pa.iter().zip(pb.iter()).enumerate() {
+            assert!(
+                a == b || (a.is_nan() && b.is_nan()),
+                "{context}: pixel {i} differs ({a:?} vs {b:?})"
+            );
+        }
+    } else {
+        assert_eq!(rust, oracle, "{context}");
+    }
+}
+
+#[test]
+fn gaussian_blur_with_workers_is_bit_identical_for_all_gray_types() {
+    for (doc, sigma) in [
+        (gaussian_noise_8bit(129, 97), 2.0),
+        (gaussian_noise_16bit(129, 97), 2.0),
+        (gaussian_impulse_32bit(129, 97), 2.0),
+        (gaussian_noise_8bit(129, 97), 12.0),
+        (gaussian_noise_16bit(129, 97), 12.0),
+        (gaussian_impulse_32bit(129, 97), 12.0),
+    ] {
+        let mut sequential = doc.clone();
+        sequential.gaussian_blur_with_workers(sigma, 1).unwrap();
+        let mut parallel = doc.clone();
+        parallel.gaussian_blur_with_workers(sigma, 9).unwrap();
+        assert_planes_bit_identical(
+            sequential.plane(),
+            parallel.plane(),
+            "workers 1 vs 9",
+        );
+        // The default entry point (auto workers) must agree as well.
+        let mut automatic = doc.clone();
+        automatic.gaussian_blur(sigma).unwrap();
+        assert_planes_bit_identical(
+            sequential.plane(),
+            automatic.plane(),
+            "workers 1 vs auto",
+        );
+    }
+}
+
+#[test]
+fn gaussian_blur_with_workers_roi_and_outside_roi_stay_bit_identical() {
+    for sigma in [2.0, 12.0] {
+        // An irregular ROI exercises the mask restore and the extra-lines
+        // pass above and below the ROI rectangle.
+        let mut oval = gaussian_noise_8bit(129, 97);
+        oval.set_oval_roi(20, 15, 84, 62).unwrap();
+        let mut sequential = oval.clone();
+        sequential.gaussian_blur_with_workers(sigma, 1).unwrap();
+        let mut parallel = oval.clone();
+        parallel.gaussian_blur_with_workers(sigma, 6).unwrap();
+        assert_eq!(sequential.plane(), parallel.plane(), "oval ROI sigma {sigma}");
+
+        // A ROI fully outside the image leaves a 0x0 processor ROI;
+        // convolveLine's first loop still blurs rows in the x pass.
+        let mut outside = gaussian_noise_8bit(129, 97);
+        outside.set_rect_roi(500, 500, 8, 8).unwrap();
+        let mut sequential = outside.clone();
+        sequential.gaussian_blur_with_workers(sigma, 1).unwrap();
+        let mut parallel = outside.clone();
+        parallel.gaussian_blur_with_workers(sigma, 6).unwrap();
+        assert_eq!(
+            sequential.plane(),
+            parallel.plane(),
+            "outside ROI sigma {sigma}"
+        );
+    }
+}
+
+#[test]
+fn gaussian_blur_with_workers_keeps_single_image_undo() {
+    let mut doc = gaussian_noise_8bit(129, 97);
+    let original = doc.plane().clone();
+    doc.gaussian_blur_with_workers(2.0, 8).unwrap();
+    assert_ne!(doc.plane(), &original);
+    assert!(doc.undo(), "slice blur must stay undoable with workers > 1");
+    assert_eq!(doc.plane(), &original);
+}
+
+#[test]
+fn gaussian_blur_with_workers_clamps_to_line_count_and_task_size() {
+    // Tiny images must not exceed the line count or the ImageJ task-size
+    // estimate (GaussianBlur.java 273-276); they stay effectively sequential
+    // and identical.
+    for doc in [
+        gaussian_pattern_8bit(1, 5),
+        gaussian_pattern_8bit(5, 1),
+        gaussian_pattern_8bit(2, 2),
+        gaussian_pattern_8bit(9, 7),
+    ] {
+        let mut sequential = doc.clone();
+        sequential.gaussian_blur_with_workers(2.0, 1).unwrap();
+        let mut parallel = doc.clone();
+        parallel.gaussian_blur_with_workers(2.0, 64).unwrap();
+        assert_eq!(sequential.plane(), parallel.plane());
+    }
+}
+
+#[test]
+fn gaussian_blur_workers_zero_uses_auto_budget_and_stays_exact() {
+    let mut auto = gaussian_noise_8bit(129, 97);
+    auto.gaussian_blur_with_workers(2.0, 0).unwrap();
+    let mut sequential = gaussian_noise_8bit(129, 97);
+    sequential.gaussian_blur_with_workers(2.0, 1).unwrap();
+    assert_eq!(auto.plane(), sequential.plane());
+}
+
+#[test]
+fn gaussian_blur_stack_with_workers_is_bit_identical_and_preserves_state() {
+    for sigma in [2.0, 12.0] {
+        for mut doc in [
+            distinct_stack_8bit(129, 97, 4),
+            distinct_stack_16bit(129, 97, 4),
+        ] {
+            doc.set_slice(2).unwrap();
+            let mut sequential = doc.clone();
+            sequential.gaussian_blur_stack_with_workers(sigma, 1).unwrap();
+            let mut parallel = doc.clone();
+            parallel.gaussian_blur_stack_with_workers(sigma, 10).unwrap();
+            assert_eq!(sequential.slices, parallel.slices, "sigma {sigma}");
+            assert_eq!(parallel.current_slice, 2, "selected slice must survive");
+            // A complete-stack filter clears Undo
+            // (PlugInFilterRunner.java 118-120).
+            assert!(!sequential.undo() && !parallel.undo());
+        }
+    }
+}
+
+#[test]
+fn gaussian_blur_stack_with_workers_and_roi_stays_bit_identical() {
+    let mut doc = distinct_stack_8bit(129, 97, 4);
+    doc.set_oval_roi(20, 15, 84, 62).unwrap();
+    let mut sequential = doc.clone();
+    sequential.gaussian_blur_stack_with_workers(2.0, 1).unwrap();
+    let mut parallel = doc.clone();
+    parallel.gaussian_blur_stack_with_workers(2.0, 8).unwrap();
+    assert_eq!(sequential.slices, parallel.slices);
+}
+
+#[test]
+fn parity_gaussian_blur_with_workers_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (doc, sigma) in [
+        (gaussian_noise_8bit(129, 97), 2.0),
+        (gaussian_noise_16bit(129, 97), 12.0),
+        (gaussian_impulse_32bit(129, 97), 12.0),
+    ] {
+        let oracle = oracle_gaussian_blur(&bridge, &doc, sigma, "");
+        let mut rust = doc.clone();
+        rust.gaussian_blur_with_workers(sigma, 6).unwrap();
+        assert_plane_matches_oracle_nan_aware(
+            rust.plane(),
+            oracle.plane(),
+            "workers=6",
+        );
+    }
+
+    let mut roi_doc = gaussian_noise_8bit(129, 97);
+    roi_doc.set_rect_roi(20, 15, 84, 62).unwrap();
+    let oracle = oracle_gaussian_blur(&bridge, &roi_doc, 2.0, "makeRectangle(20,15,84,62);");
+    let mut rust = roi_doc.clone();
+    rust.gaussian_blur_with_workers(2.0, 6).unwrap();
+    assert_eq!(rust.plane(), oracle.plane());
+}
+
+#[test]
+fn parity_gaussian_blur_stack_with_workers_matches_java_oracle() {
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_8bit(6, 4, 3),
+        "",
+        "run(\"Gaussian Blur...\", \"sigma=1.5 stack\");",
+        |doc| doc.gaussian_blur_stack_with_workers(1.5, 6).unwrap(),
+    );
+    assert_whole_stack_filter_matches_oracle(
+        stack_filter_with_rect_roi(distinct_stack_8bit(6, 4, 3)),
+        "makeRectangle(1,1,4,2);",
+        "run(\"Gaussian Blur...\", \"sigma=1.5 stack\");",
+        |doc| doc.gaussian_blur_stack_with_workers(1.5, 6).unwrap(),
+    );
+    // Downscaled path (sigma > 8.5) on a larger 16-bit stack.
+    assert_whole_stack_filter_matches_oracle(
+        distinct_stack_16bit(13, 9, 3),
+        "",
+        "run(\"Gaussian Blur...\", \"sigma=12 stack\");",
+        |doc| doc.gaussian_blur_stack_with_workers(12.0, 6).unwrap(),
+    );
+}
+
+#[test]
+fn session_gaussian_blur_stack_dispatch_stays_bit_identical_with_sequential() {
+    let path = temp_tiff("session_gaussian_workers.tif");
+    let original = distinct_stack_8bit(96, 64, 3);
+    save_tiff(&path, &original).unwrap();
+    let mut session = Session::new();
+    session.dispatch(Command::OpenTiff { path }).unwrap();
+    session
+        .dispatch(Command::GaussianBlurStack { sigma: 2.0 })
+        .unwrap();
+    let mut expected = original.clone();
+    expected.gaussian_blur_stack_with_workers(2.0, 1).unwrap();
+    assert_eq!(session.active_doc().unwrap().slices, expected.slices);
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Gaussian Blur...\", \"sigma=2 stack\");")
+    );
+}
+
+/// Gray32 stack whose slices carry NaN, +-inf and -0.0 at distinct
+/// positions, so a slice misalignment or a missed staging band changes the
+/// bit pattern.
+fn distinct_stack_32bit_specials(width: u32, height: u32, depth: u32) -> ImageDocument {
+    let mut slices = Vec::new();
+    for s in 0..depth {
+        let mut pixels = Vec::with_capacity((width * height) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let i = (y * width + x) as f32;
+                pixels.push(i * 0.37 + s as f32 * 11.3 - 5.0 + 0.001 * x as f32);
+            }
+        }
+        let at = |x: u32, y: u32| (y * width + x) as usize;
+        pixels[at(3 + s, 2)] = f32::NAN;
+        pixels[at(7, 4 + s)] = f32::INFINITY;
+        pixels[at(9 + s, 8)] = f32::NEG_INFINITY;
+        pixels[at(1 + s, 6)] = -0.0;
+        pixels[at(5, 5 + s)] = 0.0;
+        slices.push(PixelPlane::Gray32(pixels));
+    }
+    ImageDocument::new_stack("stack32.tif", width, height, slices).unwrap()
+}
+
+#[test]
+fn gaussian_blur_columns_parallel_past_roi_write_stays_bit_identical() {
+    // A 3-row ROI over a 1000-column image puts the y pass on the parallel
+    // path (task estimate >= 2 workers) while convolveLine's edge loop still
+    // writes min(kRadius, length) = 9 rows past writeTo
+    // (GaussianBlur.java 478-489): the staging must cover write_end=9 >
+    // write_to=3 rows per column.
+    let mut doc = gaussian_noise_8bit(1000, 1000);
+    doc.set_rect_roi(0, 0, 1000, 3).unwrap();
+    let mut sequential = doc.clone();
+    sequential.gaussian_blur_with_workers(2.0, 1).unwrap();
+    let mut parallel = doc.clone();
+    parallel.gaussian_blur_with_workers(2.0, 4).unwrap();
+    assert_eq!(sequential.plane(), parallel.plane(), "sigma 2 narrow ROI");
+
+    // Same geometry through the downscaled path (sigma > 8.5), where the
+    // staged band ends exactly at write_to.
+    let mut sequential = doc.clone();
+    sequential.gaussian_blur_with_workers(12.0, 1).unwrap();
+    let mut parallel = doc.clone();
+    parallel.gaussian_blur_with_workers(12.0, 4).unwrap();
+    assert_eq!(
+        sequential.plane(),
+        parallel.plane(),
+        "sigma 12 narrow ROI"
+    );
+}
+
+#[test]
+fn parity_gaussian_blur_narrow_roi_column_overrun_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = gaussian_noise_8bit(1000, 1000);
+    doc.set_rect_roi(0, 0, 1000, 3).unwrap();
+    let oracle = oracle_gaussian_blur(&bridge, &doc, 2.0, "makeRectangle(0,0,1000,3);");
+    let mut rust = doc.clone();
+    rust.gaussian_blur_with_workers(2.0, 4).unwrap();
+    assert_eq!(rust.plane(), oracle.plane());
+}
+
+#[test]
+fn gaussian_blur_stack_gray32_specials_bit_identical_across_workers() {
+    for sigma in [2.0, 12.0] {
+        let mut doc = distinct_stack_32bit_specials(129, 97, 4);
+        doc.set_slice(2).unwrap();
+        let mut sequential = doc.clone();
+        sequential.gaussian_blur_stack_with_workers(sigma, 1).unwrap();
+        let mut parallel = doc.clone();
+        parallel.gaussian_blur_stack_with_workers(sigma, 8).unwrap();
+        for (i, (a, b)) in sequential
+            .slices
+            .iter()
+            .zip(parallel.slices.iter())
+            .enumerate()
+        {
+            assert_planes_bit_identical(a, b, &format!("slice {i} sigma {sigma}"));
+        }
+        assert_eq!(parallel.current_slice, 2, "selected slice must survive");
+    }
+}
+
+#[test]
+fn gaussian_blur_stack_rejects_mixed_planes_without_mutating_state() {
+    let mut doc = ImageDocument::new_stack(
+        "mixed.tif",
+        8,
+        6,
+        vec![
+            PixelPlane::Gray8(vec![7; 48]),
+            PixelPlane::ColorRgb(vec![0x00A0B0C0; 48]),
+            PixelPlane::Gray16(vec![9; 48]),
+        ],
+    )
+    .unwrap();
+    doc.set_slice(3).unwrap();
+    doc.set_rect_roi(1, 1, 3, 3).unwrap();
+    doc.snapshot = Some(doc.slices.clone());
+    let before = doc.clone();
+
+    assert!(matches!(
+        doc.gaussian_blur_stack_with_workers(2.0, 8),
+        Err(CoreError::UnsupportedFilter { .. })
+    ));
+    assert_eq!(doc.slices, before.slices, "no slice may be filtered");
+    assert_eq!(doc.current_slice, before.current_slice);
+    assert_eq!(doc.position, before.position);
+    assert_eq!(doc.roi, before.roi);
+    assert_eq!(doc.snapshot, before.snapshot, "snapshot must be untouched");
+}
+
+#[test]
+fn gaussian_blur_stack_rejects_extreme_sigma_without_mutating_state() {
+    let mut doc = distinct_stack_8bit(16, 12, 3);
+    doc.set_slice(3).unwrap();
+    doc.set_rect_roi(1, 1, 5, 4).unwrap();
+    doc.snapshot = Some(doc.slices.clone());
+    let before = doc.clone();
+
+    assert!(matches!(
+        doc.gaussian_blur_stack_with_workers(6.0e8, 8),
+        Err(CoreError::InvalidFilterParameter { .. })
+    ));
+    assert_eq!(doc.slices, before.slices);
+    assert_eq!(doc.current_slice, before.current_slice);
+    assert_eq!(doc.roi, before.roi);
+    assert_eq!(doc.snapshot, before.snapshot);
+
+    // The single-image entry point rejects sigma before saving its Undo
+    // snapshot, so the document must be equally untouched.
+    let mut single = gaussian_noise_8bit(16, 12);
+    single.set_rect_roi(1, 1, 5, 4).unwrap();
+    let before = single.clone();
+    assert!(matches!(
+        single.gaussian_blur_with_workers(6.0e8, 4),
+        Err(CoreError::InvalidFilterParameter { .. })
+    ));
+    assert_eq!(single.plane(), before.plane());
+    assert_eq!(single.roi, before.roi);
+    assert_eq!(single.snapshot, before.snapshot);
+}
+
+#[test]
+fn gaussian_blur_stack_nonpositive_sigma_is_noop() {
+    // blurFloat checks sigmaX > 0 and sigmaY > 0 (GaussianBlur.java
+    // 205-212), so zero, negative and NaN sigma must leave every slice
+    // untouched and never reach the worker pool.
+    for sigma in [0.0, -1.0, f64::NAN] {
+        let mut doc = distinct_stack_8bit(32, 24, 3);
+        doc.set_slice(2).unwrap();
+        let before = doc.slices.clone();
+        doc.gaussian_blur_stack_with_workers(sigma, 8).unwrap();
+        assert_eq!(doc.slices, before, "sigma {sigma} must not touch pixels");
+        assert_eq!(doc.current_slice, 2);
+        assert!(!doc.undo(), "stack entry point drops Undo like a real pass");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit 5 (fifth increment): AutoThresholder.Otsu and AutoThresholder.IsoData
 // for 8-bit grayscale images.
 //

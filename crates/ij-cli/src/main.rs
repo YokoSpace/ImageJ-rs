@@ -38,7 +38,8 @@ fn print_usage() {
   ij-cli doctor
   ij-cli slice1 --out-dir <dir>
   ij-cli parity-check
-  ij-cli bench-worker <case> <width> <height> <slices> <iterations> <warmup>"
+  ij-cli bench-worker <case> <width> <height> <slices> <iterations> <warmup>
+    [type=8|16|32] [input=noise|impulse|ramp] [sigma=N] [seed=N] [threads=N]"
     );
 }
 

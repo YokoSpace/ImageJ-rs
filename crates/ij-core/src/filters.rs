@@ -220,6 +220,21 @@ impl ImageDocument {
     /// Indexed 8-bit color and RGB are rejected explicitly: this increment
     /// covers the three grayscale representations only.
     pub fn gaussian_blur(&mut self, sigma: f64) -> Result<(), CoreError> {
+        self.gaussian_blur_with_workers(sigma, 0)
+    }
+
+    /// `gaussian_blur` with an explicit execution worker budget.
+    ///
+    /// `workers` bounds the scoped worker set used for the blur:
+    /// `0` resolves to `std::thread::available_parallelism` (the Java default
+    /// is `Prefs.getThreads() == Runtime.availableProcessors`, Prefs.java
+    /// 690-698) and `1` is fully sequential. Worker count only changes how
+    /// lines are scheduled; every budget produces bit-identical pixels.
+    pub fn gaussian_blur_with_workers(
+        &mut self,
+        sigma: f64,
+        workers: usize,
+    ) -> Result<(), CoreError> {
         reject_unsupported_gray_type(self.plane(), "Gaussian Blur")?;
 
         // ImageJ 1.54u computes the kernel radius as
@@ -243,50 +258,135 @@ impl ImageDocument {
         let region = self.filter_region()?;
         let width = self.width;
         let height = self.height;
+        gaussian_blur_plane(
+            self.plane_mut(),
+            width,
+            height,
+            &region,
+            sigma,
+            resolve_workers(workers),
+        )
+    }
 
-        match self.plane_mut() {
-            PixelPlane::Gray8(pixels) => {
-                // GaussianBlur.run picks accuracy 0.002 for ByteProcessor
-                // (GaussianBlur.java 135-136).
-                let original = pixels.clone();
-                let mut float: Vec<f32> = pixels.iter().map(|&p| p as f32).collect();
-                blur_gaussian_float(&mut float, width, height, &region, sigma, 0.002);
-                // ByteProcessor.setPixels converts the whole image, not just
-                // the ROI (ByteProcessor.java 1268-1279).
-                for (dst, &src) in pixels.iter_mut().zip(float.iter()) {
-                    *dst = rounded_byte(src);
-                }
-                restore_outside_roi(pixels, &original, width, height, &region, sigma);
-            }
-            PixelPlane::Gray16(pixels) => {
-                let original = pixels.clone();
-                let mut float: Vec<f32> = pixels.iter().map(|&p| p as f32).collect();
-                blur_gaussian_float(&mut float, width, height, &region, sigma, 0.0002);
-                for (dst, &src) in pixels.iter_mut().zip(float.iter()) {
-                    *dst = rounded_short(src);
-                }
-                restore_outside_roi(pixels, &original, width, height, &region, sigma);
-            }
-            PixelPlane::Gray32(pixels) => {
-                let original = pixels.clone();
-                blur_gaussian_float(pixels, width, height, &region, sigma, 0.0002);
-                restore_outside_roi(pixels, &original, width, height, &region, sigma);
-            }
-            // Rejected above; kept explicit instead of silently ignoring them.
-            PixelPlane::Color256 { .. } => {
-                return Err(CoreError::UnsupportedFilter {
-                    filter: "Gaussian Blur",
-                    pixel_type: "8-bit color (indexed)",
-                });
-            }
-            PixelPlane::ColorRgb(_) => {
-                return Err(CoreError::UnsupportedFilter {
-                    filter: "Gaussian Blur",
-                    pixel_type: "RGB",
-                });
-            }
+    /// `run("Gaussian Blur...", "sigma=N stack")` with an explicit execution
+    /// worker budget; see [`ImageDocument::gaussian_blur_with_workers`].
+    ///
+    /// Slices are distributed over at most `GAUSSIAN_MAX_SLICE_WORKERS`
+    /// slice workers, further capped so the concurrent transient float
+    /// buffers (workspace, column staging, ROI-restore copy) stay under
+    /// `GAUSSIAN_STACK_TEMP_BUDGET`; oversized planes run sequentially with
+    /// the full line-worker budget instead. Each slice worker gets
+    /// `workers / slice_workers` line workers inside the blur, so the
+    /// nested parallelism stays within the budget instead of
+    /// oversubscribing.
+    pub fn gaussian_blur_stack_with_workers(
+        &mut self,
+        sigma: f64,
+        workers: usize,
+    ) -> Result<(), CoreError> {
+        // Reject unsupported pixel types and an overflowing sigma before
+        // touching any slice so a heterogeneous stack cannot be left
+        // half-filtered.
+        for plane in &self.slices {
+            reject_unsupported_gray_type(plane, "Gaussian Blur")?;
         }
-        Ok(())
+        if sigma > 5.0e8 {
+            return Err(CoreError::InvalidFilterParameter {
+                filter: "Gaussian Blur",
+                parameter: "sigma",
+                value: format!("{sigma}"),
+            });
+        }
+        if self.slices.is_empty() {
+            return Ok(());
+        }
+        if self.slices.len() == 1 {
+            // A one-plane stack keeps its Undo snapshot, exactly like the
+            // single-image entry point.
+            return self.gaussian_blur_with_workers(sigma, workers);
+        }
+
+        let workers = resolve_workers(workers);
+        let region = self.filter_region()?;
+        let width = self.width;
+        let height = self.height;
+
+        // blurFloat skips zero/negative/NaN sigma per slice
+        // (GaussianBlur.java 205-212); a whole-stack no-op would only churn
+        // worker threads and transient buffers. The Undo snapshot is still
+        // dropped, exactly like after a filtered pass.
+        if !(sigma > 0.0) {
+            self.snapshot = None;
+            self.snapshot_dimensions = None;
+            self.snapshot_display_range = None;
+            return Ok(());
+        }
+
+        // Cap slice-level parallelism so `outer` concurrent transient
+        // buffer sets stay under the temporary-memory budget. A slice that
+        // alone exceeds the share still gets one worker (never zero); its
+        // blur keeps full inner-line parallelism.
+        let per_slice = self
+            .slices
+            .iter()
+            .map(|plane| gaussian_slice_temp_bytes(plane, width, height, &region))
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let budget_slots = (GAUSSIAN_STACK_TEMP_BUDGET / per_slice).max(1) as usize;
+        let outer = workers
+            .min(self.slices.len())
+            .min(GAUSSIAN_MAX_SLICE_WORKERS)
+            .min(budget_slots)
+            .max(1);
+        let inner = (workers / outer).max(1);
+        let region = &region;
+
+        // `chunks_mut` hands each slice worker a disjoint slice range; the
+        // stack is never moved out of `self`, so a worker panic cannot
+        // strand planes inside a Mutex and no slot/lock bookkeeping is
+        // needed. Slice costs are uniform, so the static split loses
+        // nothing to the previous atomic work queue.
+        let result = if outer <= 1 {
+            self.slices.iter_mut().try_for_each(|plane| {
+                gaussian_blur_plane(plane, width, height, region, sigma, inner)
+            })
+        } else {
+            let chunk = self.slices.len().div_ceil(outer);
+            let mut chunks: Vec<&mut [PixelPlane]> = self.slices.chunks_mut(chunk).collect();
+            let last = chunks.pop();
+            let blur_chunk = move |planes: &mut [PixelPlane]| {
+                planes.iter_mut().try_for_each(|plane| {
+                    gaussian_blur_plane(plane, width, height, region, sigma, inner)
+                })
+            };
+            std::thread::scope(|scope| {
+                let worker_ref = &blur_chunk;
+                let mut handles = Vec::with_capacity(chunks.len());
+                for planes in chunks {
+                    handles.push(scope.spawn(move || worker_ref(planes)));
+                }
+                let last_result = last.map(blur_chunk);
+                let mut results = Vec::with_capacity(handles.len() + 1);
+                for handle in handles {
+                    results.push(handle.join().expect("slice worker panicked"));
+                }
+                if let Some(result) = last_result {
+                    results.push(result);
+                }
+                // Report the first error in slice order. Post-validation
+                // errors are unreachable (all planes were type-checked
+                // above), so chunk completion order is unobservable.
+                results.into_iter().collect()
+            })
+        };
+
+        // A complete-stack filter clears Undo (PlugInFilterRunner.java
+        // 118-120).
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
+        result
     }
 
     /// Port of `RankFilters.rank` for the MEDIAN, MIN and MAX filter types of
@@ -1588,6 +1688,125 @@ fn restore_outside_roi<T: Copy>(
     }
 }
 
+/// `gaussian_blur` worker resolution: `0` means the available-parallelism
+/// default (matching `Prefs.getThreads()`, Prefs.java 690-698); any positive
+/// value is used as-is.
+fn resolve_workers(workers: usize) -> usize {
+    if workers == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    } else {
+        workers
+    }
+}
+
+/// Upper bound on the transient float buffers a stack-wide Gaussian blur
+/// may hold concurrently across slice workers. Slices whose estimated
+/// working set exceeds an equal share run sequentially, each keeping the
+/// full inner line-worker budget.
+const GAUSSIAN_STACK_TEMP_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Hard cap on stack-slice workers so many-slice stacks cannot multiply
+/// transient buffers even on high-core machines.
+const GAUSSIAN_MAX_SLICE_WORKERS: usize = 4;
+
+/// Estimated peak transient bytes of one slice blur, used only to bound
+/// slice-level parallelism. The float workspace (Gray8/Gray16 convolve a
+/// float copy; Gray32 blurs in place) and the column-pass staging band are
+/// each bounded by 4 bytes per pixel, plus a full-plane copy when the
+/// out-of-ROI restore path keeps the original. Per-line caches and kernels
+/// are negligible by comparison.
+fn gaussian_slice_temp_bytes(
+    plane: &PixelPlane,
+    width: u32,
+    height: u32,
+    region: &FilterRegion,
+) -> u64 {
+    let pixels = u64::from(width) * u64::from(height);
+    let workspace = match plane {
+        PixelPlane::Gray32(_) => 0,
+        _ => pixels * 4,
+    };
+    // `restore_outside_roi` keeps a typed copy of the whole plane.
+    let restore = if region.height != height || region.mask.is_some() {
+        match plane {
+            PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => pixels,
+            PixelPlane::Gray16(_) => pixels * 2,
+            PixelPlane::Gray32(_) | PixelPlane::ColorRgb(_) => pixels * 4,
+        }
+    } else {
+        0
+    };
+    workspace + pixels * 4 + restore
+}
+
+/// The per-plane body of `gaussian_blur`, shared by the slice and stack
+/// entry points. The caller handles snapshots and ROI semantics; this only
+/// rewrites pixels inside `plane`.
+pub(crate) fn gaussian_blur_plane(
+    plane: &mut PixelPlane,
+    width: u32,
+    height: u32,
+    region: &FilterRegion,
+    sigma: f64,
+    workers: usize,
+) -> Result<(), CoreError> {
+    // `restore_outside_roi` only runs when the ROI is shorter than the image
+    // or an irregular mask exists; skip the pre-blur copy otherwise.
+    let needs_restore = (region.height != height && sigma > 0.0) || region.mask.is_some();
+    match plane {
+        PixelPlane::Gray8(pixels) => {
+            // GaussianBlur.run picks accuracy 0.002 for ByteProcessor
+            // (GaussianBlur.java 135-136).
+            let original = needs_restore.then(|| pixels.clone());
+            let mut float: Vec<f32> = pixels.iter().map(|&p| p as f32).collect();
+            blur_gaussian_float(&mut float, width, height, region, sigma, 0.002, workers);
+            // ByteProcessor.setPixels converts the whole image, not just
+            // the ROI (ByteProcessor.java 1268-1279).
+            for (dst, &src) in pixels.iter_mut().zip(float.iter()) {
+                *dst = rounded_byte(src);
+            }
+            if let Some(original) = original {
+                restore_outside_roi(pixels, &original, width, height, region, sigma);
+            }
+        }
+        PixelPlane::Gray16(pixels) => {
+            let original = needs_restore.then(|| pixels.clone());
+            let mut float: Vec<f32> = pixels.iter().map(|&p| p as f32).collect();
+            blur_gaussian_float(&mut float, width, height, region, sigma, 0.0002, workers);
+            for (dst, &src) in pixels.iter_mut().zip(float.iter()) {
+                *dst = rounded_short(src);
+            }
+            if let Some(original) = original {
+                restore_outside_roi(pixels, &original, width, height, region, sigma);
+            }
+        }
+        PixelPlane::Gray32(pixels) => {
+            let original = needs_restore.then(|| pixels.clone());
+            blur_gaussian_float(pixels, width, height, region, sigma, 0.0002, workers);
+            if let Some(original) = original {
+                restore_outside_roi(pixels, &original, width, height, region, sigma);
+            }
+        }
+        // Callers reject these types before dispatching; kept explicit
+        // instead of silently ignoring them.
+        PixelPlane::Color256 { .. } => {
+            return Err(CoreError::UnsupportedFilter {
+                filter: "Gaussian Blur",
+                pixel_type: "8-bit color (indexed)",
+            });
+        }
+        PixelPlane::ColorRgb(_) => {
+            return Err(CoreError::UnsupportedFilter {
+                filter: "Gaussian Blur",
+                pixel_type: "RGB",
+            });
+        }
+    }
+    Ok(())
+}
+
 /// `GaussianBlur.blurFloat` (GaussianBlur.java 205-212). The x pass processes
 /// `ceil(5*sigmaY)` extra lines above and below the ROI because the y pass
 /// reads filtered neighbours; `resetOutOfRoi` later restores those lines
@@ -1601,6 +1820,7 @@ fn blur_gaussian_float(
     region: &FilterRegion,
     sigma: f64,
     accuracy: f64,
+    workers: usize,
 ) {
     // blurFloat checks `sigmaX > 0` and `sigmaY > 0`, so zero and negative
     // sigma (and NaN) leave the pixels untouched.
@@ -1617,13 +1837,27 @@ fn blur_gaussian_float(
         accuracy,
         true,
         extra_lines,
+        workers,
     );
-    blur_one_direction(pixels, width, height, region, sigma, accuracy, false, 0);
+    blur_one_direction(
+        pixels,
+        width,
+        height,
+        region,
+        sigma,
+        accuracy,
+        false,
+        0,
+        workers,
+    );
 }
 
 /// Port of `GaussianBlur.blur1Direction` (GaussianBlur.java 222-319) without
-/// the progress bar and worker threads. Each line is independent, so running
-/// the lines sequentially produces the same pixels as ImageJ's thread pool.
+/// the progress bar. `workers` bounds the scoped worker set; the effective
+/// thread count is also capped by the line count and ImageJ's task-size
+/// estimate (GaussianBlur.java 273-276), so small blurs stay sequential.
+/// Each line is independent, so every worker count produces the same pixels
+/// as ImageJ's thread pool.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blur_one_direction(
     pixels: &mut [f32],
@@ -1634,6 +1868,7 @@ pub(crate) fn blur_one_direction(
     accuracy: f64,
     x_direction: bool,
     extra_lines: i32,
+    workers: usize,
 ) {
     const UPSCALE_K_RADIUS: i32 = 2;
     const MIN_DOWNSCALED_SIGMA: f64 = 4.0;
@@ -1706,6 +1941,63 @@ pub(crate) fn blur_one_direction(
         None
     };
 
+    let num_lines = (line_to - line_from).max(0);
+    if num_lines == 0 {
+        return;
+    }
+    // blur1Direction caps the thread count by the line count and by a
+    // task-size estimate in units of multiply-adds, so small blurs stay
+    // sequential (GaussianBlur.java 273-276).
+    let line_cap = workers.max(1).min(num_lines as usize);
+    let task_estimate = (num_lines as u64)
+        .saturating_mul((write_to - write_from).max(0) as u64)
+        .saturating_mul(gauss_kernel[0].len() as u64)
+        / if do_downscaling { 8000 } else { 16000 };
+    let num_threads = line_cap.min(task_estimate as usize + 1).max(1);
+
+    if num_threads > 1 {
+        if x_direction {
+            blur_rows_parallel(
+                pixels,
+                width,
+                line_from,
+                line_to,
+                write_from,
+                write_to,
+                read_from,
+                read_to,
+                new_length,
+                unscaled0,
+                reduce_by,
+                &gauss_kernel,
+                downscale_kernel.as_deref(),
+                upscale_kernel.as_deref(),
+                num_threads,
+            );
+        } else {
+            blur_columns_parallel(
+                pixels,
+                width,
+                line_from,
+                line_to,
+                write_from,
+                write_to,
+                read_from,
+                read_to,
+                new_length,
+                length,
+                point_inc,
+                unscaled0,
+                reduce_by,
+                &gauss_kernel,
+                downscale_kernel.as_deref(),
+                upscale_kernel.as_deref(),
+                num_threads,
+            );
+        }
+        return;
+    }
+
     let mut cache1 = vec![0f32; new_length as usize];
     let mut cache2 = if do_downscaling {
         Some(vec![0f32; new_length as usize])
@@ -1763,6 +2055,342 @@ pub(crate) fn blur_one_direction(
                 pixel0,
                 point_inc,
             );
+        }
+    }
+}
+
+/// x-direction parallel path: rows are contiguous in the pixel array, so
+/// `chunks_mut` hands each worker whole rows to blur in place. Line work is
+/// uniform, so the split is static and the caller thread takes the last
+/// block.
+#[allow(clippy::too_many_arguments)]
+fn blur_rows_parallel(
+    pixels: &mut [f32],
+    width: u32,
+    line_from: i32,
+    line_to: i32,
+    write_from: i32,
+    write_to: i32,
+    read_from: i32,
+    read_to: i32,
+    new_length: i32,
+    unscaled0: i32,
+    reduce_by: i32,
+    gauss_kernel: &[Vec<f32>; 2],
+    downscale_kernel: Option<&[f32]>,
+    upscale_kernel: Option<&[f32]>,
+    num_threads: usize,
+) {
+    let w = width as usize;
+    let num_lines = (line_to - line_from) as usize;
+    let chunk = num_lines.div_ceil(num_threads) * w;
+    let rows = &mut pixels[line_from as usize * w..line_to as usize * w];
+    let mut blocks: Vec<&mut [f32]> = rows.chunks_mut(chunk).collect();
+    let Some(last) = blocks.pop() else { return };
+    std::thread::scope(|scope| {
+        for block in blocks {
+            scope.spawn(|| {
+                blur_rows_block(
+                    block,
+                    w,
+                    write_from,
+                    write_to,
+                    read_from,
+                    read_to,
+                    new_length,
+                    unscaled0,
+                    reduce_by,
+                    gauss_kernel,
+                    downscale_kernel,
+                    upscale_kernel,
+                );
+            });
+        }
+        blur_rows_block(
+            last,
+            w,
+            write_from,
+            write_to,
+            read_from,
+            read_to,
+            new_length,
+            unscaled0,
+            reduce_by,
+            gauss_kernel,
+            downscale_kernel,
+            upscale_kernel,
+        );
+    });
+}
+
+/// Blurs every row of `block` in place; the block is a whole number of rows.
+#[allow(clippy::too_many_arguments)]
+fn blur_rows_block(
+    block: &mut [f32],
+    w: usize,
+    write_from: i32,
+    write_to: i32,
+    read_from: i32,
+    read_to: i32,
+    new_length: i32,
+    unscaled0: i32,
+    reduce_by: i32,
+    gauss_kernel: &[Vec<f32>; 2],
+    downscale_kernel: Option<&[f32]>,
+    upscale_kernel: Option<&[f32]>,
+) {
+    let mut cache1 = vec![0f32; new_length as usize];
+    let mut cache2 = if downscale_kernel.is_some() {
+        vec![0f32; new_length as usize]
+    } else {
+        Vec::new()
+    };
+    for row in block.chunks_mut(w) {
+        if let (Some(downscale), Some(upscale)) = (downscale_kernel, upscale_kernel) {
+            // Row-local indices: `pixel0` is 0 because `row` starts at the
+            // line origin and `pLast` is the row end.
+            downscale_line(
+                row,
+                &mut cache1,
+                downscale,
+                reduce_by,
+                0,
+                unscaled0,
+                w as i32,
+                1,
+                new_length,
+            );
+            convolve_line(
+                &cache1,
+                &mut cache2,
+                gauss_kernel,
+                0,
+                new_length,
+                1,
+                new_length - 1,
+                0,
+                1,
+            );
+            upscale_line(
+                &cache2, row, upscale, reduce_by, 0, unscaled0, write_from, write_to, 1,
+            );
+        } else {
+            for i in read_from..read_to {
+                cache1[i as usize] = row[i as usize];
+            }
+            convolve_line(
+                &cache1,
+                row,
+                gauss_kernel,
+                read_from,
+                read_to,
+                write_from,
+                write_to,
+                0,
+                1,
+            );
+        }
+    }
+}
+
+/// y-direction parallel path: a column is strided in the pixel array, so
+/// disjoint mutable borrows are impossible without unsafe code. Workers
+/// convolve their columns into one flat column-major staging buffer,
+/// `staged[(line - line_from) * out_len + (y - write_from)]`, that holds up
+/// to 4 bytes per staged output position (the full [line_from, line_to) x
+/// [write_from, write_end) band). The write-back then transposes it into
+/// the pixel array in cache-sized tiles over parallel row chunks.
+#[allow(clippy::too_many_arguments)]
+fn blur_columns_parallel(
+    pixels: &mut [f32],
+    width: u32,
+    line_from: i32,
+    line_to: i32,
+    write_from: i32,
+    write_to: i32,
+    read_from: i32,
+    read_to: i32,
+    new_length: i32,
+    length: i32,
+    point_inc: i32,
+    unscaled0: i32,
+    reduce_by: i32,
+    gauss_kernel: &[Vec<f32>; 2],
+    downscale_kernel: Option<&[f32]>,
+    upscale_kernel: Option<&[f32]>,
+    num_threads: usize,
+) {
+    // convolveLine can write past writeTo up to min(kRadius, length)
+    // (GaussianBlur.java 478-489), so stage that full range.
+    let first_part = (gauss_kernel[0].len() as i32).min(length);
+    let write_end = if downscale_kernel.is_some() {
+        write_to
+    } else {
+        write_to.max(first_part)
+    };
+    let out_len = (write_end - write_from).max(0) as usize;
+    let num_lines = (line_to - line_from) as usize;
+    if out_len == 0 || num_lines == 0 {
+        return;
+    }
+    let chunk = num_lines.div_ceil(num_threads);
+    let pixels_ref: &[f32] = pixels;
+
+    // A single zeroed staging allocation replaces the previous per-column
+    // Vec<Vec<f32>> churn (one allocation plus a zero-fill per line). Every
+    // staged position is fully overwritten by convolveLine/upscaleLine
+    // before the write-back reads it, so the initial zeroes are never
+    // observed. `chunks_mut` hands each worker a contiguous disjoint band
+    // of whole columns.
+    let mut staged = vec![0f32; num_lines * out_len];
+    {
+        let mut bands: Vec<(i32, &mut [f32])> = Vec::new();
+        let mut band_from = line_from;
+        for band in staged.chunks_mut(chunk * out_len) {
+            let band_lines = (band.len() / out_len) as i32;
+            bands.push((band_from, band));
+            band_from += band_lines;
+        }
+        let Some((last_from, last_band)) = bands.pop() else {
+            return;
+        };
+
+        let worker = |range_from: i32, band: &mut [f32]| {
+            let mut cache1 = vec![0f32; new_length as usize];
+            let mut cache2 = if downscale_kernel.is_some() {
+                vec![0f32; new_length as usize]
+            } else {
+                Vec::new()
+            };
+            let band_lines = band.len() / out_len;
+            for local in 0..band_lines {
+                // line_inc is 1 for columns.
+                let line = range_from + local as i32;
+                let out = &mut band[local * out_len..(local + 1) * out_len];
+                if let (Some(downscale), Some(upscale)) = (downscale_kernel, upscale_kernel) {
+                    downscale_line(
+                        pixels_ref,
+                        &mut cache1,
+                        downscale,
+                        reduce_by,
+                        line,
+                        unscaled0,
+                        length,
+                        point_inc,
+                        new_length,
+                    );
+                    convolve_line(
+                        &cache1,
+                        &mut cache2,
+                        gauss_kernel,
+                        0,
+                        new_length,
+                        1,
+                        new_length - 1,
+                        0,
+                        1,
+                    );
+                    // Stage positions [write_from, write_to) at
+                    // out[x - write_from].
+                    upscale_line(
+                        &cache2,
+                        out,
+                        upscale,
+                        reduce_by,
+                        -write_from,
+                        unscaled0,
+                        write_from,
+                        write_to,
+                        1,
+                    );
+                } else {
+                    let mut p = line + read_from * point_inc;
+                    for i in read_from..read_to {
+                        cache1[i as usize] = pixels_ref[p as usize];
+                        p += point_inc;
+                    }
+                    convolve_line(
+                        &cache1,
+                        out,
+                        gauss_kernel,
+                        read_from,
+                        read_to,
+                        write_from,
+                        write_to,
+                        -write_from,
+                        1,
+                    );
+                }
+            }
+        };
+
+        std::thread::scope(|scope| {
+            let worker_ref = &worker;
+            let mut handles = Vec::with_capacity(bands.len());
+            for (range_from, band) in bands {
+                handles.push(scope.spawn(move || worker_ref(range_from, band)));
+            }
+            worker(last_from, last_band);
+            for handle in handles {
+                handle.join().expect("column worker panicked");
+            }
+        });
+    }
+
+    // Write-back: staged[(line - line_from) * out_len + (y - write_from)]
+    // belongs to column `line`, row y. Output rows are contiguous runs
+    // inside [line_from, line_to), so row chunks can again be handed out
+    // mutably.
+    let w = width as usize;
+    let rows = &mut pixels[write_from as usize * w..write_end as usize * w];
+    let chunk_rows = (rows.len() / w).div_ceil(num_threads) * w;
+    let mut blocks: Vec<&mut [f32]> = rows.chunks_mut(chunk_rows).collect();
+    let Some(last) = blocks.pop() else { return };
+    let last_y = write_end - (last.len() / w) as i32;
+    let staged = &staged[..];
+    let mut y0 = write_from;
+    std::thread::scope(|scope| {
+        for block in blocks {
+            let block_y = y0;
+            y0 += (block.len() / w) as i32;
+            scope.spawn(move || {
+                write_back_columns(block, w, block_y, write_from, line_from, out_len, staged);
+            });
+        }
+        write_back_columns(last, w, last_y, write_from, line_from, out_len, staged);
+    });
+}
+
+/// Transposes one row block of the column-major staging into `block`.
+/// 32x32 tiles bound the working set on both sides: each tile reads 32
+/// staged columns over a 32-row window (4 KiB) and writes 32-row segments
+/// of 32 contiguous pixels, so the strided side of the transpose stays
+/// resident in L1 instead of sweeping one cache line per column per row.
+fn write_back_columns(
+    block: &mut [f32],
+    w: usize,
+    block_y: i32,
+    write_from: i32,
+    line_from: i32,
+    out_len: usize,
+    staged: &[f32],
+) {
+    const TILE: usize = 32;
+    let num_lines = staged.len() / out_len;
+    let x_base = line_from as usize;
+    for (tile_index, row_tile) in block.chunks_mut(TILE * w).enumerate() {
+        let tile_y = block_y + (tile_index * TILE) as i32;
+        let mut x0 = 0usize;
+        while x0 < num_lines {
+            let x1 = (x0 + TILE).min(num_lines);
+            for (r, row) in row_tile.chunks_mut(w).enumerate() {
+                let t = (tile_y + r as i32 - write_from) as usize;
+                let dst = &mut row[x_base + x0..x_base + x1];
+                for (i, d) in dst.iter_mut().enumerate() {
+                    *d = staged[(x0 + i) * out_len + t];
+                }
+            }
+            x0 = x1;
         }
     }
 }

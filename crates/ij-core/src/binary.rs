@@ -599,7 +599,7 @@ fn isodata2_threshold(histogram: &[i64; 256]) -> (f64, f64) {
         height: 1,
         mask: None,
     };
-    blur_one_direction(&mut hist_f, 256, 1, &full, 2.0, 0.01, true, 0);
+    blur_one_direction(&mut hist_f, 256, 1, &full, 2.0, 0.01, true, 0, 1);
     let mut blurred_max = 0f32;
     let mut blurred_mode = 0usize;
     let mut sum = 0f32;
