@@ -4,6 +4,8 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+mod benchmark;
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -15,6 +17,13 @@ fn main() -> ExitCode {
         "doctor" => run_doctor(),
         "slice1" => run_slice1(&args[1..]),
         "parity-check" => run_parity_check(),
+        "bench-worker" => match benchmark::run(&args[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("benchmark failed: {error}");
+                ExitCode::from(1)
+            }
+        },
         _ => {
             eprintln!("unknown subcommand: {}", args[0]);
             print_usage();
@@ -28,7 +37,8 @@ fn print_usage() {
         "Usage:
   ij-cli doctor
   ij-cli slice1 --out-dir <dir>
-  ij-cli parity-check"
+  ij-cli parity-check
+  ij-cli bench-worker <case> <width> <height> <slices> <iterations> <warmup>"
     );
 }
 

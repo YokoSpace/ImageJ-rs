@@ -54,6 +54,8 @@ Plug-ins do **not** run in a security sandbox. Run only code you trust. The [`ij
 
 This checks the untouched Java reference, builds the ImageJ 1.54u oracle, runs Rust tests including differential comparisons and the Phase 3 compressed TIFF → particle analysis → save workflow, and exercises the original TIFF → ROI → measurement → save slice. Success ends with `VERIFY_ALL_OK`; artifacts are written to `verification/evidence/latest/`.
 
+To compare processing time and peak process memory with ImageJ 1.54u, run `python3 tools/benchmark/compare.py --out-dir verification/benchmarks/manual`. The [benchmark guide](tools/benchmark/README.md) explains the workloads, output, and measurement boundaries.
+
 For a shorter environment check:
 
 ```sh

@@ -6,6 +6,7 @@
 /tools/oracle/.build_stamp.json
 /tools/oracle/.oracle_build.lock
 /verification/evidence/
+/verification/benchmarks/
 __pycache__/
 *.pyc
 /tools/plugin-host/classes/
