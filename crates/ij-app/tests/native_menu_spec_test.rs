@@ -89,7 +89,7 @@ fn native_spec_disables_image_actions_without_an_image() {
     let spec = app.build_native_menu_spec();
 
     for action in [
-        AppAction::NewRamp,
+        AppAction::NewImage,
         AppAction::OpenTiff,
         AppAction::Quit,
         AppAction::InstalledPlugins,
@@ -408,8 +408,11 @@ fn building_the_native_spec_does_not_touch_session_or_macro_state() {
 fn native_action_queue_dispatches_through_the_app() {
     let mut app = ij_app::ImageJApp::new();
     let ctx = egui::Context::default();
-    ij_app::macos_bridge::native_menu::queue_action(ij_app::action::AppAction::NewRamp, &ctx);
+    ij_app::macos_bridge::native_menu::queue_action(ij_app::action::AppAction::NewImage, &ctx);
     app.dispatch_native_menu_actions(&ctx);
+    // File > New > Image... opens the dialog; OK creates the window.
+    assert!(app.dialogs.new_image.open);
+    app.apply_new_image_dialog(&ctx).unwrap();
     assert_eq!(app.open_window_count(), 1);
     app.dispatch_native_menu_actions(&ctx);
     assert_eq!(app.open_window_count(), 1);
@@ -500,10 +503,16 @@ impl eframe::App for Smoke {
     assert_eq!(native_menu::probe_item(AppAction::Save), Some((false,"s".into())));
     assert_eq!(native_menu::probe_item(AppAction::Measure), Some((false,"".into())));
     assert_eq!(native_menu::probe_item(AppAction::Quit), Some((true,"".into())));
-    assert!(native_menu::probe_activate(AppAction::NewRamp));
+    assert!(native_menu::probe_activate(AppAction::NewImage));
+    self.app.apply_new_image_dialog(ctx).unwrap();
     println!("NATIVE_MENU_INSTALL_OK {:?}", self.titles);
    }
    1 => {
+    // The File > New > Image... callback opened the dialog; OK creates it.
+    // If activation was synchronous the phase-0 apply already closed it.
+    self.app.apply_new_image_dialog(ctx).unwrap();
+    // Refresh so the native spec reflects the newly created, dirty image.
+    self.app.update_ui(ctx);
     assert_eq!(self.app.open_window_count(), 1);
     assert!(self.app.any_dirty());
     assert_eq!(native_menu::probe_item(AppAction::Save), Some((true,"s".into())));

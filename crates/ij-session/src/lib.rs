@@ -6,7 +6,8 @@ pub use ij_bridge::plugin::{
 };
 use ij_core::{
     default_duplicate_title, display_histogram, CoreError, DisplayRange, ImageDocument,
-    MeasurementConfig, MeasurementFlags, MeasurementSummary, PixelPlane, ProfileData, ResultsTable,
+    MeasurementConfig, MeasurementFlags, MeasurementSummary, NewImageFill, NewImageType,
+    PixelPlane, ProfileData, ResultsTable,
     AnalyzedParticle, AngleRoi, ParticleAnalysisOptions, PointRoi, Roi, StackBinaryOptions,
     ThresholdLevels,
 };
@@ -168,6 +169,10 @@ pub enum SessionError {
     InvalidPluginFilterOutput(String),
     #[error("Rust plugin failed: {0}")]
     RustPlugin(String),
+    #[error("Width and height must be >0")]
+    InvalidNewImageDimensions,
+    #[error("unsupported newImage type: {0}")]
+    UnsupportedNewImageType(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,6 +181,17 @@ pub enum Command {
         title: String,
         width: u32,
         height: u32,
+    },
+    /// `File > New > Image...` and the `newImage` macro function. `type_name`
+    /// is the Java type string ("8-bit", "16-bit", "32-bit" or "RGB",
+    /// optionally followed by a fill keyword) parsed exactly like
+    /// `IJ.createImage` (original_imagej/ij/IJ.java 2293-2318).
+    NewImage {
+        title: String,
+        type_name: String,
+        width: u32,
+        height: u32,
+        slices: u32,
     },
     OpenTiff {
         path: PathBuf,
@@ -1033,6 +1049,44 @@ impl Session {
                 let doc = ImageDocument::new_ramp_8bit(&title, width, height)?;
                 self.macro_recorder.push(format!(
                     "newImage(\"{title}\", \"8-bit ramp\", {width}, {height}, 1);"
+                ));
+                let id = self.insert_doc(doc);
+                self.dirty_images.insert(id);
+                Ok(CommandOutcome::ImageOpened(id))
+            }
+            Command::NewImage {
+                title,
+                type_name,
+                width,
+                height,
+                slices,
+            } => {
+                // NewImage.showDialog: slices clamp to >=1 and width/height
+                // <1 abort with "Width and height must be >0"
+                // (original_imagej/ij/gui/NewImage.java 429-433).
+                if width < 1 || height < 1 {
+                    return Err(SessionError::InvalidNewImageDimensions);
+                }
+                let (image_type, fill) = parse_new_image_type(&type_name)?;
+                self.save_roi();
+                let doc = ImageDocument::new_image(
+                    &title,
+                    image_type,
+                    fill,
+                    width,
+                    height,
+                    slices,
+                    u64::from(self.next_id).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
+                )?;
+                // Recorder.appendNewImage writes the type plus lowercase fill
+                // keyword (original_imagej/ij/plugin/frame/Recorder.java
+                // 726-753); the recorded string replays identically through
+                // the same parse.
+                self.macro_recorder.push(format!(
+                    "newImage(\"{}\", \"{}\", {width}, {height}, {});",
+                    macro_string(&title),
+                    macro_string(&type_name),
+                    slices.max(1),
                 ));
                 let id = self.insert_doc(doc);
                 self.dirty_images.insert(id);
@@ -2702,6 +2756,49 @@ impl Session {
         self.active_image = Some(id);
         id
     }
+}
+
+/// `IJ.createImage`'s type-string parsing (original_imagej/ij/IJ.java
+/// 2293-2317): the string is lowercased, "16"/"32"/"24"|"rgb" select the bit
+/// depth in that precedence order (default 8), explicit fill keywords
+/// override, and the default fill is White for 8-bit/RGB but Black for
+/// 16/32-bit. Signed-int images route through IntProcessor and are out of
+/// scope for the `File > New` dialog.
+fn parse_new_image_type(type_name: &str) -> Result<(NewImageType, NewImageFill), SessionError> {
+    let lower = type_name.to_lowercase();
+    if lower.contains("32-bit int") {
+        return Err(SessionError::UnsupportedNewImageType(type_name.into()));
+    }
+    let mut bit_depth = 8u8;
+    if lower.contains("16") {
+        bit_depth = 16;
+    }
+    if lower.contains("32") {
+        bit_depth = 32;
+    }
+    if lower.contains("24") || lower.contains("rgb") {
+        bit_depth = 24;
+    }
+    let image_type = match bit_depth {
+        16 => NewImageType::Gray16,
+        32 => NewImageType::Gray32,
+        24 => NewImageType::Rgb,
+        _ => NewImageType::Gray8,
+    };
+    let fill = if lower.contains("white") {
+        NewImageFill::White
+    } else if lower.contains("black") {
+        NewImageFill::Black
+    } else if lower.contains("ramp") {
+        NewImageFill::Ramp
+    } else if lower.contains("noise") || lower.contains("random") {
+        NewImageFill::Noise
+    } else if bit_depth == 16 || bit_depth == 32 {
+        NewImageFill::Black
+    } else {
+        NewImageFill::White
+    };
+    Ok((image_type, fill))
 }
 
 fn macro_string(value: &str) -> String {

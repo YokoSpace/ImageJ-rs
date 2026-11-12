@@ -350,6 +350,10 @@ impl ImageJApp {
             self.render_duplicate_dialog(ctx);
         }
 
+        if self.dialogs.new_image.open {
+            self.render_new_image_dialog(ctx);
+        }
+
         if self.dialogs.show_brightness_contrast {
             self.render_bc_palette(ctx);
         }

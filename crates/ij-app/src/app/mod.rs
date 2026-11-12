@@ -36,6 +36,7 @@ mod close_guard;
 mod histogram_window;
 mod image_window;
 mod menu;
+mod new_image_dialog;
 mod plugin_ops;
 mod plugins_ui;
 mod shortcuts;

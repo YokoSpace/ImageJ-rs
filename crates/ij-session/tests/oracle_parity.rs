@@ -19276,3 +19276,292 @@ fn parity_particle_macro_replays_white_background_preference() {
     assert_eq!(count, session.results.rows.len(), "{recorded}");
     assert_eq!(area, session.results.rows[0].area, "{recorded}");
 }
+
+// ---------------------------------------------------------------------------
+// Wave 1 P4.1b: File > New > Image... — NewImage.java + IJ.createImage parity.
+//
+// The oracle path is the `newImage` macro function, which routes through
+// IJ.newImage -> IJ.createImage (IJ.java 2293-2318): the type string is
+// lowercased, "16"/"32"/"24"|"rgb" select the bit depth, the fill defaults to
+// White for 8-bit and RGB but Black for 16/32-bit, and stack slices 2+ are a
+// pixel arraycopy only for White/Ramp — Black and Noise allocate fresh arrays
+// (NewImage.java 42-104). For RGB black stacks that allocation quirk leaves
+// slices 2+ as transparent zero instead of opaque black.
+
+fn oracle_new_image(
+    bridge: &JavaOracleBridge,
+    title: &str,
+    type_arg: &str,
+    width: u32,
+    height: u32,
+    slices: u32,
+) -> (Option<ImageDocument>, Vec<f64>, f64, f64, String) {
+    let seed = ImageDocument::new("seed.tif", 1, 1, PixelPlane::Gray8(vec![0])).unwrap();
+    // getPixel output is collected via a plain macro because the 16/32-bit
+    // white fill's invertLut writes a ColorMap TIFF that load_tiff cannot
+    // represent; its raw values still give a full pixel comparison. The
+    // saveAs leg is attempted separately and tolerated as None.
+    let out = bridge
+        .eval_macro(&format!(
+            "newImage(\"{title}\", \"{type_arg}\", {width}, {height}, {slices}); \
+             print(\"TITLE \"+getTitle()); \
+             getMinAndMax(a,b); \
+             print(\"RANGE \"+d2s(a,15)+\" \"+d2s(b,15)); \
+             for (s=1; s<=nSlices; s++) {{ setSlice(s); \
+               for (i=0; i<getWidth()*getHeight(); i++) print(\"PX \"+d2s(getPixel(i),15)); }}"
+        ))
+        .unwrap();
+    let saved = bridge
+        .run_macro_on_image(
+            &seed,
+            &format!("newImage(\"{title}\", \"{type_arg}\", {width}, {height}, {slices});"),
+        )
+        .ok()
+        .and_then(|run| run.output_image);
+    let mut image_title = String::new();
+    let mut range = (f64::NAN, f64::NAN);
+    let mut pixels = Vec::new();
+    for line in out.stdout.lines().map(str::trim_start) {
+        if let Some(rest) = line.strip_prefix("TITLE ") {
+            image_title = rest.trim().to_string();
+        } else if let Some(rest) = line.strip_prefix("RANGE ") {
+            let mut parts = rest.split_whitespace().map(|v| v.parse::<f64>().unwrap());
+            range = (parts.next().unwrap(), parts.next().unwrap());
+        } else if let Some(rest) = line.strip_prefix("PX ") {
+            pixels.push(rest.trim().parse::<f64>().unwrap());
+        }
+    }
+    (saved, pixels, range.0, range.1, image_title)
+}
+
+fn plane_f64_values(plane: &PixelPlane) -> Vec<f64> {
+    match plane {
+        PixelPlane::Gray8(p) => p.iter().map(|v| f64::from(*v)).collect(),
+        PixelPlane::Gray16(p) => p.iter().map(|v| f64::from(*v)).collect(),
+        PixelPlane::Gray32(p) => p.iter().map(|v| f64::from(*v)).collect(),
+        PixelPlane::ColorRgb(p) => p.iter().map(|v| f64::from(*v as i32)).collect(),
+        PixelPlane::Color256 { pixels, .. } => {
+            pixels.iter().map(|v| f64::from(*v)).collect()
+        }
+    }
+}
+
+fn session_new_image(title: &str, type_arg: &str, width: u32, height: u32, slices: u32) -> ImageDocument {
+    let mut session = Session::new();
+    let outcome = session
+        .dispatch(Command::NewImage {
+            title: title.into(),
+            type_name: type_arg.into(),
+            width,
+            height,
+            slices,
+        })
+        .unwrap();
+    let CommandOutcome::ImageOpened(id) = outcome else {
+        panic!("new image must open a window: {outcome:?}")
+    };
+    session.get_image(id).unwrap().clone()
+}
+
+fn assert_new_image_matches_oracle(
+    bridge: &JavaOracleBridge,
+    type_arg: &str,
+    width: u32,
+    height: u32,
+    slices: u32,
+) {
+    let (expected, oracle_pixels, dmin, dmax, title) =
+        oracle_new_image(bridge, "Probe-1", type_arg, width, height, slices);
+    let rust = session_new_image("Probe-1", type_arg, width, height, slices);
+    assert_eq!(rust.title, title, "title for {type_arg:?}");
+    if let Some(expected) = expected {
+        assert_eq!(
+            (rust.width, rust.height, rust.slices.len()),
+            (expected.width, expected.height, expected.slices.len()),
+            "geometry for {type_arg:?}"
+        );
+    }
+    // Compare in-memory getPixel values, not the TIFF: the inverted-LUT
+    // 16/32-bit white TIFF is unloadable, and an RGB black stack's
+    // transparent slice-2+ zeros round-trip through the TIFF writer as
+    // opaque black in Java too.
+    let rust_values: Vec<f64> = rust
+        .slices
+        .iter()
+        .flat_map(|plane| plane_f64_values(plane))
+        .collect();
+    assert_eq!(rust_values.len(), oracle_pixels.len(), "pixels for {type_arg:?}");
+    for (i, (actual, expected)) in rust_values.iter().zip(&oracle_pixels).enumerate() {
+        assert!(
+            (actual - expected).abs() < 1e-6,
+            "{type_arg} pixel {i}: java {expected} rust {actual}"
+        );
+    }
+    assert_f64_pair_eq(
+        (rust.display_range.min, rust.display_range.max),
+        (dmin, dmax),
+        &format!("display range for {type_arg:?}"),
+    );
+}
+
+#[test]
+fn parity_new_image_deterministic_fills_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for type_arg in [
+        "8-bit black",
+        "8-bit white",
+        "8-bit ramp",
+        "16-bit black",
+        "16-bit white",
+        "16-bit ramp",
+        "32-bit black",
+        "32-bit white",
+        "32-bit ramp",
+        "RGB black",
+        "RGB white",
+        "RGB ramp",
+    ] {
+        assert_new_image_matches_oracle(&bridge, type_arg, 7, 5, 1);
+    }
+}
+
+#[test]
+fn parity_new_image_fill_defaults_match_java_oracle() {
+    // IJ.createImage defaults the fill to White for 8-bit/RGB and Black for
+    // 16/32-bit when the type string has no fill keyword (IJ.java 2303-2305).
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for type_arg in ["8-bit", "16-bit", "32-bit", "RGB"] {
+        assert_new_image_matches_oracle(&bridge, type_arg, 7, 5, 1);
+    }
+}
+
+#[test]
+fn parity_new_image_stack_slice_fills_match_java_oracle() {
+    // createStack copies slice 1 pixels only for White/Ramp; Black and Noise
+    // allocate fresh arrays, which for RGB leaves slices 2+ at transparent
+    // zero rather than opaque black (NewImage.java 76-88).
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for type_arg in [
+        "8-bit black",
+        "8-bit white",
+        "8-bit ramp",
+        "16-bit black",
+        "16-bit white",
+        "16-bit ramp",
+        "32-bit black",
+        "32-bit ramp",
+        "RGB black",
+        "RGB white",
+        "RGB ramp",
+    ] {
+        assert_new_image_matches_oracle(&bridge, type_arg, 5, 4, 3);
+    }
+}
+
+#[test]
+fn parity_new_image_noise_distribution_matches_java_oracle() {
+    // ip.noise draws from an unseeded java.util.Random, so pixels cannot be
+    // compared exactly; the Java distribution is what must match
+    // (NewImage.java fillNoiseByte/Short/Float calling ByteProcessor.noise,
+    // ShortProcessor.noise, FloatProcessor.noise).
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (type_arg, mean_tolerance, std_tolerance) in
+        [("8-bit noise", 2.0, 2.0), ("16-bit noise", 200.0, 300.0), ("32-bit noise", 0.05, 0.05)]
+    {
+        let (expected, oracle_pixels, dmin, dmax, _) =
+            oracle_new_image(&bridge, "N", type_arg, 200, 200, 1);
+        let rust = session_new_image("N", type_arg, 200, 200, 1);
+        let (rmean, rstd) = plane_mean_std(&rust.slices[0]);
+        let oracle_values: Vec<f64> = match &expected {
+            Some(doc) => plane_f64_values(&doc.slices[0]),
+            None => oracle_pixels,
+        };
+        let (emean, estd) = f64_mean_std(&oracle_values);
+        assert!(
+            (rmean - emean).abs() <= mean_tolerance,
+            "{type_arg} mean: java {emean} rust {rmean}"
+        );
+        assert!(
+            (rstd - estd).abs() <= std_tolerance,
+            "{type_arg} stddev: java {estd} rust {rstd}"
+        );
+        if type_arg != "32-bit noise" {
+            // 8-bit keeps the fixed 0..255 range; 16-bit always sets the
+            // 0..65535 default (NewImage.java 304).
+            assert_f64_pair_eq(
+                (rust.display_range.min, rust.display_range.max),
+                (dmin, dmax),
+                &format!("noise display range for {type_arg:?}"),
+            );
+        } else {
+            // FloatProcessor.noise calls resetMinAndMax, so the range is the
+            // slice-1 data range of each run's own draw (NewImage.java
+            // 345-347, FloatProcessor.java 755).
+            let values = plane_f64_values(&rust.slices[0]);
+            let data_min = values.iter().fold(f64::INFINITY, |a, b| a.min(*b));
+            let data_max = values.iter().fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+            assert_eq!(
+                (rust.display_range.min, rust.display_range.max),
+                (data_min as f32 as f64, data_max as f32 as f64),
+                "noise display range for {type_arg:?}"
+            );
+        }
+    }
+}
+
+fn plane_mean_std(plane: &PixelPlane) -> (f64, f64) {
+    let mut values = plane_f64_values(plane);
+    if let PixelPlane::ColorRgb(p) = plane {
+        values = p.iter().map(|v| f64::from(*v & 0xff)).collect();
+    }
+    f64_mean_std(&values)
+}
+
+fn f64_mean_std(values: &[f64]) -> (f64, f64) {
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    let variance = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+    (mean, variance.sqrt())
+}
+
+#[test]
+fn session_new_image_records_macro_and_validates_dimensions() {
+    let mut session = Session::new();
+    // NewImage.showDialog clamps Slices to >=1 (NewImage.java 429).
+    let outcome = session
+        .dispatch(Command::NewImage {
+            title: "Untitled".into(),
+            type_name: "8-bit black".into(),
+            width: 512,
+            height: 512,
+            slices: 0,
+        })
+        .unwrap();
+    let CommandOutcome::ImageOpened(id) = outcome else {
+        panic!("expected ImageOpened: {outcome:?}")
+    };
+    assert_eq!(session.get_image(id).unwrap().slices.len(), 1);
+    // Recorder.appendNewImage writes name/type/fill/width/height/slices
+    // (Recorder.java 726-753).
+    assert_eq!(
+        session.macro_recorder.last().unwrap(),
+        "newImage(\"Untitled\", \"8-bit black\", 512, 512, 1);"
+    );
+
+    // showDialog rejects width/height < 1 (NewImage.java 430-433).
+    for (width, height) in [(0u32, 4u32), (4, 0)] {
+        let error = session
+            .dispatch(Command::NewImage {
+                title: "bad".into(),
+                type_name: "8-bit black".into(),
+                width,
+                height,
+                slices: 1,
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Width and height must be >0"),
+            "unexpected error: {error}"
+        );
+    }
+}

@@ -5,6 +5,7 @@ pub mod edit;
 pub mod filters;
 pub mod histogram;
 pub mod math;
+pub mod new_image;
 pub mod particles;
 pub mod threshold_palette;
 pub mod wand;
@@ -17,6 +18,7 @@ pub use contrast::{
 };
 pub use filters::{AutoThresholdMethod, RankFilterKind};
 pub use histogram::{display_histogram, DisplayHistogram};
+pub use new_image::{NewImageFill, NewImageType};
 pub use particles::{AnalyzedParticle, ParticleAnalysisOptions};
 pub use threshold_palette::{
     adjust_max_threshold, adjust_min_threshold, format_threshold_label, plot_threshold_bins,

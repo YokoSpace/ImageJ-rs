@@ -4,6 +4,8 @@ use ij_session::{Command, CommandOutcome, ImageId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppAction {
+    /// `File > New > Image...` (NewImage.java).
+    NewImage,
     NewRamp,
     OpenTiff,
     /// `File > Save` (`Cmd+S`). `FileSaver.save()` re-saves a document that
@@ -147,7 +149,7 @@ const SEPARATOR: MenuNode = MenuNode {
     kind: MenuKind::Separator,
 };
 
-const FILE_NEW: &[MenuNode] = &[item("Image... (8-bit Ramp)", None, AppAction::NewRamp)];
+const FILE_NEW: &[MenuNode] = &[item("Image...", None, AppAction::NewImage)];
 // IJ_Props.txt File>Save As entries (original_imagej/IJ_Props.txt 49-66).
 const FILE_SAVE_AS: &[MenuNode] = &[
     item("Tiff...", None, AppAction::SaveAs),
@@ -474,7 +476,7 @@ impl ImageJApp {
             }
             // Set Measurements is a user-option dialog, not an image command:
             // ImageJ's Analyze menu enables it with no image open.
-            NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
+            NewImage | NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
             | SetMeasurements | RoiManager => Ok(()),
             SaveResults | ClearResults => {
                 if self.session.results.rows.is_empty() {
@@ -584,6 +586,9 @@ impl ImageJApp {
         }
         use AppAction::*;
         match action {
+            NewImage => {
+                self.open_new_image_dialog();
+            }
             NewRamp => {
                 let _ = self.open_ramp_8bit("ramp", 256, 256);
             }

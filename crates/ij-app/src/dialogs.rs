@@ -19,6 +19,52 @@ pub struct DuplicateDialog {
     pub stack_size: u32,
 }
 
+/// `Type:` and `Fill with:` choice labels in `NewImage.showDialog` order
+/// (original_imagej/ij/gui/NewImage.java 34-35, 400-401).
+pub const NEW_IMAGE_TYPES: [&str; 4] = ["8-bit", "16-bit", "32-bit", "RGB"];
+pub const NEW_IMAGE_FILLS: [&str; 4] = ["White", "Black", "Ramp", "Noise"];
+
+/// Editable state of `File > New > Image...` (NewImage.showDialog).
+/// `type_index`/`fill_index` are dialog choice indices; the fill index also
+/// doubles as NewImage's `options` fill code where 0 is `OLD_FILL_WHITE`
+/// (NewImage.java 20, 106-113).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NewImageDialog {
+    pub open: bool,
+    pub name: String,
+    pub type_index: usize,
+    pub fill_index: usize,
+    pub width: String,
+    pub height: String,
+    pub slices: String,
+}
+
+/// NewImage's `static*` fields: defaults persist across invocations and are
+/// updated after a successful OK (NewImage.java 26-31, 435-441).
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewImageDefaults {
+    pub name: String,
+    pub type_index: usize,
+    pub fill_index: usize,
+    pub width: String,
+    pub height: String,
+    pub slices: String,
+}
+
+impl Default for NewImageDefaults {
+    fn default() -> Self {
+        Self {
+            // name="Untitled", type=GRAY8, fill=FILL_BLACK, w/h=512, slices=1
+            name: "Untitled".to_string(),
+            type_index: 0,
+            fill_index: 1,
+            width: "512".to_string(),
+            height: "512".to_string(),
+            slices: "1".to_string(),
+        }
+    }
+}
+
 /// Editable state of `Analyze > Set Scale...`.
 ///
 /// The numeric fields mirror ScaleDialog's four `GenericDialog` inputs
@@ -157,6 +203,8 @@ pub struct DialogState {
     pub plugin_filter_classpath_input: String,
     pub plugin_filter_target_id: Option<ImageId>,
     pub duplicate: DuplicateDialog,
+    pub new_image: NewImageDialog,
+    pub new_image_defaults: NewImageDefaults,
     pub math: Option<MathDialog>,
     pub math_defaults: MathDefaults,
     pub calculator: Option<ImageCalculatorDialog>,
@@ -192,6 +240,16 @@ impl DialogState {
             plugin_filter_classpath_input: String::new(),
             plugin_filter_target_id: None,
             duplicate: DuplicateDialog::default(),
+            new_image: NewImageDialog {
+                open: false,
+                name: String::new(),
+                type_index: 0,
+                fill_index: 0,
+                width: String::new(),
+                height: String::new(),
+                slices: String::new(),
+            },
+            new_image_defaults: NewImageDefaults::default(),
             math: None,
             math_defaults: MathDefaults::default(),
             calculator: None,
