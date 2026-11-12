@@ -171,6 +171,48 @@ impl PixelPlane {
             }
         }
     }
+
+    /// Swaps two pixels of the same plane. `ImageProcessor.getPixel`/`putPixel`
+    /// round-trip through the processor's own storage, so the swap is exact for
+    /// every type, including float bit patterns.
+    fn swap_pixels(&mut self, a: usize, b: usize) {
+        match self {
+            Self::Gray8(v) => v.swap(a, b),
+            Self::Color256 { pixels, .. } => pixels.swap(a, b),
+            Self::Gray16(v) => v.swap(a, b),
+            Self::Gray32(v) => v.swap(a, b),
+            Self::ColorRgb(v) => v.swap(a, b),
+        }
+    }
+
+    /// An all-zero plane of the same type and colour model, matching
+    /// `createProcessor(width, height)` (ImageProcessor.java 98-102, 136-143,
+    /// 183-188, 236-241).
+    fn empty_like(&self, len: usize) -> PixelPlane {
+        match self {
+            Self::Gray8(_) => PixelPlane::Gray8(vec![0; len]),
+            Self::Color256 { lut, .. } => PixelPlane::Color256 {
+                pixels: vec![0; len],
+                lut: lut.clone(),
+            },
+            Self::Gray16(_) => PixelPlane::Gray16(vec![0; len]),
+            Self::Gray32(_) => PixelPlane::Gray32(vec![0.0; len]),
+            Self::ColorRgb(_) => PixelPlane::ColorRgb(vec![0; len]),
+        }
+    }
+
+    fn copy_pixel_from(&mut self, source: &PixelPlane, from: usize, to: usize) {
+        match (self, source) {
+            (Self::Gray8(dst), Self::Gray8(src)) => dst[to] = src[from],
+            (Self::Color256 { pixels: dst, .. }, Self::Color256 { pixels: src, .. }) => {
+                dst[to] = src[from]
+            }
+            (Self::Gray16(dst), Self::Gray16(src)) => dst[to] = src[from],
+            (Self::Gray32(dst), Self::Gray32(src)) => dst[to] = src[from],
+            (Self::ColorRgb(dst), Self::ColorRgb(src)) => dst[to] = src[from],
+            _ => unreachable!("rotate_plane_90 keeps the source plane type"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -195,6 +237,12 @@ pub struct Calibration {
     pub pixel_depth: f64,
     pub unit: String,
     pub invert_y: bool,
+    /// `Calibration.xOrigin`/`yOrigin` (Calibration.java 24-25). The Transform
+    /// commands move them (Transformer.java 29-76).
+    #[serde(default)]
+    pub x_origin: f64,
+    #[serde(default)]
+    pub y_origin: f64,
 }
 
 impl Default for Calibration {
@@ -205,6 +253,8 @@ impl Default for Calibration {
             pixel_depth: 1.0,
             unit: "pixel".to_string(),
             invert_y: false,
+            x_origin: 0.0,
+            y_origin: 0.0,
         }
     }
 }
@@ -2698,6 +2748,131 @@ impl ImageDocument {
         }
     }
 
+    /// `Image > Transform > Flip Horizontally` (Transformer.java 26-33).
+    ///
+    /// `ImageProcessor.flipHorizontal` swaps the columns of the processor ROI
+    /// (ImageProcessor.java 1659-1668), so an area selection limits the flip
+    /// to its bounding box and a line selection flips the whole image
+    /// (ImagePlus.java 2080-2083 resets the processor ROI for lines).
+    /// `whole_stack` mirrors the "Process Stack?" answer; otherwise only the
+    /// current slice changes.
+    pub fn flip_horizontal(&mut self, whole_stack: bool) {
+        self.transform_planes(whole_stack, |plane, width, height, bounds| {
+            flip_plane_horizontal(plane, width, height, bounds)
+        });
+        // Transformer.java 29-31 only moves the origin when the processor ROI
+        // exactly matches the image bounds.
+        if self.calibration.x_origin != 0.0 || self.calibration.y_origin != 0.0 {
+            if self.transform_covers_whole_image() {
+                self.calibration.x_origin = self.width as f64 - 1.0 - self.calibration.x_origin;
+            }
+        }
+    }
+
+    /// `Image > Transform > Flip Vertically` (Transformer.java 34-40).
+    pub fn flip_vertical(&mut self, whole_stack: bool) {
+        self.transform_planes(whole_stack, |plane, width, height, bounds| {
+            flip_plane_vertical(plane, width, height, bounds)
+        });
+        if self.calibration.x_origin != 0.0 || self.calibration.y_origin != 0.0 {
+            if self.transform_covers_whole_image() {
+                self.calibration.y_origin = self.height as f64 - 1.0 - self.calibration.y_origin;
+            }
+        }
+    }
+
+    /// `Image > Transform > Rotate 90 Degrees Right` (Transformer.java 41-60).
+    ///
+    /// `StackProcessor.rotate90Degrees` rotates every slice and keeps its
+    /// label (StackProcessor.java 155-180); the calibration swaps pixel width
+    /// and height (Transformer.java 61-69). The existing Calibration model
+    /// has one spatial unit.
+    pub fn rotate_90_right(&mut self) {
+        self.rotate_90(true);
+    }
+
+    /// `Image > Transform > Rotate 90 Degrees Left` (Transformer.java 41-60).
+    pub fn rotate_90_left(&mut self) {
+        self.rotate_90(false);
+    }
+
+    fn rotate_90(&mut self, clockwise: bool) {
+        let source_width = self.width;
+        let source_height = self.height;
+        for plane in &mut self.slices {
+            *plane = rotate_plane_90(plane, source_width, source_height, clockwise);
+        }
+        self.width = source_height;
+        self.height = source_width;
+        // Transformer.java 61-69.
+        let pixel_width = self.calibration.pixel_width;
+        self.calibration.pixel_width = self.calibration.pixel_height;
+        self.calibration.pixel_height = pixel_width;
+        if self.calibration.x_origin != 0.0 || self.calibration.y_origin != 0.0 {
+            let (x_origin, y_origin) = if clockwise {
+                (
+                    source_height as f64 - 1.0 - self.calibration.y_origin,
+                    self.calibration.x_origin,
+                )
+            } else {
+                (
+                    self.calibration.y_origin,
+                    source_width as f64 - 1.0 - self.calibration.x_origin,
+                )
+            };
+            self.calibration.x_origin = x_origin;
+            self.calibration.y_origin = y_origin;
+        }
+        // A rotation changes the image dimensions, so any pending snapshot no
+        // longer describes this document.
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
+    }
+
+    /// True when the active selection covers the whole image, which is the
+    /// `r.x==0 && r.y==0 && r.width==ip.getWidth() && r.height==ip.getHeight()`
+    /// test in Transformer.java 30 and 37.
+    fn transform_covers_whole_image(&self) -> bool {
+        match &self.roi {
+            None => true,
+            Some(roi) if !roi.is_area() => true,
+            Some(roi) => {
+                let (x, y, w, h) = roi.bounds();
+                x == 0 && y == 0 && w == self.width as i32 && h == self.height as i32
+            }
+        }
+    }
+
+    /// Applies `transform` to the current slice or to every slice. Transformer
+    /// returns `NO_UNDO` (Transformer.java 19-21), so no snapshot is created
+    /// and any existing one is dropped.
+    fn transform_planes<F>(&mut self, whole_stack: bool, transform: F)
+    where
+        F: Fn(&mut PixelPlane, u32, u32, (u32, u32, u32, u32)),
+    {
+        let width = self.width;
+        let height = self.height;
+        let bounds = match &self.roi {
+            None => (0, 0, width, height),
+            Some(roi) if !roi.is_area() => (0, 0, width, height),
+            Some(roi) => roi
+                .clipped_bounds(width, height)
+                .unwrap_or((0, 0, width, height)),
+        };
+        let indices: Vec<usize> = if whole_stack {
+            (0..self.slices.len()).collect()
+        } else {
+            vec![self.current_slice_index()]
+        };
+        for index in indices {
+            transform(&mut self.slices[index], width, height, bounds);
+        }
+        self.snapshot = None;
+        self.snapshot_dimensions = None;
+        self.snapshot_display_range = None;
+    }
+
     /// Inverts the current stack slice, matching `run("Invert", "slice")`.
     pub fn invert(&mut self) {
         self.save_snapshot();
@@ -4405,6 +4580,74 @@ impl ImageDocument {
         }
         finish_moments(count as f64, mean, sum1, sum2, sum3, sum4, xsum, ysum)
     }
+}
+
+/// `ImageProcessor.flipHorizontal` (ImageProcessor.java 1659-1668): swap the
+/// columns of the processor ROI, leaving the middle column of an odd-width ROI
+/// in place.
+fn flip_plane_horizontal(
+    plane: &mut PixelPlane,
+    width: u32,
+    _height: u32,
+    (rx, ry, rw, rh): (u32, u32, u32, u32),
+) {
+    let width = width as usize;
+    let (rx, ry, rw, rh) = (rx as usize, ry as usize, rw as usize, rh as usize);
+    let mut swap = |a: usize, b: usize| {
+        for y in ry..ry + rh {
+            let row = y * width;
+            plane.swap_pixels(row + a, row + b);
+        }
+    };
+    for x in 0..rw / 2 {
+        swap(rx + x, rx + rw - x - 1);
+    }
+}
+
+/// `flipVertical` on every processor type (ByteProcessor.java 1122-1134,
+/// ShortProcessor.java 806-818, FloatProcessor.java 727-739,
+/// ColorProcessor.java 1090-1102): swap the rows of the processor ROI.
+fn flip_plane_vertical(
+    plane: &mut PixelPlane,
+    width: u32,
+    _height: u32,
+    (rx, ry, rw, rh): (u32, u32, u32, u32),
+) {
+    let width = width as usize;
+    let (rx, ry, rw, rh) = (rx as usize, ry as usize, rw as usize, rh as usize);
+    for y in 0..rh / 2 {
+        let top = (ry + y) * width;
+        let bottom = (ry + rh - y - 1) * width;
+        for x in rx..rx + rw {
+            plane.swap_pixels(top + x, bottom + x);
+        }
+    }
+}
+
+/// `ImageProcessor.rotateRight`/`rotateLeft` (ImageProcessor.java 1672-1699).
+/// The rotation covers the whole processor, not the ROI, and returns a new
+/// plane of size `height x width`.
+fn rotate_plane_90(
+    plane: &PixelPlane,
+    width: u32,
+    height: u32,
+    clockwise: bool,
+) -> PixelPlane {
+    let (width, height) = (width as usize, height as usize);
+    let mut out = plane.empty_like(height * width);
+    for row in 0..height {
+        for col in 0..width {
+            // rotateRight puts row `row` into column `height-row-1`; rotateLeft
+            // reverses the row into column `row`.
+            let (x, y) = if clockwise {
+                (height - row - 1, col)
+            } else {
+                (row, width - col - 1)
+            };
+            out.copy_pixel_from(plane, row * width + col, y * height + x);
+        }
+    }
+    out
 }
 
 fn crop_rows<T: Copy>(

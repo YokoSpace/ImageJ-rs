@@ -18617,3 +18617,219 @@ fn parity_particle_macro_replays_white_background_preference() {
     assert_eq!(count, session.results.rows.len(), "{recorded}");
     assert_eq!(area, session.results.rows[0].area, "{recorded}");
 }
+
+// ---------------------------------------------------------------------------
+// P4.2a: Image > Transform > Flip Horizontally/Vertically and
+// Rotate 90 Degrees Right/Left (Transformer.java 19-92).
+// ---------------------------------------------------------------------------
+
+/// Builds the same 4x3 ramp the Java macros below create with
+/// `setPixel(x, y, x+10*y)`.
+fn transform_ramp_8bit() -> ImageDocument {
+    let mut pixels = vec![0u8; 12];
+    for y in 0..3u32 {
+        for x in 0..4u32 {
+            pixels[(y * 4 + x) as usize] = (x + 10 * y) as u8;
+        }
+    }
+    ImageDocument::new("ramp", 4, 3, PixelPlane::Gray8(pixels)).unwrap()
+}
+
+fn transform_ramp_16bit() -> ImageDocument {
+    let mut pixels = vec![0u16; 12];
+    for y in 0..3u32 {
+        for x in 0..4u32 {
+            pixels[(y * 4 + x) as usize] = (x * 1000 + y * 5000) as u16;
+        }
+    }
+    ImageDocument::new("ramp16", 4, 3, PixelPlane::Gray16(pixels)).unwrap()
+}
+
+fn transform_ramp_32bit() -> ImageDocument {
+    let mut pixels = vec![0f32; 12];
+    for y in 0..3u32 {
+        for x in 0..4u32 {
+            pixels[(y * 4 + x) as usize] = x as f32 * 0.5 + y as f32 * 10.25;
+        }
+    }
+    ImageDocument::new("ramp32", 4, 3, PixelPlane::Gray32(pixels)).unwrap()
+}
+
+fn transform_ramp_rgb() -> ImageDocument {
+    let mut pixels = vec![0u32; 12];
+    for y in 0..3u32 {
+        for x in 0..4u32 {
+            let r = (x * 60) as u32;
+            let g = (y * 80) as u32;
+            let b = (x + y * 4) as u32;
+            pixels[(y * 4 + x) as usize] = (r << 16) | (g << 8) | b;
+        }
+    }
+    ImageDocument::new("ramprgb", 4, 3, PixelPlane::ColorRgb(pixels)).unwrap()
+}
+
+/// `run("Flip Horizontally")` and friends on a single image: pixels, size and
+/// the absence of Undo (Transformer.java 19-21 returns NO_UNDO).
+#[test]
+fn parity_transform_flip_and_rotate90_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let cases: Vec<(&str, ImageDocument, &str, &str)> = vec![
+        ("8-bit", transform_ramp_8bit(), "8-bit ramp", "x+10*y"),
+        ("16-bit", transform_ramp_16bit(), "16-bit ramp", "x*1000+y*5000"),
+        ("32-bit", transform_ramp_32bit(), "32-bit ramp", "x*0.5+y*10.25"),
+        (
+            "RGB",
+            transform_ramp_rgb(),
+            "RGB ramp",
+            "x*60*65536+y*80*256+(x+y*4)",
+        ),
+    ];
+    let commands: Vec<(&str, Command)> = vec![
+        ("Flip Horizontally", Command::FlipHorizontal { whole_stack: false }),
+        ("Flip Vertically", Command::FlipVertical { whole_stack: false }),
+        ("Rotate 90 Degrees Right", Command::Rotate90Right),
+        ("Rotate 90 Degrees Left", Command::Rotate90Left),
+    ];
+    for (type_name, doc, image_type, fill) in &cases {
+        for (macro_name, command) in &commands {
+            let macro_body = format!(
+                "newImage(\"t\", \"{image_type}\", 4, 3, 1);\n\
+                 for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,{fill});\n\
+                 run(\"{macro_name}\");\n\
+                 run(\"Undo\");\n\
+                 values=\"\";\n\
+                 for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) values=values+getPixel(x,y)+\",\";\n\
+                 print(\"PIXELS=\"+values);\n\
+                 print(\"SIZE=\"+getWidth()+\",\"+getHeight());"
+            );
+            let oracle = bridge.eval_macro(&macro_body).unwrap();
+            let expected_pixels = oracle_line(&oracle.stdout, "PIXELS=")
+                .strip_prefix("PIXELS=")
+                .unwrap()
+                .to_string();
+            let expected_size = oracle_line(&oracle.stdout, "SIZE=")
+                .strip_prefix("SIZE=")
+                .unwrap()
+                .to_string();
+
+            let mut session = Session::new();
+            session.insert_doc(doc.clone());
+            session.dispatch(command.clone()).unwrap();
+            // Transformer returns NO_UNDO, so Undo must not restore anything.
+            session.dispatch(Command::Undo).unwrap();
+            let result = session.active_doc().unwrap();
+            assert_eq!(
+                format!("{},{}", result.width, result.height),
+                expected_size,
+                "{type_name} {macro_name}"
+            );
+            let expected: Vec<f64> = expected_pixels
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse().unwrap())
+                .collect();
+            assert_eq!(expected.len(), (result.width * result.height) as usize);
+            for (idx, expected_value) in expected.iter().enumerate() {
+                let actual = match result.plane() {
+                    PixelPlane::ColorRgb(pixels) => pixels[idx] as i32 as f64,
+                    plane => plane.sample_f64(idx),
+                };
+                assert!(
+                    (actual - expected_value).abs() < 1e-6,
+                    "{type_name} {macro_name} pixel {idx}: Java={expected_value} Rust={actual}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_transform_rotate90_rotates_every_stack_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge.eval_macro(
+        "newImage(\"s\",\"8-bit black\",4,3,2); \
+         for (s=1;s<=2;s++) {setSlice(s); for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,x+10*y+100*s);} \
+         run(\"Rotate 90 Degrees Right\"); \
+         print(\"SIZE=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices); \
+         for (s=1;s<=nSlices;s++) {setSlice(s); v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"SLICE=\"+s+\":\"+v);}",
+    ).unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "SIZE="), "SIZE=3,4,2");
+    let mut slices = Vec::new();
+    for s in 1..=2u8 {
+        let mut pixels = Vec::new();
+        for y in 0..3u8 {
+            for x in 0..4u8 {
+                pixels.push(x + 10 * y + 100 * s);
+            }
+        }
+        slices.push(PixelPlane::Gray8(pixels));
+    }
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new_stack("s", 4, 3, slices).unwrap());
+    session.dispatch(Command::Rotate90Right).unwrap();
+    let result = session.active_doc().unwrap();
+    assert_eq!((result.width, result.height, result.stack_size()), (3, 4, 2));
+    for s in 1..=2 {
+        let expected: Vec<u8> = oracle_line(&oracle.stdout, &format!("SLICE={s}:"))
+            .split_once(':').unwrap().1
+            .split(',').filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap())
+            .collect();
+        let PixelPlane::Gray8(actual) = &result.slices[s - 1] else { panic!("8-bit stack") };
+        assert_eq!(actual, &expected, "slice {s}");
+    }
+}
+
+#[test]
+fn parity_transform_flip_roi_and_stack_choices_match_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (macro_name, command) in [
+        ("Flip Horizontally", true),
+        ("Flip Vertically", false),
+    ] {
+        for whole_stack in [false, true] {
+            let option = if whole_stack { "stack" } else { "slice" };
+            let oracle = bridge.eval_macro(&format!(
+                "newImage(\"s\",\"8-bit black\",4,3,2); \
+                 for (s=1;s<=2;s++) {{setSlice(s); for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,x+10*y+100*s);}} \
+                 setSlice(2); makeRectangle(1,0,2,3); run(\"{macro_name}\",\"{option}\"); \
+                 for (s=1;s<=nSlices;s++) {{setSlice(s); v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"SLICE=\"+s+\":\"+v);}}"
+            )).unwrap();
+            let mut slices = Vec::new();
+            for s in 1..=2u8 {
+                let mut pixels = Vec::new();
+                for y in 0..3u8 {
+                    for x in 0..4u8 {
+                        pixels.push(x + 10 * y + 100 * s);
+                    }
+                }
+                slices.push(PixelPlane::Gray8(pixels));
+            }
+            let mut doc = ImageDocument::new_stack("s", 4, 3, slices).unwrap();
+            doc.set_slice(2).unwrap();
+            let mut session = Session::new();
+            session.insert_doc(doc);
+            session.dispatch(Command::MakeRectRoi { x: 1, y: 0, width: 2, height: 3 }).unwrap();
+            let transform = if command {
+                Command::FlipHorizontal { whole_stack }
+            } else {
+                Command::FlipVertical { whole_stack }
+            };
+            session.dispatch(transform).unwrap();
+            let result = session.active_doc().unwrap();
+            for s in 1..=2 {
+                let expected: Vec<u8> = oracle_line(&oracle.stdout, &format!("SLICE={s}:"))
+                    .split_once(':').unwrap().1
+                    .split(',').filter(|part| !part.is_empty())
+                    .map(|part| part.parse().unwrap())
+                    .collect();
+                let PixelPlane::Gray8(actual) = &result.slices[s - 1] else { panic!("8-bit stack") };
+                assert_eq!(actual, &expected, "{macro_name} {option} slice {s}");
+            }
+            assert_eq!(
+                session.macro_recorder.last().unwrap(),
+                &format!("run(\"{macro_name}\", \"{option}\");")
+            );
+        }
+    }
+}

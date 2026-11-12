@@ -40,6 +40,8 @@ fn inverted(plane: &PixelPlane) -> PixelPlane {
 fn all_stack_operations() -> Vec<StackOperation> {
     vec![
         StackOperation::Invert,
+        StackOperation::FlipHorizontal,
+        StackOperation::FlipVertical,
         StackOperation::Smooth,
         StackOperation::Sharpen,
         StackOperation::FindEdges,
@@ -55,6 +57,8 @@ fn all_stack_operations() -> Vec<StackOperation> {
 fn invoke(app: &mut ImageJApp, operation: &StackOperation) -> Result<(), SessionError> {
     match operation {
         StackOperation::Invert => app.invert_active(),
+        StackOperation::FlipHorizontal => app.flip_horizontal_active(),
+        StackOperation::FlipVertical => app.flip_vertical_active(),
         StackOperation::Smooth => app.smooth_active(),
         StackOperation::Sharpen => app.sharpen_active(),
         StackOperation::FindEdges => app.find_edges_active(),

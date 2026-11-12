@@ -346,6 +346,22 @@ pub enum Command {
         float_result: bool,
         process_stack: bool,
     },
+    /// `Image > Transform > Flip Horizontally` (Transformer.java 26-33).
+    /// `whole_stack` is the "Process Stack?" answer or the macro `stack`
+    /// option; without it only the current slice is flipped.
+    FlipHorizontal {
+        whole_stack: bool,
+    },
+    /// `Image > Transform > Flip Vertically` (Transformer.java 34-40).
+    FlipVertical {
+        whole_stack: bool,
+    },
+    /// `Image > Transform > Rotate 90 Degrees Right`
+    /// (Transformer.java 41-60).
+    Rotate90Right,
+    /// `Image > Transform > Rotate 90 Degrees Left`
+    /// (Transformer.java 41-60).
+    Rotate90Left,
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
@@ -1716,6 +1732,30 @@ impl Session {
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
+            Command::FlipHorizontal { whole_stack } => {
+                self.active_doc_mut()?.flip_horizontal(whole_stack);
+                self.record_transform("Flip Horizontally", whole_stack);
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::FlipVertical { whole_stack } => {
+                self.active_doc_mut()?.flip_vertical(whole_stack);
+                self.record_transform("Flip Vertically", whole_stack);
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Rotate90Right => {
+                self.active_doc_mut()?.rotate_90_right();
+                self.macro_recorder.push("run(\"Rotate 90 Degrees Right\");".into());
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Rotate90Left => {
+                self.active_doc_mut()?.rotate_90_left();
+                self.macro_recorder.push("run(\"Rotate 90 Degrees Left\");".into());
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
             Command::Crop => {
                 self.active_doc_mut()?.crop()?;
                 self.mark_active_dirty();
@@ -2544,6 +2584,25 @@ impl Session {
     fn mark_active_dirty(&mut self) {
         if let Some(id) = self.active_image {
             self.dirty_images.insert(id);
+        }
+    }
+
+    /// Records a `Transformer` command. `IJ.setupDialog` adds `DOES_STACKS`
+    /// for a `stack ` macro option (IJ.java 1257-1267); without it a stack
+    /// records the `slice` option (IJ.java 1287-1291).
+    fn record_transform(&mut self, name: &str, whole_stack: bool) {
+        let is_stack = self
+            .active_doc()
+            .map(|doc| doc.stack_size() > 1)
+            .unwrap_or(false);
+        if !is_stack {
+            self.macro_recorder.push(format!("run(\"{name}\");"));
+        } else if whole_stack {
+            self.macro_recorder
+                .push(format!("run(\"{name}\", \"stack\");"));
+        } else {
+            self.macro_recorder
+                .push(format!("run(\"{name}\", \"slice\");"));
         }
     }
 

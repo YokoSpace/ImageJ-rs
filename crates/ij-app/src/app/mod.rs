@@ -645,6 +645,40 @@ impl ImageJApp {
         self.begin_stack_aware(StackOperation::Invert)
     }
 
+    pub fn flip_horizontal_active(&mut self) -> Result<(), SessionError> {
+        self.begin_stack_aware(StackOperation::FlipHorizontal)
+    }
+
+    pub fn flip_vertical_active(&mut self) -> Result<(), SessionError> {
+        self.begin_stack_aware(StackOperation::FlipVertical)
+    }
+
+    pub fn rotate_90_active(&mut self, clockwise: bool) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Rotate 90 Degrees") {
+            return Err(err);
+        }
+        let command = if clockwise {
+            Command::Rotate90Right
+        } else {
+            Command::Rotate90Left
+        };
+        match self.session.dispatch(command) {
+            Ok(_) => {
+                self.status_message = if clockwise {
+                    "Rotated 90 degrees right"
+                } else {
+                    "Rotated 90 degrees left"
+                }.into();
+                Ok(())
+            }
+            Err(error) => {
+                self.status_message = format!("Rotate 90 Degrees failed: {error}");
+                self.dialogs.last_error = Some(self.status_message.clone());
+                Err(error)
+            }
+        }
+    }
+
     pub fn filler_clear_active(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("Clear") {
             return Err(err);

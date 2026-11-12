@@ -664,6 +664,8 @@ fn filter_rejects_non_default_calibration_metadata() {
         pixel_depth: 1.0,
         unit: "um".to_string(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
     let result = bridge.run_filter(&filter_request("fixtures.RectInvertFilter", doc));
     assert_validation_error(

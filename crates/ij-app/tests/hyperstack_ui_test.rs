@@ -42,6 +42,8 @@ fn hyperstack_calibrated_subtitle() {
         pixel_depth: 2.0,
         unit: "micron".into(),
         invert_y: false,
+        x_origin: 0.0,
+        y_origin: 0.0,
     };
 
     // Subtitle must format calibrated dimensions and units like StackWindow.java:259-288

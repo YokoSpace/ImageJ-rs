@@ -49,6 +49,8 @@ fn binary_command(
 #[derive(Debug, Clone, PartialEq)]
 pub enum StackOperation {
     Invert,
+    FlipHorizontal,
+    FlipVertical,
     Smooth,
     Sharpen,
     FindEdges,
@@ -77,6 +79,8 @@ impl StackOperation {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Invert => "Invert",
+            Self::FlipHorizontal => "Flip Horizontally",
+            Self::FlipVertical => "Flip Vertically",
             Self::Smooth => "Smooth",
             Self::Sharpen => "Sharpen",
             Self::FindEdges => "Find Edges",
@@ -100,6 +104,8 @@ impl StackOperation {
     pub fn failure_label(&self) -> &'static str {
         match self {
             Self::Invert => "Invert",
+            Self::FlipHorizontal => "Flip Horizontally",
+            Self::FlipVertical => "Flip Vertically",
             Self::Smooth => "Smooth",
             Self::Sharpen => "Sharpen",
             Self::FindEdges => "Find Edges",
@@ -124,6 +130,8 @@ impl StackOperation {
         matches!(
             self,
             Self::Invert
+                | Self::FlipHorizontal
+                | Self::FlipVertical
                 | Self::Smooth
                 | Self::Sharpen
                 | Self::FindEdges
@@ -155,6 +163,8 @@ impl StackOperation {
     pub fn current_slice_command(&self) -> Command {
         match self {
             Self::Invert => Command::Invert,
+            Self::FlipHorizontal => Command::FlipHorizontal { whole_stack: false },
+            Self::FlipVertical => Command::FlipVertical { whole_stack: false },
             Self::Smooth => Command::Smooth,
             Self::Sharpen => Command::Sharpen,
             Self::FindEdges => Command::FindEdges,
@@ -183,6 +193,8 @@ impl StackOperation {
     pub fn whole_stack_command(&self) -> Option<Command> {
         match self {
             Self::Invert => Some(Command::InvertStack),
+            Self::FlipHorizontal => Some(Command::FlipHorizontal { whole_stack: true }),
+            Self::FlipVertical => Some(Command::FlipVertical { whole_stack: true }),
             Self::Smooth => Some(Command::SmoothStack),
             Self::Sharpen => Some(Command::SharpenStack),
             Self::FindEdges => Some(Command::FindEdgesStack),
@@ -210,6 +222,8 @@ impl StackOperation {
     pub fn success_message(&self) -> String {
         match self {
             Self::Invert => "Inverted active image".to_string(),
+            Self::FlipHorizontal => "Flipped image horizontally".to_string(),
+            Self::FlipVertical => "Flipped image vertically".to_string(),
             Self::Smooth => "Smooth applied".to_string(),
             Self::Sharpen => "Sharpen applied".to_string(),
             Self::FindEdges => "Find Edges applied".to_string(),
