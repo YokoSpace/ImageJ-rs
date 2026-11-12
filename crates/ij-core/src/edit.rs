@@ -583,4 +583,94 @@ impl ImageDocument {
         raster_roi_outline(&roi, image_line_clip(width, height), &mut plot);
         Ok(())
     }
+
+    /// `Edit > Clear Outside` (`Filler.run("outside")`, Filler.java 210-219,
+    /// ImageProcessor.java 1756-1770) on the active slice.
+    pub fn clear_outside(&mut self, background_color: [u8; 3]) -> Result<(), CoreError> {
+        self.clear_outside_stack(background_color, false)
+    }
+
+    /// `Edit > Clear Outside` on either the active slice or all slices in a stack.
+    pub fn clear_outside_stack(
+        &mut self,
+        background_color: [u8; 3],
+        whole_stack: bool,
+    ) -> Result<(), CoreError> {
+        let Some(roi) = self.roi.clone() else {
+            return Err(CoreError::InvalidOperation(
+                "This command requires a selection",
+            ));
+        };
+        if roi.is_line() {
+            // Filler.java 211-213: "Clear Outside" does not work with line selections.
+            return Err(CoreError::InvalidOperation(
+                "\"Clear Outside\" does not work with line selections.",
+            ));
+        }
+        if !roi.is_area() {
+            // Point ROI: Filler.java 217 & ImageProcessor.java 1757: if (roi==null || !roi.isArea()) return;
+            return Ok(());
+        }
+
+        self.save_snapshot();
+        let (width, height) = (self.width, self.height);
+        let mask = roi.raster_mask(width, height).ok().flatten();
+
+        let slice_indices: Vec<usize> = if whole_stack {
+            (0..self.slices.len()).collect()
+        } else {
+            vec![self.current_slice_index()]
+        };
+
+        for index in slice_indices {
+            let (value, new_range) =
+                PlaneFillValue::for_plane(&self.slices[index], background_color, self.display_range);
+            if let Some(range) = new_range {
+                self.display_range = range;
+            }
+            let plane = &mut self.slices[index];
+            match &roi {
+                Roi::Rect(rect) => {
+                    for y in 0..height {
+                        let row = (y * width) as usize;
+                        let in_y = (y as i32) >= rect.y && (y as i32) < rect.y + rect.height;
+                        for x in 0..width {
+                            let in_x = (x as i32) >= rect.x && (x as i32) < rect.x + rect.width;
+                            if !(in_x && in_y) {
+                                value.write_at(plane, row + x as usize);
+                            }
+                        }
+                    }
+                }
+                Roi::Oval(_) | Roi::Polygon(_) => {
+                    if let Some(mask) = &mask {
+                        for y in 0..height {
+                            let row = (y * width) as usize;
+                            let in_mask_y = y >= mask.y && y < mask.y + mask.height;
+                            for x in 0..width {
+                                let in_mask_x = x >= mask.x && x < mask.x + mask.width;
+                                let inside = in_mask_y
+                                    && in_mask_x
+                                    && mask.pixels[((y - mask.y) * mask.width + (x - mask.x)) as usize];
+                                if !inside {
+                                    value.write_at(plane, row + x as usize);
+                                }
+                            }
+                        }
+                    } else {
+                        // The shape is completely outside image bounds; fill the entire plane.
+                        for y in 0..height {
+                            let row = (y * width) as usize;
+                            for x in 0..width {
+                                value.write_at(plane, row + x as usize);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
+

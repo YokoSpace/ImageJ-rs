@@ -90,6 +90,9 @@ pub enum AppAction {
     /// Edit > Clear: fills the selection with the background color
     /// (Filler.java "clear").
     Clear,
+    /// Edit > Clear Outside: fills everything outside the selection with
+    /// the background color (Filler.java "outside").
+    ClearOutside,
     /// Edit > Fill (`F`): fills the selection with the foreground color
     /// (Filler.java "fill").
     Fill,
@@ -184,6 +187,7 @@ const EDIT_MENU: &[MenuNode] = &[
     item("Copy", Some("C"), AppAction::Copy),
     item("Paste", Some("V"), AppAction::Paste),
     item("Clear", None, AppAction::Clear),
+    item("Clear Outside", None, AppAction::ClearOutside),
     item("Fill", Some("F"), AppAction::Fill),
     item("Draw", Some("D"), AppAction::Draw),
     SEPARATOR,
@@ -542,6 +546,13 @@ impl ImageJApp {
                         }
                         _ => Err("Area selection required".into()),
                     },
+                    ClearOutside => match doc.roi.as_ref() {
+                        None => Err("This command requires a selection".into()),
+                        Some(roi) if roi.is_line() => {
+                            Err("\"Clear Outside\" does not work with line selections.".into())
+                        }
+                        _ => Ok(()),
+                    },
                     Threshold if !matches!(doc.plane(), PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)) => Err("Threshold requires a grayscale image".into()),
                     ConvertTo16Bit => match doc.plane() {
                         // ImageConverter.java 59-62 rejects COLOR_256.
@@ -666,6 +677,9 @@ impl ImageJApp {
             }
             Clear => {
                 let _ = self.filler_clear_active();
+            }
+            ClearOutside => {
+                let _ = self.clear_outside_active();
             }
             Copy | Cut | Paste => {
                 let command = match action { Copy => ij_session::Command::Copy, Cut => ij_session::Command::Cut, _ => ij_session::Command::Paste };

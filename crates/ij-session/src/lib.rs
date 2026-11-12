@@ -292,6 +292,12 @@ pub enum Command {
     /// `run("Clear")` — Filler("clear") fills the selection interior with the
     /// background color (Filler.java 79-95).
     Clear,
+    /// `run("Clear Outside")` — Filler("outside") fills everything outside
+    /// the selection with the background color (Filler.java 210-219).
+    ClearOutside {
+        #[serde(default)]
+        whole_stack: bool,
+    },
     /// `run("Draw")` — Filler("draw") draws the selection outline with the
     /// foreground color (Filler.java 116-121).
     Draw,
@@ -1505,6 +1511,29 @@ impl Session {
                 self.active_doc_mut()?.clear_roi_or_plane(color)?;
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"Clear\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::ClearOutside { whole_stack } => {
+                let is_stack;
+                {
+                    let color = self.background_color;
+                    let doc = self.active_doc_mut()?;
+                    doc.clear_outside_stack(color, whole_stack)?;
+                    is_stack = doc.stack_size() > 1;
+                }
+                self.mark_active_dirty();
+                if is_stack {
+                    if whole_stack {
+                        self.macro_recorder
+                            .push("run(\"Clear Outside\", \"stack\");".into());
+                    } else {
+                        self.macro_recorder
+                            .push("run(\"Clear Outside\", \"slice\");".into());
+                    }
+                } else {
+                    self.macro_recorder
+                        .push("run(\"Clear Outside\");".into());
+                }
                 Ok(CommandOutcome::Updated)
             }
             Command::Draw => {

@@ -662,6 +662,23 @@ impl ImageJApp {
         }
     }
 
+    pub fn clear_outside_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Clear Outside") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::ClearOutside { whole_stack: false }) {
+            Ok(_) => {
+                self.status_message = "Clear Outside".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Clear Outside failed: {e}");
+                self.dialogs.last_error = Some(format!("Clear Outside failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn fill_active(&mut self) -> Result<(), SessionError> {
         if let Some(err) = self.reject_while_closing("Fill") {
             return Err(err);

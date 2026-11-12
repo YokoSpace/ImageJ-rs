@@ -18617,3 +18617,223 @@ fn parity_particle_macro_replays_white_background_preference() {
     assert_eq!(count, session.results.rows.len(), "{recorded}");
     assert_eq!(area, session.results.rows[0].area, "{recorded}");
 }
+
+#[test]
+fn parity_clear_outside_rect_and_non_rect_all_types() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // 1. 8-bit Gray: rectangle ROI
+    let doc8 = ImageDocument::new(
+        "edit8",
+        8,
+        8,
+        PixelPlane::Gray8((0..64u8).collect()),
+    ).unwrap();
+    let oracle8 = bridge
+        .run_macro_on_image(
+            &doc8,
+            "setBackgroundColor(42, 42, 42); makeRectangle(2, 2, 4, 4); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session = Session::new();
+    session.insert_doc(doc8);
+    session.dispatch(Command::SetBackgroundColor { color: [42, 42, 42] }).unwrap();
+    session.dispatch(Command::MakeRectRoi { x: 2, y: 2, width: 4, height: 4 }).unwrap();
+    session.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session.active_doc().unwrap().slices, oracle8.slices);
+    assert_eq!(session.macro_recorder.last().unwrap(), "run(\"Clear Outside\");");
+
+    // 2. Oval ROI
+    let doc_oval = ImageDocument::new(
+        "edit_oval",
+        10,
+        10,
+        PixelPlane::Gray8((0..100u8).collect()),
+    ).unwrap();
+    let oracle_oval = bridge
+        .run_macro_on_image(
+            &doc_oval,
+            "setBackgroundColor(77, 77, 77); makeOval(2, 2, 6, 6); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session_oval = Session::new();
+    session_oval.insert_doc(doc_oval);
+    session_oval.dispatch(Command::SetBackgroundColor { color: [77, 77, 77] }).unwrap();
+    session_oval.dispatch(Command::MakeOvalRoi { x: 2, y: 2, width: 6, height: 6 }).unwrap();
+    session_oval.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session_oval.active_doc().unwrap().slices, oracle_oval.slices);
+
+    // 3. Polygon ROI
+    let doc_poly = ImageDocument::new(
+        "edit_poly",
+        10,
+        10,
+        PixelPlane::Gray8((0..100u8).collect()),
+    ).unwrap();
+    let oracle_poly = bridge
+        .run_macro_on_image(
+            &doc_poly,
+            "setBackgroundColor(99, 99, 99); makePolygon(1,1, 7,2, 5,8, 2,6); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session_poly = Session::new();
+    session_poly.insert_doc(doc_poly);
+    session_poly.dispatch(Command::SetBackgroundColor { color: [99, 99, 99] }).unwrap();
+    session_poly.dispatch(Command::MakePolygonRoi { points: vec![(1, 1), (7, 2), (5, 8), (2, 6)] }).unwrap();
+    session_poly.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session_poly.active_doc().unwrap().slices, oracle_poly.slices);
+
+    // 4. Line ROI: rejected with error matching Filler.java 212
+    let mut session_line = Session::new();
+    session_line.insert_doc(ImageDocument::new("line", 8, 8, PixelPlane::Gray8(vec![0; 64])).unwrap());
+    session_line.dispatch(Command::MakeLineRoi { x1: 1, y1: 1, x2: 6, y2: 6 }).unwrap();
+    let err = session_line.dispatch(Command::ClearOutside { whole_stack: false }).unwrap_err();
+    assert!(err.to_string().contains("\"Clear Outside\" does not work with line selections."));
+
+    // 5. Point ROI: no-op in Java (Filler.java 217 & ImageProcessor.java 1757)
+    let doc_pt = ImageDocument::new("pt", 6, 6, PixelPlane::Gray8(vec![123; 36])).unwrap();
+    let mut session_pt = Session::new();
+    session_pt.insert_doc(doc_pt.clone());
+    session_pt.dispatch(Command::MakePointRoi { points: vec![(3, 3)] }).unwrap();
+    session_pt.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session_pt.active_doc().unwrap().slices, doc_pt.slices);
+
+    // 6. Stack: slice vs whole stack
+    let doc_stack = ImageDocument::new_stack(
+        "stack",
+        6,
+        6,
+        vec![PixelPlane::Gray8(vec![10; 36]), PixelPlane::Gray8(vec![20; 36])],
+    ).unwrap();
+    let oracle_stack_slice = bridge
+        .run_macro_on_image(
+            &doc_stack,
+            "setBackgroundColor(55, 55, 55); makeRectangle(1, 1, 3, 3); run(\"Clear Outside\", \"slice\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session_stack_slice = Session::new();
+    session_stack_slice.insert_doc(doc_stack.clone());
+    session_stack_slice.dispatch(Command::SetBackgroundColor { color: [55, 55, 55] }).unwrap();
+    session_stack_slice.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 3, height: 3 }).unwrap();
+    session_stack_slice.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session_stack_slice.active_doc().unwrap().slices, oracle_stack_slice.slices);
+    assert_eq!(session_stack_slice.macro_recorder.last().unwrap(), "run(\"Clear Outside\", \"slice\");");
+
+    let oracle_stack_all = bridge
+        .run_macro_on_image(
+            &doc_stack,
+            "setBackgroundColor(55, 55, 55); makeRectangle(1, 1, 3, 3); run(\"Clear Outside\", \"stack\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session_stack_all = Session::new();
+    session_stack_all.insert_doc(doc_stack);
+    session_stack_all.dispatch(Command::SetBackgroundColor { color: [55, 55, 55] }).unwrap();
+    session_stack_all.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 3, height: 3 }).unwrap();
+    session_stack_all.dispatch(Command::ClearOutside { whole_stack: true }).unwrap();
+    assert_eq!(session_stack_all.active_doc().unwrap().slices, oracle_stack_all.slices);
+    assert_eq!(session_stack_all.macro_recorder.last().unwrap(), "run(\"Clear Outside\", \"stack\");");
+
+    // 7. 16-bit Gray + DisplayRange scaling + Undo
+    let doc16 = ImageDocument::new(
+        "edit16",
+        8,
+        8,
+        PixelPlane::Gray16((0..64u32).map(|i| (i * 1000) as u16).collect()),
+    ).unwrap();
+    let oracle16 = bridge
+        .run_macro_on_image(
+            &doc16,
+            "setMinAndMax(1000, 50000); setBackgroundColor(200, 100, 50); makeRectangle(2, 2, 4, 4); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session16 = Session::new();
+    session16.insert_doc(doc16);
+    session16.dispatch(Command::SetDisplayRange { min: 1000.0, max: 50000.0 }).unwrap();
+    session16.dispatch(Command::SetBackgroundColor { color: [200, 100, 50] }).unwrap();
+    session16.dispatch(Command::MakeRectRoi { x: 2, y: 2, width: 4, height: 4 }).unwrap();
+    let before_slices = session16.active_doc().unwrap().slices.clone();
+    session16.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session16.active_doc().unwrap().slices, oracle16.slices);
+    session16.dispatch(Command::Undo).unwrap();
+    assert_eq!(session16.active_doc().unwrap().slices, before_slices);
+
+    // 8. 32-bit Float
+    let doc32 = ImageDocument::new(
+        "edit32",
+        8,
+        8,
+        PixelPlane::Gray32((0..64u32).map(|i| i as f32 * 1.5).collect()),
+    ).unwrap();
+    let oracle32 = bridge
+        .run_macro_on_image(
+            &doc32,
+            "setMinAndMax(0, 100); setBackgroundColor(100, 100, 100); makeRectangle(1, 1, 5, 5); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session32 = Session::new();
+    session32.insert_doc(doc32);
+    session32.dispatch(Command::SetDisplayRange { min: 0.0, max: 100.0 }).unwrap();
+    session32.dispatch(Command::SetBackgroundColor { color: [100, 100, 100] }).unwrap();
+    session32.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 5, height: 5 }).unwrap();
+    session32.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session32.active_doc().unwrap().slices, oracle32.slices);
+
+    // 9. RGB Color
+    let doc_rgb = ImageDocument::new(
+        "edit_rgb",
+        6,
+        6,
+        PixelPlane::ColorRgb((0..36u32).map(|i| 0xff000000 | (i * 5) << 16 | (i * 3) << 8 | (i * 2)).collect()),
+    ).unwrap();
+    let oracle_rgb = bridge
+        .run_macro_on_image(
+            &doc_rgb,
+            "setBackgroundColor(12, 34, 56); makeRectangle(2, 2, 2, 2); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session_rgb = Session::new();
+    session_rgb.insert_doc(doc_rgb);
+    session_rgb.dispatch(Command::SetBackgroundColor { color: [12, 34, 56] }).unwrap();
+    session_rgb.dispatch(Command::MakeRectRoi { x: 2, y: 2, width: 2, height: 2 }).unwrap();
+    session_rgb.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session_rgb.active_doc().unwrap().slices, oracle_rgb.slices);
+
+    // 10. Out-of-bounds Rectangle ROI: clears entire image to background color
+    let doc_oob = ImageDocument::new(
+        "oob",
+        6,
+        6,
+        PixelPlane::Gray8((0..36u8).collect()),
+    ).unwrap();
+    let oracle_oob = bridge
+        .run_macro_on_image(
+            &doc_oob,
+            "setBackgroundColor(88, 88, 88); makeRectangle(20, 20, 4, 4); run(\"Clear Outside\");",
+        )
+        .unwrap()
+        .output_image
+        .expect("oracle must return edited TIFF");
+    let mut session_oob = Session::new();
+    session_oob.insert_doc(doc_oob);
+    session_oob.dispatch(Command::SetBackgroundColor { color: [88, 88, 88] }).unwrap();
+    session_oob.dispatch(Command::MakeRectRoi { x: 20, y: 20, width: 4, height: 4 }).unwrap();
+    session_oob.dispatch(Command::ClearOutside { whole_stack: false }).unwrap();
+    assert_eq!(session_oob.active_doc().unwrap().slices, oracle_oob.slices);
+}
+
