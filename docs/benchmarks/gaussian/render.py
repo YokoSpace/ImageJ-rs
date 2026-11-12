@@ -30,25 +30,17 @@ def main():
         samples = report["samples"]
         assert len({s["fingerprint"] for s in samples}) == 1
     rows = [report["summary"][0] for report in reports]
-    first = rows[0]
-    speed = first["java_ms_per_op"] / first["rust_ms_per_op"]
-    saving = 100 * (1 - first["rust_peak_rss_mib"] / first["java_peak_rss_mib"])
-
     plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 11,
                          "svg.fonttype": "none", "svg.hashsalt": "imagej-gaussian"})
-    background, ink, muted = "#f8fafc", "#13243a", "#526377"
-    colors = ["#71849c", "#e45d34"]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 8.2))
+    background, ink, muted = "#ffffff", "#222222", "#555555"
+    colors = ["#b6b6b6", "#3d6488"]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6.7))
     fig.set_facecolor(background)
-    fig.subplots_adjust(left=.225, right=.95, top=.69, bottom=.23, wspace=.25)
-    fig.text(.045, .94, "ImageJ-rs  /  Gaussian Blur", fontsize=22, weight="bold", color=ink)
-    fig.text(.045, .868, f"{speed:.1f}× faster", fontsize=29, weight="bold", color=colors[1])
-    fig.text(.39, .868, f"{saving:.0f}% lower peak RSS", fontsize=29, weight="bold", color=ink)
-    fig.text(.045, .823, "8-bit stack result vs ImageJ 1.54u · matching pixel fingerprints in every run",
-             fontsize=12, color=muted)
+    fig.subplots_adjust(left=.225, right=.95, top=.78, bottom=.23, wspace=.30)
+    fig.text(.045, .95, "Gaussian blur", fontsize=16, color=ink)
     fig.legend(handles=[Patch(color=colors[0], label="Java · ImageJ 1.54u"),
                         Patch(color=colors[1], label="Rust · ImageJ-rs")],
-               loc="upper right", bbox_to_anchor=(.95, .787), ncol=2, frameon=False,
+               loc="upper right", bbox_to_anchor=(.95, .96), ncol=2, frameon=False,
                labelcolor=ink)
 
     for ax, suffix, title, units, limit in [
@@ -62,16 +54,16 @@ def main():
                 ax.barh(index + offset, value, height=.28, color=color, zorder=3)
                 label = f"{value:.2f}" if suffix == "ms_per_op" else f"{value:.1f}"
                 ax.text(value + limit * .02, index + offset, label, va="center",
-                        fontsize=11, color=ink, weight="bold" if engine == "rust" else "normal")
+                        fontsize=11, color=ink)
         ax.set_xlim(0, limit)
         ax.set_ylim(3.6, -.6)
         ax.set_yticks(range(4))
         ax.set_yticklabels([f"{title}\n{size}" for _, title, size in CASES]
                            if ax is axes[0] else [""] * 4, color=ink)
         ax.tick_params(axis="both", length=0, labelcolor=muted, pad=10)
-        ax.set_title(title, loc="left", fontsize=15, color=ink, weight="bold", pad=17)
+        ax.set_title(title, loc="left", fontsize=12, color=ink, pad=17)
         ax.set_xlabel(units, color=muted, labelpad=12)
-        ax.grid(axis="x", color="#dce3ec", linewidth=.7, zorder=0)
+        ax.grid(axis="x", color="#e5e5e5", linewidth=.7, zorder=0)
         for spine in ax.spines.values():
             spine.set_visible(False)
 
@@ -84,6 +76,9 @@ def main():
     for extension in ("png", "svg"):
         fig.savefig(ROOT / f"gaussian-comparison.{extension}", dpi=180, facecolor=background,
                     metadata={"Date": None} if extension == "svg" else {})
+        if extension == "svg":
+            path = ROOT / "gaussian-comparison.svg"
+            path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n")
     plt.close(fig)
 
 

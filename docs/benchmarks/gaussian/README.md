@@ -17,7 +17,7 @@ All cases use identical deterministic inputs in Java and Rust. Every measured ru
 | 8-bit ramp / 1024×768×4 / 2 | 10.775 | 4.639 | 2.32 | 195.8 | 29.9 | 5 |
 | 8-bit noise, sequential Rust / 1024×768×4 / 2 | 9.854 | 31.889 | 0.31 | 197.0 | 8.1 | 5 |
 
-The README headline uses the first row: Java time ÷ Rust time is 2.305, and Rust's peak RSS is 84.81% lower. This comparison covers these workloads on one machine. It does not establish a speedup for every ImageJ command or platform.
+For the first row, Java time divided by Rust time is 2.305, and Rust's peak RSS is 84.81% lower. These measurements cover Gaussian blur on one machine.
 
 Parallel Rust uses more peak memory than sequential Rust: 29.9 vs 8.1 MiB in the noise-stack runs. The stack scheduler permits up to four concurrent slices and limits concurrency using a 64 MiB temporary-buffer estimate. An oversized slice still needs its own workspace, so this is not a process memory limit. Column parallelism can require one additional `f32` plane.
 

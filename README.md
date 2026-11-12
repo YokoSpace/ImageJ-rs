@@ -2,19 +2,9 @@
 
 [日本語版](README_ja.md)
 
-**ImageJ-rs is an in-progress Rust reproduction of ImageJ 1.54u.** The goal is to keep ImageJ's familiar windows and workflows while reproducing its image processing and measurements as closely as possible. The original Java implementation in [`original_imagej/`](original_imagej/) is the reference for behavior, and automated tests compare Rust results with that implementation.
+ImageJ-rs is an in-progress Rust reproduction of ImageJ 1.54u. The goal is to keep ImageJ's familiar windows and workflows while reproducing its image processing and measurements as closely as possible. The original Java implementation in [`original_imagej/`](original_imagej/) is the reference for behavior, and automated tests compare Rust results with that implementation.
 
 This is a development project, not a complete replacement for ImageJ or Fiji. There is no packaged release yet; build it from source.
-
-## Gaussian blur: 2.3× faster in a measured stack workload
-
-**4.29 ms in Rust vs 9.88 ms in Java**, with matching pixel fingerprints in every run of this benchmark. Peak process memory was **29.9 MiB vs 196.9 MiB**, an 85% reduction.
-
-![Gaussian blur benchmark comparing Java and Rust processing time and peak process memory for 8-bit, 16-bit, 32-bit, and single-image workloads](docs/benchmarks/gaussian/gaussian-comparison.png)
-
-The headline result uses a 1024×768, four-slice, 8-bit noise stack with σ=2. Both engines have a worker budget of 14 on an Apple M4 Pro running macOS. Values are medians of five processes, each with three warmups and ten measured operations, using a Rust release build and ImageJ 1.54u on OpenJDK 27.
-
-RSS includes each runtime and temporary buffers. Parallel Rust uses more memory than its sequential path. These results cover the Gaussian blur workloads shown, and performance varies by machine and input size. See the [measurement details, raw samples, and reproduction commands](docs/benchmarks/gaussian/README.md).
 
 ## Try the desktop app
 
@@ -49,6 +39,16 @@ You can also use **File → Open** for TIFF, PNG, and JPEG images. For a quick t
 - A Java compatibility path for a **limited subset** of classic ImageJ plug-ins and an API for Rust image plug-ins, described below.
 
 The [Phase 3 daily workflow](docs/roadmap_phase3_practical_workflows.md) and [Phase 4 Wave 1](docs/roadmap_phase4_completeness.md) are implemented for the tested image types. The project remains narrower than ImageJ: some TIFF variants, advanced plug-in APIs and dialogs, and specialized image commands are not yet supported. Text uses a small built-in bitmap font. Disjoint or holed masks that require ImageJ's composite ShapeRoi remain unsupported.
+
+## Benchmarks
+
+Gaussian blur on a 1024×768, four-slice, 8-bit noise image took 4.29 ms in Rust and 9.88 ms in ImageJ 1.54u. Rust was about 2.3 times as fast in this workload. Every run produced matching pixel hashes.
+
+![Gaussian blur processing time and peak process memory in Java and Rust](docs/benchmarks/gaussian/gaussian-comparison.png)
+
+These measurements used an Apple M4 Pro, macOS, a Rust release build, and OpenJDK 27. Both programs had a thread limit of 14. The 8-bit stack values are medians of five processes; each process ran three warmups and ten measured operations.
+
+Peak RSS includes the runtime and temporary buffers. Parallel Rust used more memory than sequential Rust. The [benchmark notes](docs/benchmarks/gaussian/README.md) include the other workloads, raw samples, and commands to reproduce the results.
 
 ## Classic ImageJ plug-ins
 

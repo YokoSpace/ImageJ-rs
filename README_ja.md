@@ -2,19 +2,9 @@
 
 [English](README.md)
 
-**ImageJ-rs は、ImageJ 1.54u を Rust で再現する開発中のプロジェクトです。** ImageJ に慣れた人が使いやすいウィンドウ構成と操作感を保ちながら、画像処理や計測結果をできるだけ一致させることを目指しています。[`original_imagej/`](original_imagej/) の Java 実装を仕様の基準とし、Rust の結果を自動テストで比較しています。
+ImageJ-rs は、ImageJ 1.54u を Rust で再現する開発中のプロジェクトです。 ImageJ に慣れた人が使いやすいウィンドウ構成と操作感を保ちながら、画像処理や計測結果をできるだけ一致させることを目指しています。[`original_imagej/`](original_imagej/) の Java 実装を仕様の基準とし、Rust の結果を自動テストで比較しています。
 
 現時点では ImageJ や Fiji の完全な代替ではありません。配布用のリリースはまだなく、ソースからビルドします。
-
-## ガウシアンぼかしで Java 版比約2.3倍の速度
-
-今回のスタック画像の計測では、**Rust 4.29 ms、Java 9.88 ms**。全実行で画素の指紋が一致しました。プロセス全体の最大メモリ使用量は **29.9 MiB 対 196.9 MiB、約85%減**でした。
-
-![8-bit・16-bit・32-bit・単一画像での、Java版とRust版のガウシアン処理時間および最大メモリ使用量の比較](docs/benchmarks/gaussian/gaussian-comparison.png)
-
-上記の代表値は、1024×768・4スライスの8-bitノイズ画像、σ=2での結果です。Apple M4 Pro・macOS上で、両版のワーカー数の上限を14として計測しました。各プロセスでウォームアップ3回と計測10回を行い、5プロセスの中央値を採用しています。Rustはreleaseビルド、JavaはImageJ 1.54u・OpenJDK 27です。
-
-最大RSSにはランタイムや一時バッファも含みます。Rustの並列処理は逐次処理よりメモリを使用します。この結果は掲載したガウシアンぼかしの条件に限られ、速度はマシンや画像サイズで変わります。[計測の詳細・元データ・再現コマンド](docs/benchmarks/gaussian/README.md)も公開しています。
 
 ## デスクトップアプリを試す
 
@@ -48,6 +38,16 @@ cargo run --release -p ij-app -- /path/to/image.tif
 - 後述する**限定的な範囲**での従来の Java プラグイン実行と、Rust 製画像プラグイン用 API。
 
 [Phase 3 の日常ワークフロー](docs/roadmap_phase3_practical_workflows.md) は、対応する画像形式で実装しました。ただし ImageJ の全機能を再現したわけではなく、一部の TIFF 形式、高度なプラグイン API とダイアログ、専門的な画像コマンドは未対応です。Text は組み込みの小さなビットマップフォントを使用し、32-bit 画像とスタックでは自動しきい値選択を利用できません。以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
+
+## ベンチマーク
+
+1024×768・4スライスの8-bitノイズ画像をガウシアンぼかしで処理したところ、Rustは4.29 ms、ImageJ 1.54uは9.88 msでした。この条件ではRustが約2.3倍速く、全実行で画素のハッシュが一致しました。
+
+![Java版とRust版のガウシアンぼかしの処理時間と最大メモリ使用量](docs/benchmarks/gaussian/gaussian-comparison.png)
+
+Apple M4 Pro・macOS上で、RustのreleaseビルドとOpenJDK 27を使い、両版のスレッド数の上限を14として計測しました。8-bitスタックの値は5プロセスの中央値です。各プロセスでウォームアップ3回と計測10回を行っています。
+
+最大RSSにはランタイムと一時バッファも含みます。Rustの並列処理は逐次処理よりメモリを使用します。ほかの画像での結果や元データ、再現コマンドは[計測ノート](docs/benchmarks/gaussian/README.md)にまとめています。
 
 ## 従来の ImageJ プラグイン
 
