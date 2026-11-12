@@ -18833,3 +18833,320 @@ fn parity_transform_flip_roi_and_stack_choices_match_java() {
         }
     }
 }
+
+#[test]
+fn parity_rotate_arbitrary_gray8_bilinear_matches_java() {
+    use ij_core::transform::{Interpolation, RotateOptions};
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge.eval_macro(
+        "newImage(\"t\",\"8-bit black\",5,5,1); \
+         for (y=0;y<5;y++) for (x=0;x<5;x++) setPixel(x,y,x*10+y*20); \
+         run(\"Rotate... \",\"angle=30 grid=0 interpolation=Bilinear\"); \
+         v=\"\"; for (y=0;y<5;y++) for (x=0;x<5;x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);"
+    ).unwrap();
+    let expected: Vec<u8> = oracle_line(&oracle.stdout, "PX=")
+        .strip_prefix("PX=").unwrap()
+        .split(',').filter(|part| !part.is_empty())
+        .map(|part| part.parse().unwrap()).collect();
+    let mut pixels = Vec::new();
+    for y in 0..5u8 {
+        for x in 0..5u8 {
+            pixels.push(x * 10 + y * 20);
+        }
+    }
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new("t", 5, 5, PixelPlane::Gray8(pixels)).unwrap());
+    session.dispatch(Command::Rotate {
+        options: RotateOptions {
+            angle: 30.0,
+            grid_lines: 0,
+            interpolation: Interpolation::Bilinear,
+            fill_with_background: false,
+            enlarge: false,
+            whole_stack: false,
+        },
+    }).unwrap();
+    let PixelPlane::Gray8(actual) = session.active_doc().unwrap().plane() else { panic!("8-bit") };
+    assert_eq!(actual, &expected);
+}
+
+#[test]
+fn parity_rotate_arbitrary_types_methods_and_roi_match_java() {
+    use ij_core::transform::{Interpolation, RotateOptions};
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (type_name, expression) in [
+        ("8-bit black", "x*10+y*20"),
+        ("16-bit black", "x*1000+y*5000"),
+        ("32-bit black", "x*0.5+y*10.25"),
+        ("RGB black", "x*60*65536+y*30*256+x+y"),
+    ] {
+        let (plane, is_rgb) = match type_name {
+            "8-bit black" => (PixelPlane::Gray8((0..25).map(|i| ((i%5)*10+(i/5)*20) as u8).collect()), false),
+            "16-bit black" => (PixelPlane::Gray16((0..25).map(|i| ((i%5)*1000+(i/5)*5000) as u16).collect()), false),
+            "32-bit black" => (PixelPlane::Gray32((0..25).map(|i| (i%5) as f32*0.5+(i/5) as f32*10.25).collect()), false),
+            _ => (PixelPlane::ColorRgb((0..25).map(|i| (((i%5)*60)<<16)|(((i/5)*30)<<8)|((i%5)+(i/5))).collect()), true),
+        };
+        for interpolation in [Interpolation::None, Interpolation::Bilinear, Interpolation::Bicubic] {
+            for roi in [false, true] {
+                let roi_macro = if roi { "makeRectangle(1,1,3,3);" } else { "" };
+                let oracle = bridge.eval_macro(&format!(
+                    "newImage(\"t\",\"{type_name}\",5,5,1); \
+                     for (y=0;y<5;y++) for (x=0;x<5;x++) setPixel(x,y,{expression}); \
+                     {roi_macro} \
+                     run(\"Rotate... \",\"angle=30 grid=0 interpolation={}\"); \
+                     v=\"\"; for (y=0;y<5;y++) for (x=0;x<5;x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);",
+                    interpolation.java_name(),
+                )).unwrap();
+                let expected: Vec<f64> = oracle_line(&oracle.stdout, "PX=")
+                    .strip_prefix("PX=").unwrap()
+                    .split(',').filter(|part| !part.is_empty())
+                    .map(|part| part.parse().unwrap()).collect();
+                let mut session = Session::new();
+                session.insert_doc(ImageDocument::new("t", 5, 5, plane.clone()).unwrap());
+                if roi {
+                    session.dispatch(Command::MakeRectRoi { x: 1, y: 1, width: 3, height: 3 }).unwrap();
+                }
+                session.dispatch(Command::Rotate {
+                    options: RotateOptions { angle: 30.0, grid_lines: 0, interpolation, ..Default::default() },
+                }).unwrap();
+                let actual = session.active_doc().unwrap().plane();
+                for (index, java) in expected.iter().enumerate() {
+                    let rust = if is_rgb {
+                        let PixelPlane::ColorRgb(pixels) = actual else { panic!("RGB") };
+                        pixels[index] as i32 as f64
+                    } else {
+                        actual.sample_f64(index)
+                    };
+                    assert!((rust-java).abs() < 1e-4, "{type_name} {:?} roi={roi} pixel {index}: Java={java} Rust={rust}", interpolation);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_rotate_enlarge_matches_java() {
+    use ij_core::transform::{Interpolation, RotateOptions};
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge.eval_macro(
+        "newImage(\"t\",\"8-bit black\",4,3,1); \
+         for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,x+10*y); \
+         run(\"Rotate... \",\"angle=45 grid=0 interpolation=None enlarge\"); \
+         print(\"SIZE=\"+getWidth()+\",\"+getHeight()); \
+         v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);"
+    ).unwrap();
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new("t",4,3,PixelPlane::Gray8(
+        (0..12).map(|i| (i%4+i/4*10) as u8).collect()
+    )).unwrap());
+    session.dispatch(Command::Rotate {options:RotateOptions {
+        angle:45.0,grid_lines:0,interpolation:Interpolation::None,enlarge:true,..Default::default()
+    }}).unwrap();
+    let doc = session.active_doc().unwrap();
+    assert_eq!(oracle_line(&oracle.stdout,"SIZE="),format!("SIZE={},{}",doc.width,doc.height));
+    let expected: Vec<u8> = oracle_line(&oracle.stdout,"PX=").trim_start_matches("PX=")
+        .split(',').filter(|p| !p.is_empty()).map(|p| p.parse().unwrap()).collect();
+    let PixelPlane::Gray8(actual) = doc.plane() else {panic!("8-bit")};
+    assert_eq!(actual,&expected);
+}
+
+#[test]
+fn parity_rotate_fill_background_gray_types_matches_java() {
+    use ij_core::transform::{Interpolation,RotateOptions};
+    let bridge=JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (type_name,expr,plane) in [
+        ("8-bit black","x*10+y*20",PixelPlane::Gray8((0..16).map(|i|((i%4)*10+(i/4)*20) as u8).collect())),
+        ("16-bit black","1000+x*100+y*200",PixelPlane::Gray16((0..16).map(|i|(1000+(i%4)*100+(i/4)*200) as u16).collect())),
+        ("32-bit black","1+x*0.1+y*0.2",PixelPlane::Gray32((0..16).map(|i|1.0+(i%4) as f32*0.1+(i/4) as f32*0.2).collect())),
+    ] {
+        let oracle=bridge.eval_macro(&format!(
+            "newImage(\"t\",\"{type_name}\",4,4,1); \
+             for(y=0;y<4;y++)for(x=0;x<4;x++)setPixel(x,y,{expr}); \
+             setBackgroundColor(255,0,0); \
+             run(\"Rotate... \",\"angle=30 grid=0 interpolation=None fill\"); \
+             v=\"\";for(y=0;y<4;y++)for(x=0;x<4;x++)v=v+getPixel(x,y)+\",\";print(\"PX=\"+v);"
+        )).unwrap();
+        let expected:Vec<f64>=oracle_line(&oracle.stdout,"PX=").trim_start_matches("PX=")
+            .split(',').filter(|p|!p.is_empty()).map(|p|p.parse().unwrap()).collect();
+        let mut session=Session::new();
+        let mut doc=ImageDocument::new("t",4,4,plane).unwrap();
+        if type_name=="32-bit black" {doc.display_range=ij_core::DisplayRange{min:0.0,max:1.0};}
+        session.insert_doc(doc);
+        session.dispatch(Command::SetBackgroundColor{color:[255,0,0]}).unwrap();
+        session.dispatch(Command::Rotate{options:RotateOptions{angle:30.0,grid_lines:0,
+            interpolation:Interpolation::None,fill_with_background:true,..Default::default()}}).unwrap();
+        let actual=session.active_doc().unwrap().plane();
+        for (i,&v) in expected.iter().enumerate() {
+            assert!((actual.sample_f64(i)-v).abs()<0.0001,"{type_name} pixel {i}: Java {v} Rust {}",actual.sample_f64(i));
+        }
+    }
+}
+
+#[test]
+fn parity_size_bilinear_and_calibration_match_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge.eval_macro(
+        "newImage(\"t\",\"8-bit black\",4,4,1); \
+         for (y=0;y<4;y++) for (x=0;x<4;x++) setPixel(x,y,x*10+y*15); \
+         run(\"Properties...\",\"pixel_width=2 pixel_height=3 unit=um\"); \
+         run(\"Size...\",\"width=3 height=2 average=false interpolation=Bilinear\"); \
+         getPixelSize(unit,pw,ph,pd); print(\"CAL=\"+pw+\",\"+ph); \
+         print(\"SIZE=\"+getWidth()+\",\"+getHeight()); \
+         v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);"
+    ).unwrap();
+    let expected: Vec<u8> = oracle_line(&oracle.stdout, "PX=").trim_start_matches("PX=")
+        .split(',').filter(|part| !part.is_empty()).map(|part| part.parse().unwrap()).collect();
+    let mut session = Session::new();
+    let mut doc = ImageDocument::new("t", 4, 4, PixelPlane::Gray8(
+        (0..16).map(|i| ((i % 4) * 10 + (i / 4) * 15) as u8).collect()
+    )).unwrap();
+    doc.calibration.pixel_width = 2.0;
+    doc.calibration.pixel_height = 3.0;
+    session.insert_doc(doc);
+    session.dispatch(Command::Size {
+        width: 3, height: 2, depth: None, constrain: false,
+        average_when_downsizing: false,
+        interpolation: ij_core::transform::Interpolation::Bilinear,
+    }).unwrap();
+    let result = session.active_doc().unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "SIZE="), format!("SIZE={},{}", result.width, result.height));
+    let calibration: Vec<f64> = oracle_line(&oracle.stdout, "CAL=").trim_start_matches("CAL=")
+        .split(',').map(|part| part.parse().unwrap()).collect();
+    assert!((calibration[0] - result.calibration.pixel_width).abs() < 0.0001);
+    assert!((calibration[1] - result.calibration.pixel_height).abs() < 0.0001);
+    let PixelPlane::Gray8(actual) = result.plane() else { panic!("8-bit") };
+    assert_eq!(actual, &expected);
+}
+
+#[test]
+fn parity_size_average_types_and_stack_match_java() {
+    use ij_core::transform::Interpolation;
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (type_name, expression, plane) in [
+        ("8-bit black", "x*7+y*9", PixelPlane::Gray8((0..36).map(|i| ((i%6)*7+(i/6)*9) as u8).collect())),
+        ("16-bit black", "x*700+y*900", PixelPlane::Gray16((0..36).map(|i| ((i%6)*700+(i/6)*900) as u16).collect())),
+        ("32-bit black", "x*0.7+y*0.9", PixelPlane::Gray32((0..36).map(|i| (i%6) as f32*0.7+(i/6) as f32*0.9).collect())),
+    ] {
+        for method in [Interpolation::None, Interpolation::Bilinear, Interpolation::Bicubic] {
+            let oracle = bridge.eval_macro(&format!(
+                "newImage(\"s\",\"{type_name}\",6,6,2); \
+                 for (s=1;s<=2;s++) {{setSlice(s); for (y=0;y<6;y++) for (x=0;x<6;x++) setPixel(x,y,{expression}+s);}} \
+                 run(\"Size...\",\"width=3 height=2 depth=2 average interpolation={}\"); \
+                 print(\"SIZE=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices); \
+                 for (s=1;s<=nSlices;s++) {{setSlice(s); v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"SLICE=\"+s+\":\"+v);}}",
+                method.java_name(),
+            )).unwrap();
+            let mut session = Session::new();
+            let add = |p: &PixelPlane, s: f64| -> PixelPlane { match p {
+                PixelPlane::Gray8(v) => PixelPlane::Gray8(v.iter().map(|&x| x+s as u8).collect()),
+                PixelPlane::Gray16(v) => PixelPlane::Gray16(v.iter().map(|&x| x+s as u16).collect()),
+                PixelPlane::Gray32(v) => PixelPlane::Gray32(v.iter().map(|&x| x+s as f32).collect()),
+                _ => unreachable!(),
+            }};
+            session.insert_doc(ImageDocument::new_stack("s",6,6,vec![add(&plane,1.0),add(&plane,2.0)]).unwrap());
+            session.dispatch(Command::Size {width:3,height:2,depth:Some(2),constrain:false,average_when_downsizing:true,interpolation:method}).unwrap();
+            let doc = session.active_doc().unwrap();
+            assert_eq!(oracle_line(&oracle.stdout,"SIZE="),format!("SIZE={},{},{}",doc.width,doc.height,doc.stack_size()));
+            for s in 1..=2 {
+                let expected: Vec<f64> = oracle_line(&oracle.stdout,&format!("SLICE={s}:"))
+                    .split_once(':').unwrap().1.split(',').filter(|p| !p.is_empty()).map(|p| p.parse().unwrap()).collect();
+                for (i,&value) in expected.iter().enumerate() {
+                    assert!((doc.slices[s-1].sample_f64(i)-value).abs()<0.0002,
+                        "{type_name} {:?} slice {s} pixel {i}: Java {value} Rust {}",method,doc.slices[s-1].sample_f64(i));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_size_rgb_roi_methods_match_java() {
+    use ij_core::transform::Interpolation;
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = PixelPlane::ColorRgb((0..36).map(|i| {
+        let x=i%6; let y=i/6;
+        (x*20 << 16) | (y*25 << 8) | (x+y)
+    }).collect());
+    for method in [Interpolation::None,Interpolation::Bilinear,Interpolation::Bicubic] {
+        for roi in [false,true] {
+          for average in [false,true] {
+            let select = if roi {"makeRectangle(1,1,4,4);"} else {""};
+            let average_option = if average {"average"} else {"average=false"};
+            let oracle = bridge.eval_macro(&format!(
+                "newImage(\"t\",\"RGB black\",6,6,1); \
+                 for (y=0;y<6;y++) for (x=0;x<6;x++) setPixel(x,y,x*20*65536+y*25*256+x+y); \
+                 {select} run(\"Size...\",\"width=3 height=2 {average_option} interpolation={}\"); \
+                 print(\"SIZE=\"+getWidth()+\",\"+getHeight()); \
+                 v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);",
+                method.java_name(),
+            )).unwrap();
+            let mut session=Session::new();
+            session.insert_doc(ImageDocument::new("t",6,6,source.clone()).unwrap());
+            if roi {session.dispatch(Command::MakeRectRoi{x:1,y:1,width:4,height:4}).unwrap();}
+            session.dispatch(Command::Size{width:3,height:2,depth:None,constrain:false,average_when_downsizing:average,interpolation:method}).unwrap();
+            let doc=session.active_doc().unwrap();
+            assert_eq!(oracle_line(&oracle.stdout,"SIZE="),format!("SIZE={},{}",doc.width,doc.height));
+            let expected:Vec<i32>=oracle_line(&oracle.stdout,"PX=").trim_start_matches("PX=")
+                .split(',').filter(|p|!p.is_empty()).map(|p|p.parse().unwrap()).collect();
+            let PixelPlane::ColorRgb(actual)=doc.plane() else {panic!("RGB")};
+            assert_eq!(actual.iter().map(|&v|v as i32).collect::<Vec<_>>(),expected,"{method:?} roi={roi} average={average}");
+          }
+        }
+    }
+}
+
+#[test]
+fn parity_size_roi_same_dimensions_crops_without_interpolation() {
+    use ij_core::transform::Interpolation;
+    let bridge=JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle=bridge.eval_macro(
+        "newImage(\"t\",\"8-bit black\",6,6,1); \
+         for(y=0;y<6;y++)for(x=0;x<6;x++)setPixel(x,y,x*10+y*20); \
+         makeRectangle(1,1,4,4); run(\"Size...\",\"width=4 height=4 average=false interpolation=Bicubic\"); \
+         v=\"\";for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+\",\";print(\"PX=\"+v);"
+    ).unwrap();
+    let mut session=Session::new();
+    session.insert_doc(ImageDocument::new("t",6,6,PixelPlane::Gray8(
+        (0..36).map(|i| ((i%6)*10+(i/6)*20) as u8).collect()
+    )).unwrap());
+    session.dispatch(Command::MakeRectRoi{x:1,y:1,width:4,height:4}).unwrap();
+    session.dispatch(Command::Size{width:4,height:4,depth:None,constrain:false,
+        average_when_downsizing:false,interpolation:Interpolation::Bicubic}).unwrap();
+    let expected:Vec<u8>=oracle_line(&oracle.stdout,"PX=").trim_start_matches("PX=")
+        .split(',').filter(|p|!p.is_empty()).map(|p|p.parse().unwrap()).collect();
+    let PixelPlane::Gray8(actual)=session.active_doc().unwrap().plane() else {panic!("8-bit")};
+    assert_eq!(actual,&expected);
+}
+
+#[test]
+fn parity_size_depth_scaling_matches_java() {
+    use ij_core::transform::Interpolation;
+    let bridge=JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle=bridge.eval_macro(
+        "newImage(\"s\",\"8-bit black\",3,2,2); \
+         for(s=1;s<=2;s++){setSlice(s);for(y=0;y<2;y++)for(x=0;x<3;x++)setPixel(x,y,x+10*y+100*s);} \
+         run(\"Properties...\",\"voxel_depth=2 unit=um\"); \
+         run(\"Size...\",\"width=3 height=2 depth=3 average=false interpolation=Bilinear\"); \
+         getPixelSize(unit,pw,ph,pd);print(\"DEPTH=\"+pd); \
+         print(\"SIZE=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices); \
+         for(s=1;s<=nSlices;s++){setSlice(s);v=\"\";for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+\",\";print(\"SLICE=\"+s+\":\"+v);}"
+    ).unwrap();
+    let mut doc=ImageDocument::new_stack("s",3,2,vec![
+        PixelPlane::Gray8(vec![100,101,102,110,111,112]),
+        PixelPlane::Gray8(vec![200,201,202,210,211,212]),
+    ]).unwrap();
+    doc.calibration.pixel_depth=2.0;
+    let mut session=Session::new();session.insert_doc(doc);
+    session.dispatch(Command::Size{width:3,height:2,depth:Some(3),constrain:false,
+        average_when_downsizing:false,interpolation:Interpolation::Bilinear}).unwrap();
+    let doc=session.active_doc().unwrap();
+    assert_eq!(oracle_line(&oracle.stdout,"SIZE="),format!("SIZE={},{},{}",doc.width,doc.height,doc.stack_size()));
+    let depth:f64=oracle_line(&oracle.stdout,"DEPTH=").trim_start_matches("DEPTH=").parse().unwrap();
+    assert!((doc.calibration.pixel_depth-depth).abs()<0.0001);
+    for s in 1..=3 {
+        let expected:Vec<u8>=oracle_line(&oracle.stdout,&format!("SLICE={s}:"))
+            .split_once(':').unwrap().1.split(',').filter(|p|!p.is_empty()).map(|p|p.parse().unwrap()).collect();
+        let PixelPlane::Gray8(actual)=&doc.slices[s-1] else {panic!("8-bit")};
+        assert_eq!(actual,&expected);
+    }
+}

@@ -7,6 +7,7 @@ pub mod histogram;
 pub mod math;
 pub mod particles;
 pub mod threshold_palette;
+pub mod transform;
 pub mod wand;
 
 pub use binary::StackBinaryOptions;

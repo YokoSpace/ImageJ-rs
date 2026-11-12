@@ -25,6 +25,8 @@ pub enum AppAction {
     FlipVertical,
     Rotate90Right,
     Rotate90Left,
+    Rotate,
+    Size,
     Duplicate,
     Crop,
     ConvertTo8Bit,
@@ -197,6 +199,7 @@ const EDIT_MENU: &[MenuNode] = &[
 ];
 
 const IMAGE_ADJUST: &[MenuNode] = &[
+    item("Size...", None, AppAction::Size),
     item(
         "Brightness/Contrast...",
         None,
@@ -212,6 +215,7 @@ const IMAGE_TYPE: &[MenuNode] = &[
     item("RGB Color", None, AppAction::ConvertToRgb),
 ];
 const IMAGE_TRANSFORM: &[MenuNode] = &[
+    item("Rotate... ", None, AppAction::Rotate),
     item("Flip Horizontally", None, AppAction::FlipHorizontal),
     item("Flip Vertically", None, AppAction::FlipVertical),
     item("Rotate 90 Degrees Right", None, AppAction::Rotate90Right),
@@ -706,6 +710,8 @@ impl ImageJApp {
             Rotate90Left => {
                 let _ = self.rotate_90_active(false);
             }
+            Rotate => self.open_rotate_dialog(),
+            Size => self.open_size_dialog(),
             Duplicate => {
                 self.open_duplicate_dialog();
             }

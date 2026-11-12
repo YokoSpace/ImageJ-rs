@@ -31,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod adjust_dialogs;
+mod transform_dialogs;
 pub use adjust_dialogs::PendingStackBinaryDialog;
 mod close_guard;
 mod histogram_window;

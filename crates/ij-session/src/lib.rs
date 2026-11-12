@@ -362,6 +362,19 @@ pub enum Command {
     /// `Image > Transform > Rotate 90 Degrees Left`
     /// (Transformer.java 41-60).
     Rotate90Left,
+    /// Arbitrary-angle Image > Transform > Rotate... (Rotator.java).
+    Rotate {
+        options: ij_core::transform::RotateOptions,
+    },
+    /// `Image > Adjust > Size...` (Resizer.java).
+    Size {
+        width: u32,
+        height: u32,
+        depth: Option<u32>,
+        constrain: bool,
+        average_when_downsizing: bool,
+        interpolation: ij_core::transform::Interpolation,
+    },
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
@@ -1753,6 +1766,46 @@ impl Session {
             Command::Rotate90Left => {
                 self.active_doc_mut()?.rotate_90_left();
                 self.macro_recorder.push("run(\"Rotate 90 Degrees Left\");".into());
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Rotate { options } => {
+                let background_color = self.background_color;
+                self.active_doc_mut()?.rotate_arbitrary(options, background_color)?;
+                let mut macro_options = format!(
+                    "angle={} grid={} interpolation={}",
+                    options.angle,
+                    options.grid_lines,
+                    options.interpolation.java_name()
+                );
+                if options.fill_with_background {
+                    macro_options.push_str(" fill");
+                }
+                if options.enlarge {
+                    macro_options.push_str(" enlarge");
+                }
+                if self.active_doc()?.stack_size() > 1 {
+                    macro_options.push_str(if options.whole_stack { " stack" } else { " slice" });
+                }
+                self.macro_recorder.push(format!("run(\"Rotate... \", \"{macro_options}\");"));
+                self.mark_active_dirty();
+                Ok(CommandOutcome::Updated)
+            }
+            Command::Size { width, height, depth, constrain, average_when_downsizing, interpolation } => {
+                let doc = self.active_doc_mut()?;
+                let (src_width, src_height) = doc.roi.as_ref().filter(|roi| roi.is_area())
+                    .and_then(|roi| roi.clipped_bounds(doc.width, doc.height).ok())
+                    .map(|(_, _, w, h)| (w, h)).unwrap_or((doc.width, doc.height));
+                let width = if width == 0 && constrain { ((height as f64 * src_width as f64 / src_height as f64).round() as u32).max(1) } else { width };
+                let height = if constrain { ((width as f64 * src_height as f64 / src_width as f64).round() as u32).max(1) } else { height };
+                doc.resize_image(width, height, interpolation, average_when_downsizing)?;
+                if let Some(depth) = depth { doc.resize_depth(depth, interpolation, average_when_downsizing)?; }
+                let mut options = format!("width={width} height={height}");
+                if let Some(depth) = depth { options.push_str(&format!(" depth={depth}")); }
+                if constrain { options.push_str(" constrain"); }
+                if average_when_downsizing { options.push_str(" average"); }
+                options.push_str(&format!(" interpolation={}", interpolation.java_name()));
+                self.macro_recorder.push(format!("run(\"Size...\", \"{options}\");"));
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
