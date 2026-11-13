@@ -1475,6 +1475,45 @@ impl ImageJApp {
         }
     }
 
+    /// `Image > Stacks > Add Slice` (StackEditor.java 30-49).
+    /// `insert_before_current` is `IJ.altKeyDown()`.
+    pub fn add_slice_active(&mut self, insert_before_current: bool) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Add Slice") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::AddSlice {
+            insert_before_current,
+        }) {
+            Ok(_) => {
+                self.status_message = "Add Slice".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Add Slice failed: {e}");
+                self.dialogs.last_error = Some(format!("Add Slice failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// `Image > Stacks > Delete Slice` (StackEditor.java 51-71).
+    pub fn delete_slice_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Delete Slice") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::DeleteSlice) {
+            Ok(_) => {
+                self.status_message = "Delete Slice".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Delete Slice failed: {e}");
+                self.dialogs.last_error = Some(format!("Delete Slice failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
     pub fn update_status_for_pixel(&mut self, image_id: ImageId, x: i32, y: i32) {
         if let Some(doc) = self.session.get_image(image_id) {
             if let Some(text) = crate::status_text::pixel_status(doc, x, y) {

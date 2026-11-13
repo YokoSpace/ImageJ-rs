@@ -406,6 +406,16 @@ pub enum Command {
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
+    /// `Image > Stacks > Add Slice` (`ij.plugin.StackEditor("add")`,
+    /// StackEditor.java 30-49). `insert_before_current` is `IJ.altKeyDown()`:
+    /// the blank slice goes in front of the current slice instead of after it.
+    /// Hyperstacks and C/T stacks are rejected rather than flattened.
+    AddSlice {
+        insert_before_current: bool,
+    },
+    /// `Image > Stacks > Delete Slice` (`ij.plugin.StackEditor("delete")`,
+    /// StackEditor.java 51-71). Deleting the last remaining slice is an error.
+    DeleteSlice,
     /// `Image > Duplicate...` (Duplicator.java 36-135). `title: None` asks
     /// for a `WindowManager.getUniqueName`-style title; an explicit title is
     /// used verbatim. `duplicate_stack` copies the whole stack or the
@@ -2044,6 +2054,23 @@ impl Session {
                 self.active_doc_mut()?.crop()?;
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"Crop\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::AddSlice {
+                insert_before_current,
+            } => {
+                self.active_doc_mut()?.add_slice(insert_before_current)?;
+                self.mark_active_dirty();
+                // StackEditor records no options, and Recorder.saveCommand
+                // only emits setKeyDown("alt") for Open Next and Plot Profile
+                // (Recorder.java 675-676), so Alt is not part of the macro.
+                self.macro_recorder.push("run(\"Add Slice\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::DeleteSlice => {
+                self.active_doc_mut()?.delete_slice()?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Delete Slice\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::Duplicate {

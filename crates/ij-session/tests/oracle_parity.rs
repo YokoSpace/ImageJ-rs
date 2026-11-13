@@ -22076,3 +22076,773 @@ fn parity_zproject_dialog_fields_match_real_generic_dialog() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P4.4b: Image > Stacks > Add Slice / Delete Slice for plain Z-stacks
+// (original_imagej/ij/plugin/StackEditor.java 30-71).
+// ---------------------------------------------------------------------------
+
+/// A `depth`-slice 8-bit ramp stack matching `newImage('t','8-bit ramp',w,h,d)`.
+fn ramp8_stack(title: &str, width: u32, height: u32, depth: u32) -> ImageDocument {
+    let base = ImageDocument::new_ramp_8bit(title, width, height).unwrap();
+    let plane = base.slices[0].clone();
+    ImageDocument::new_stack(title, width, height, vec![plane; depth as usize]).unwrap()
+}
+
+/// Parses the `S<n>=<pixels>|<label>` lines emitted by the P4.4b probes.
+fn slice_planes(stdout: &str) -> Vec<(Vec<f64>, String)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix('S') else {
+            continue;
+        };
+        let Some((index, rest)) = rest.split_once('=') else {
+            continue;
+        };
+        if index.parse::<u32>().is_err() {
+            continue;
+        }
+        let (pixels, label) = rest.split_once('|').unwrap();
+        let pixels = pixels
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<f64>().unwrap())
+            .collect();
+        out.push((pixels, label.to_string()));
+    }
+    out
+}
+
+fn assert_slice_planes(doc: &ImageDocument, stdout: &str) {
+    let expected = slice_planes(stdout);
+    assert_eq!(expected.len(), doc.stack_size(), "slice count");
+    for (index, (pixels, label)) in expected.iter().enumerate() {
+        let plane = &doc.slices[index];
+        let actual: Vec<f64> = (0..plane.len()).map(|i| plane.sample_f64(i)).collect();
+        assert_eq!(&actual, pixels, "slice {} pixels", index + 1);
+        assert_eq!(
+            doc.slice_labels[index].as_deref().unwrap_or(""),
+            label,
+            "slice {} label",
+            index + 1
+        );
+    }
+}
+
+#[test]
+fn parity_add_slice_inserts_blank_after_current_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,3);
+for (i=1;i<=3;i++){setSlice(i); setPixel(0,0,i*10); setMetadata("L"+i);}
+setSlice(2);
+run('Add Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ramp8_stack("t", 4, 3, 3);
+    for i in 1..=3u32 {
+        doc.set_slice(i as i32).unwrap();
+        if let PixelPlane::Gray8(pixels) = &mut doc.slices[(i - 1) as usize] {
+            pixels[0] = (i * 10) as u8;
+        }
+        doc.slice_labels[(i - 1) as usize] = Some(format!("L{i}"));
+    }
+    doc.set_slice(2).unwrap();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+    assert_eq!(doc.get_dimensions(), [4, 3, 1, 4, 1]);
+    assert_eq!(doc.title, "t");
+    assert!(session.is_dirty(id));
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Add Slice\");")
+    );
+}
+
+#[test]
+fn parity_add_slice_with_alt_inserts_before_current_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,3);
+for (i=1;i<=3;i++){setSlice(i); setPixel(0,0,i*10); setMetadata("L"+i);}
+setSlice(2);
+setKeyDown("alt");
+run('Add Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ramp8_stack("t", 4, 3, 3);
+    for i in 1..=3u32 {
+        doc.set_slice(i as i32).unwrap();
+        if let PixelPlane::Gray8(pixels) = &mut doc.slices[(i - 1) as usize] {
+            pixels[0] = (i * 10) as u8;
+        }
+        doc.slice_labels[(i - 1) as usize] = Some(format!("L{i}"));
+    }
+    doc.set_slice(2).unwrap();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: true,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+    // Alt is not part of the recorded statement (Recorder.java 675-676 only
+    // records setKeyDown("alt") for Open Next and Plot Profile).
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Add Slice\");")
+    );
+}
+
+#[test]
+fn parity_add_slice_on_single_image_creates_a_two_slice_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,1);
+setPixel(0,0,7);
+run('Add Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ImageDocument::new_ramp_8bit("t", 4, 3).unwrap();
+    if let PixelPlane::Gray8(pixels) = &mut doc.slices[0] {
+        pixels[0] = 7;
+    }
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+    // A one-slice image becomes a plain (1, 2, 1) Z-stack.
+    assert_eq!(doc.get_dimensions(), [4, 3, 1, 2, 1]);
+}
+
+#[test]
+fn parity_delete_slice_removes_current_slice_and_moves_back() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,3);
+for (i=1;i<=3;i++){setSlice(i); setPixel(0,0,i*10); setMetadata("L"+i);}
+setSlice(2);
+run('Delete Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}
+setSlice(1);
+run('Delete Slice');
+print("N2="+nSlices+" CUR2="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("T"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ramp8_stack("t", 4, 3, 3);
+    for i in 1..=3u32 {
+        doc.set_slice(i as i32).unwrap();
+        if let PixelPlane::Gray8(pixels) = &mut doc.slices[(i - 1) as usize] {
+            pixels[0] = (i * 10) as u8;
+        }
+        doc.slice_labels[(i - 1) as usize] = Some(format!("L{i}"));
+    }
+    doc.set_slice(2).unwrap();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session.dispatch(Command::DeleteSlice).unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+
+    session.dispatch(Command::DeleteSlice).unwrap();
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N2="),
+        format!("N2={} CUR2={}", doc.stack_size(), doc.current_slice)
+    );
+    let expected: Vec<(Vec<f64>, String)> = oracle
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix('T'))
+        .filter_map(|rest| rest.split_once('='))
+        .filter(|(index, _)| index.parse::<u32>().is_ok())
+        .map(|(_, rest)| {
+            let (pixels, label) = rest.split_once('|').unwrap();
+            (
+                pixels
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.parse::<f64>().unwrap())
+                    .collect::<Vec<f64>>(),
+                label.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(expected.len(), doc.stack_size());
+    for (index, (pixels, label)) in expected.iter().enumerate() {
+        let plane = &doc.slices[index];
+        let actual: Vec<f64> = (0..plane.len()).map(|i| plane.sample_f64(i)).collect();
+        assert_eq!(&actual, pixels, "slice {} pixels", index + 1);
+        assert_eq!(
+            doc.slice_labels[index].as_deref().unwrap_or(""),
+            label,
+            "slice {} label",
+            index + 1
+        );
+    }
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Delete Slice\");")
+    );
+}
+
+#[test]
+fn parity_delete_slice_on_single_image_reports_requires_a_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let error = bridge
+        .eval_macro("newImage('t','8-bit ramp',4,3,1); run('Delete Slice');")
+        .unwrap_err();
+    let ij_bridge::BridgeError::MacroAborted { message, .. } = error else {
+        panic!("expected BridgeError::MacroAborted, got {error:?}");
+    };
+    assert!(
+        message.contains("\"Delete Slice\" requires a stack"),
+        "unexpected Java error: {message}"
+    );
+
+    let mut session = Session::new();
+    let id = session.insert_doc(ImageDocument::new_ramp_8bit("t", 4, 3).unwrap());
+    let before = session.get_image(id).unwrap().clone();
+    let error = session.dispatch(Command::DeleteSlice).unwrap_err();
+    assert!(
+        error.to_string().contains("\"Delete Slice\" requires a stack"),
+        "unexpected Rust error: {error}"
+    );
+    assert_eq!(session.get_image(id).unwrap(), &before, "state preserved");
+    assert!(!session.is_dirty(id));
+    assert!(session.macro_recorder.is_empty());
+}
+
+#[test]
+fn parity_add_and_delete_slice_preserve_display_range_and_calibration() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','16-bit ramp',3,2,2);
+run("Set Scale...", "distance=2 known=1 pixel=1 unit=um");
+setMinAndMax(100,2000);
+setSlice(1);
+run('Add Slice');
+getMinAndMax(mn,mx); getVoxelSize(pw,ph,pd,unit);
+print("A="+nSlices+","+getSliceNumber()+","+mn+","+mx+","+pw+","+ph+","+unit);
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|");}
+setSlice(2);
+run('Delete Slice');
+getMinAndMax(mn,mx); getVoxelSize(pw,ph,pd,unit);
+print("B="+nSlices+","+getSliceNumber()+","+mn+","+mx+","+pw+","+ph+","+unit);"#,
+        )
+        .unwrap();
+
+    let base = ImageDocument::new_ramp_16bit("t", 3, 2).unwrap();
+    let plane = base.slices[0].clone();
+    let mut doc = ImageDocument::new_stack("t", 3, 2, vec![plane.clone(), plane]).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.5;
+    // Calibration.setUnit canonicalizes "um" to the micro sign
+    // (Calibration.java 128-136).
+    doc.calibration.set_unit("um");
+    doc.display_range = DisplayRange {
+        min: 100.0,
+        max: 2000.0,
+    };
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    let expected = oracle_line(&oracle.stdout, "A=").trim_start_matches("A=");
+    let fields: Vec<&str> = expected.split(',').collect();
+    assert_eq!(fields[0].parse::<usize>().unwrap(), doc.stack_size());
+    assert_eq!(fields[1].parse::<u32>().unwrap(), doc.current_slice);
+    assert_eq!(fields[2].parse::<f64>().unwrap(), doc.display_range.min);
+    assert_eq!(fields[3].parse::<f64>().unwrap(), doc.display_range.max);
+    assert_eq!(fields[4].parse::<f64>().unwrap(), doc.calibration.pixel_width);
+    assert_eq!(fields[5].parse::<f64>().unwrap(), doc.calibration.pixel_height);
+    assert_eq!(fields[6], doc.calibration.unit);
+    assert_slice_planes(doc, &oracle.stdout);
+
+    session.dispatch(Command::DeleteSlice).unwrap();
+    let doc = session.get_image(id).unwrap();
+    let expected = oracle_line(&oracle.stdout, "B=").trim_start_matches("B=");
+    let fields: Vec<&str> = expected.split(',').collect();
+    assert_eq!(fields[0].parse::<usize>().unwrap(), doc.stack_size());
+    assert_eq!(fields[1].parse::<u32>().unwrap(), doc.current_slice);
+    assert_eq!(fields[2].parse::<f64>().unwrap(), doc.display_range.min);
+    assert_eq!(fields[3].parse::<f64>().unwrap(), doc.display_range.max);
+    assert_eq!(fields[4].parse::<f64>().unwrap(), doc.calibration.pixel_width);
+    assert_eq!(fields[6], doc.calibration.unit);
+}
+
+/// Every pixel type keeps its own blank-slice rule: `createProcessor` returns
+/// an all-zero plane of the same type and colour model
+/// (ByteProcessor.java 136-143, ColorProcessor.java 98-102,
+/// ShortProcessor.java 183-188, FloatProcessor.java 236-241).
+#[test]
+fn parity_add_slice_blank_pixels_for_every_pixel_type() {
+    let stdout = run_java_harness(
+        "AddSlicePixelTypes",
+        r#"
+import ij.*;
+import ij.process.*;
+
+public class AddSlicePixelTypes {
+    static void dump(String tag, ImagePlus imp) {
+        System.out.println(tag+" N="+imp.getStackSize()+" CUR="+imp.getCurrentSlice()
+            +" DIMS="+imp.getNChannels()+","+imp.getNSlices()+","+imp.getNFrames()
+            +" MINMAX="+imp.getProcessor().getMin()+","+imp.getProcessor().getMax());
+        for (int i=1;i<=imp.getStackSize();i++) {
+            ImageProcessor ip = imp.getStack().getProcessor(i);
+            StringBuilder px=new StringBuilder();
+            for (int k=0;k<ip.getPixelCount();k++) px.append(ip.getPixelValue(k%ip.getWidth(), k/ip.getWidth())).append(",");
+            System.out.println(tag+" S"+i+"="+px+"|");
+            StringBuilder raw=new StringBuilder();
+            for (int k=0;k<ip.getPixelCount();k++) raw.append(ip.getPixel(k%ip.getWidth(), k/ip.getWidth())).append(",");
+            System.out.println(tag+" R"+i+"="+raw+"|");
+        }
+    }
+    public static void main(String[] a) {
+        ImageStack s8 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            byte[] p = new byte[6];
+            for (int k=0;k<6;k++) p[k]=(byte)(i*10+k);
+            s8.addSlice(null, new ByteProcessor(3,2,p));
+        }
+        ImagePlus i8 = new ImagePlus("t8", s8);
+        i8.setSlice(1);
+        IJ.run(i8, "Add Slice", "");
+        dump("G8", i8);
+
+        ImageStack s16 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            short[] p = new short[6];
+            for (int k=0;k<6;k++) p[k]=(short)(i*1000+k);
+            s16.addSlice(null, new ShortProcessor(3,2,p,null));
+        }
+        ImagePlus i16 = new ImagePlus("t16", s16);
+        i16.getProcessor().setMinAndMax(100, 2000);
+        i16.setSlice(1);
+        IJ.run(i16, "Add Slice", "");
+        dump("G16", i16);
+
+        ImageStack s32 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            float[] p = new float[6];
+            for (int k=0;k<6;k++) p[k]=(float)(i*1.5+k);
+            s32.addSlice(null, new FloatProcessor(3,2,p));
+        }
+        ImagePlus i32 = new ImagePlus("t32", s32);
+        i32.setSlice(1);
+        IJ.run(i32, "Add Slice", "");
+        dump("G32", i32);
+
+        ImageStack srgb = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            int[] p = new int[6];
+            for (int k=0;k<6;k++) p[k]=0x010203*i + k;
+            srgb.addSlice(null, new ColorProcessor(3,2,p));
+        }
+        ImagePlus irgb = new ImagePlus("trgb", srgb);
+        irgb.setSlice(1);
+        IJ.run(irgb, "Add Slice", "");
+        dump("RGB", irgb);
+
+        byte[] r=new byte[256], g=new byte[256], b=new byte[256];
+        for (int i=0;i<256;i++){r[i]=(byte)i; g[i]=(byte)(255-i); b[i]=(byte)(i/2);}
+        java.awt.image.IndexColorModel icm = new java.awt.image.IndexColorModel(8,256,r,g,b);
+        ImageStack s256 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            byte[] p = new byte[6];
+            for (int k=0;k<6;k++) p[k]=(byte)(i*10+k);
+            s256.addSlice(null, new ByteProcessor(3,2,p,icm));
+        }
+        ImagePlus i256 = new ImagePlus("t256", s256);
+        i256.setSlice(1);
+        IJ.run(i256, "Add Slice", "");
+        dump("C256", i256);
+        System.out.println("C256 CM="+(i256.getProcessor().getColorModel() instanceof java.awt.image.IndexColorModel));
+    }
+}
+"#,
+    );
+
+    let lut = Lut256 {
+        r: (0..=255u8).collect(),
+        g: (0..=255u8).rev().collect(),
+        b: (0..=255u8).map(|value| value / 2).collect(),
+    };
+    let cases: Vec<(&str, ImageDocument)> = vec![
+        (
+            "G8",
+            ImageDocument::new_stack(
+                "t8",
+                3,
+                2,
+                vec![
+                    PixelPlane::Gray8(vec![10, 11, 12, 13, 14, 15]),
+                    PixelPlane::Gray8(vec![20, 21, 22, 23, 24, 25]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "G16",
+            ImageDocument::new_stack(
+                "t16",
+                3,
+                2,
+                vec![
+                    PixelPlane::Gray16(vec![1000, 1001, 1002, 1003, 1004, 1005]),
+                    PixelPlane::Gray16(vec![2000, 2001, 2002, 2003, 2004, 2005]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "G32",
+            ImageDocument::new_stack(
+                "t32",
+                3,
+                2,
+                vec![
+                    PixelPlane::Gray32(vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
+                    PixelPlane::Gray32(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "RGB",
+            ImageDocument::new_stack(
+                "trgb",
+                3,
+                2,
+                vec![
+                    PixelPlane::ColorRgb(vec![0x010203, 0x010204, 0x010205, 0x010206, 0x010207, 0x010208]),
+                    PixelPlane::ColorRgb(vec![0x020406, 0x020407, 0x020408, 0x020409, 0x02040a, 0x02040b]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "C256",
+            ImageDocument::new_stack(
+                "t256",
+                3,
+                2,
+                vec![
+                    PixelPlane::Color256 {
+                        pixels: vec![10, 11, 12, 13, 14, 15],
+                        lut: Box::new(lut.clone()),
+                    },
+                    PixelPlane::Color256 {
+                        pixels: vec![20, 21, 22, 23, 24, 25],
+                        lut: Box::new(lut.clone()),
+                    },
+                ],
+            )
+            .unwrap(),
+        ),
+    ];
+
+    for (tag, mut doc) in cases {
+        if tag == "G16" {
+            doc.display_range = DisplayRange {
+                min: 100.0,
+                max: 2000.0,
+            };
+        }
+        let mut session = Session::new();
+        let id = session.insert_doc(doc);
+        session
+            .dispatch(Command::AddSlice {
+                insert_before_current: false,
+            })
+            .unwrap();
+        let doc = session.get_image(id).unwrap();
+        let header = oracle_line(&stdout, &format!("{tag} N="))
+            .trim_start_matches(&format!("{tag} "))
+            .to_string();
+        let field = |name: &str| -> String {
+            header
+                .split(' ')
+                .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{tag} header is missing {name}: {header}"))
+                .to_string()
+        };
+        assert_eq!(field("N").parse::<usize>().unwrap(), doc.stack_size(), "{tag} N");
+        assert_eq!(
+            field("CUR").parse::<u32>().unwrap(),
+            doc.current_slice,
+            "{tag} CUR"
+        );
+        assert_eq!(
+            field("DIMS"),
+            format!("{},{},{}", doc.n_channels, doc.n_slices, doc.n_frames),
+            "{tag} DIMS"
+        );
+        let minmax: Vec<f64> = field("MINMAX")
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(minmax, [doc.display_range.min, doc.display_range.max], "{tag} MINMAX");
+        let expected: Vec<(Vec<f64>, String)> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{tag} S")))
+            .filter_map(|rest| rest.split_once('='))
+            .filter(|(index, _)| index.parse::<u32>().is_ok())
+            .map(|(_, rest)| {
+                let (pixels, label) = rest.split_once('|').unwrap();
+                (
+                    pixels
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.parse::<f64>().unwrap())
+                        .collect::<Vec<f64>>(),
+                    label.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(expected.len(), doc.stack_size(), "{tag} slice count");
+        for (index, (pixels, _)) in expected.iter().enumerate() {
+            let plane = &doc.slices[index];
+            if tag == "RGB" {
+                // ColorProcessor.getPixelValue averages the channels in single
+                // precision, so compare the packed RGB ints instead.
+                let raw = oracle_line(&stdout, &format!("{tag} R{}=", index + 1));
+                let raw: Vec<u32> = raw
+                    .trim_start_matches(&format!("{tag} R{}=", index + 1))
+                    .split('|')
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.parse().unwrap())
+                    .collect();
+                let PixelPlane::ColorRgb(actual) = plane else {
+                    panic!("{tag} slice {} must stay RGB", index + 1);
+                };
+                assert_eq!(actual, &raw, "{tag} slice {} pixels", index + 1);
+            } else {
+                let actual: Vec<f64> = (0..plane.len()).map(|i| plane.sample_f64(i)).collect();
+                assert_eq!(&actual, pixels, "{tag} slice {} pixels", index + 1);
+            }
+        }
+        if tag == "C256" {
+            assert!(
+                stdout.contains("C256 CM=true"),
+                "Java keeps the IndexColorModel on the new slice"
+            );
+            let PixelPlane::Color256 { lut: new_lut, .. } = &doc.slices[1] else {
+                panic!("C256 slice 2 must stay indexed");
+            };
+            assert_eq!(**new_lut, lut, "C256 slice 2 keeps the palette");
+        }
+    }
+}
+
+/// A hyperstack or a C/T-only stack takes ImageJ's C/Z/T dialog path
+/// (StackEditor.java 31-34, 54-57), which P4.4d2 owns. P4.4b must reject it
+/// instead of flattening the axis.
+#[test]
+fn add_and_delete_slice_reject_hyperstack_and_ct_stacks() {
+    let mut session = Session::new();
+    let planes: Vec<PixelPlane> = (0..4)
+        .map(|i| PixelPlane::Gray8(vec![i as u8; 6]))
+        .collect();
+    let mut doc = ImageDocument::new_stack("hyper", 3, 2, planes).unwrap();
+    doc.set_dimensions(2, 2, 1).unwrap();
+    let id = session.insert_doc(doc);
+    let before = session.get_image(id).unwrap().clone();
+
+    for command in [
+        Command::AddSlice {
+            insert_before_current: false,
+        },
+        Command::DeleteSlice,
+    ] {
+        let error = session.dispatch(command).unwrap_err();
+        assert!(
+            error.to_string().contains("hyperstack"),
+            "unexpected Rust error: {error}"
+        );
+        assert_eq!(session.get_image(id).unwrap(), &before, "state preserved");
+    }
+    assert!(!session.is_dirty(id));
+    assert!(session.macro_recorder.is_empty());
+
+    // A channel-only stack (C=N, Z=1, T=1) is not an ImageJ hyperstack, but
+    // editing it would grow the channel axis, so it is rejected too.
+    let mut session = Session::new();
+    let planes: Vec<PixelPlane> = (0..3)
+        .map(|i| PixelPlane::Gray8(vec![i as u8; 6]))
+        .collect();
+    let mut doc = ImageDocument::new_stack("channels", 3, 2, planes).unwrap();
+    doc.set_dimensions(3, 1, 1).unwrap();
+    let id = session.insert_doc(doc);
+    let before = session.get_image(id).unwrap().clone();
+    let error = session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("hyperstack"),
+        "unexpected Rust error: {error}"
+    );
+    assert_eq!(session.get_image(id).unwrap(), &before, "state preserved");
+}
+
+#[test]
+fn parity_slice_edit_clears_threshold_and_preserves_roi() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for depth in [8, 16, 32] {
+        for count in [1, 2, 3] {
+            for delete in [false, true] {
+                if delete && count == 1 {
+                    continue;
+                }
+                let plane = match depth {
+                    8 => PixelPlane::Gray8(vec![50; 12]),
+                    16 => PixelPlane::Gray16(vec![500; 12]),
+                    _ => PixelPlane::Gray32(vec![50.; 12]),
+                };
+                let mut source =
+                    ImageDocument::new_stack("input.tif", 4, 3, vec![plane; count]).unwrap();
+                source.set_slice(count as i32).unwrap();
+                source.set_rect_roi(1, 0, 2, 2).unwrap();
+                source.threshold = Some(ThresholdLevels {
+                    lower: 10.,
+                    upper: 100.,
+                });
+                let name = if delete { "Delete Slice" } else { "Add Slice" };
+                let java=bridge.run_macro_on_image(&source,&format!(
+                    "setSlice({count}); makeRectangle(1,0,2,2); setThreshold(10,100); run(\"{name}\"); getThreshold(lo,hi); print(\"THR=\"+lo+\",\"+hi); getSelectionBounds(x,y,w,h); print(\"ROI=\"+x+\",\"+y+\",\"+w+\",\"+h);")).unwrap();
+                let values: Vec<f64> = oracle_line(&java.stdout, "THR=")
+                    .trim_start_matches("THR=")
+                    .split(',')
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+                assert_eq!(values, vec![-1., -1.]);
+                assert_eq!(oracle_line(&java.stdout, "ROI="), "ROI=1,0,2,2");
+                let roi = source.roi.clone();
+                let mut session = Session::new();
+                let id = session.insert_doc(source);
+                session
+                    .dispatch(if delete {
+                        Command::DeleteSlice
+                    } else {
+                        Command::AddSlice {
+                            insert_before_current: false,
+                        }
+                    })
+                    .unwrap();
+                let doc = session.get_image(id).unwrap();
+                assert_eq!(doc.threshold, None, "{depth}-bit {name}, {count} slices");
+                assert_eq!(doc.roi, roi);
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_slice_edit_rgb_resets_display_range() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for delete in [false, true] {
+        let name = if delete { "Delete Slice" } else { "Add Slice" };
+        let mut source = ImageDocument::new_stack(
+            "input.tif",
+            4,
+            3,
+            vec![PixelPlane::ColorRgb(vec![0xff102030; 12]); 3],
+        )
+        .unwrap();
+        let java=bridge.run_macro_on_image(&source,&format!("setMinAndMax(10,200); run(\"{name}\"); getMinAndMax(lo,hi); print(\"RANGE=\"+lo+\",\"+hi);")).unwrap();
+        let values: Vec<f64> = oracle_line(&java.stdout, "RANGE=")
+            .trim_start_matches("RANGE=")
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(values, vec![0., 255.]);
+        source.display_range = DisplayRange {
+            min: 10.,
+            max: 200.,
+        };
+        let mut session = Session::new();
+        let id = session.insert_doc(source);
+        session
+            .dispatch(if delete {
+                Command::DeleteSlice
+            } else {
+                Command::AddSlice {
+                    insert_before_current: false,
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            session.get_image(id).unwrap().display_range,
+            DisplayRange {
+                min: values[0],
+                max: values[1]
+            }
+        );
+    }
+}

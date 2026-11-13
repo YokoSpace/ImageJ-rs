@@ -47,6 +47,12 @@ pub enum AppAction {
     InvertStack,
     /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`).
     ZProject,
+    /// `Image > Stacks > Add Slice` (`ij.plugin.StackEditor("add")`,
+    /// IJ_Props.txt 147). Alt inserts the blank slice before the current one.
+    AddSlice,
+    /// `Image > Stacks > Delete Slice` (`ij.plugin.StackEditor("delete")`,
+    /// IJ_Props.txt 148).
+    DeleteSlice,
     Smooth,
     Sharpen,
     FindEdges,
@@ -220,6 +226,9 @@ const IMAGE_ADJUST: &[MenuNode] = &[
     item("Threshold...", None, AppAction::Threshold),
 ];
 const IMAGE_STACKS: &[MenuNode] = &[
+    // IJ_Props.txt 147-148: stacks01/stacks02 lead the Image/Stacks submenu.
+    item("Add Slice", None, AppAction::AddSlice),
+    item("Delete Slice", None, AppAction::DeleteSlice),
     item("Invert Stack", None, AppAction::InvertStack),
     item("Z Project...", None, AppAction::ZProject),
 ];
@@ -615,6 +624,18 @@ impl ImageJApp {
                         _ => Err("Binary conversion requires a grayscale image".into()),
                     },
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
+                    // StackEditor routes a hyperstack or composite to the
+                    // C/Z/T dialog (StackEditor.java 31-34, 54-57), which
+                    // P4.4d2 owns. A C- or T-only stack would grow that axis
+                    // instead of Z, so it is disabled too.
+                    AddSlice | DeleteSlice if !doc.supports_stack_axis_edit() => {
+                        Err(ij_core::CoreError::UnsupportedStackAxisEdit {
+                            channels: doc.n_channels,
+                            slices: doc.n_slices,
+                            frames: doc.n_frames,
+                        }
+                        .to_string())
+                    }
                     _ => Ok(()),
                 }
             }
@@ -818,6 +839,15 @@ impl ImageJApp {
             }
             ZProject => {
                 self.open_zproject_dialog();
+            }
+            AddSlice => {
+                // IJ.altKeyDown() inserts the blank slice before the current
+                // one (StackEditor.java 42).
+                let insert_before_current = ctx.input(|input| input.modifiers.alt);
+                let _ = self.add_slice_active(insert_before_current);
+            }
+            DeleteSlice => {
+                let _ = self.delete_slice_active();
             }
             Smooth => {
                 let _ = self.smooth_active();

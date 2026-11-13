@@ -7,6 +7,7 @@ pub mod histogram;
 pub mod math;
 pub mod new_image;
 pub mod particles;
+pub mod stack_edit;
 pub mod threshold_palette;
 pub mod transform;
 pub mod wand;
@@ -90,6 +91,22 @@ pub enum CoreError {
     },
     #[error("stack index {index} out of range 1..={stack_size}")]
     StackIndexOutOfRange { index: i32, stack_size: usize },
+    /// `IJ.error("\"Delete Slice\" requires a stack")`
+    /// (original_imagej/ij/plugin/StackEditor.java 52-53).
+    #[error("\"Delete Slice\" requires a stack")]
+    DeleteSliceRequiresStack,
+    /// Add Slice / Delete Slice only edit plain Z-stacks. A hyperstack or a
+    /// C/T-only stack takes ImageJ's C/Z/T dialog path
+    /// (original_imagej/ij/plugin/StackEditor.java 31-34, 54-57), which
+    /// P4.4d2 owns; flattening the axis here would silently lose it.
+    #[error(
+        "Add Slice and Delete Slice do not support hyperstacks or C/T stacks yet (C={channels} Z={slices} T={frames})"
+    )]
+    UnsupportedStackAxisEdit {
+        channels: u32,
+        slices: u32,
+        frames: u32,
+    },
     #[error("auto-threshold method \"{0}\" is not implemented (supported: IsoData, Otsu)")]
     UnsupportedThresholdMethod(String),
     #[error("8-bit stack required to process a single slice (Thresholder.java 129-131)")]
@@ -1706,6 +1723,15 @@ impl ImageDocument {
     /// 1294-1297).
     pub fn is_hyperstack(&self) -> bool {
         self.get_n_dimensions() > 3
+    }
+
+    /// True when `Image > Stacks > Add Slice` / `Delete Slice` can edit this
+    /// document: a single image or a plain Z-stack. ImageJ routes a hyperstack
+    /// or composite to the C/Z/T dialog (StackEditor.java 31-34, 54-57); a
+    /// C- or T-only stack is also excluded here because editing it would grow
+    /// that axis instead of Z.
+    pub fn supports_stack_axis_edit(&self) -> bool {
+        self.n_channels == 1 && self.n_frames == 1 && !self.is_hyperstack()
     }
 
     /// ImagePlus.verifyDimensions (original_imagej/ij/ImagePlus.java
