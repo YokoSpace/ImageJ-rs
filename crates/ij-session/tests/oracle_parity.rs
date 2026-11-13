@@ -21159,3 +21159,767 @@ fn parity_size_depth_scaling_matches_java() {
         assert_eq!(actual,&expected);
     }
 }
+
+// ===================================================================
+// P4.4a — Image > Stacks > Z Project... (original_imagej/ij/plugin/ZProjector.java)
+// ===================================================================
+
+use ij_core::{ZProjectionMethod, ZProjectionOptions};
+
+fn zproject_options(
+    method: ZProjectionMethod,
+    start_slice: f64,
+    stop_slice: f64,
+) -> ZProjectionOptions {
+    ZProjectionOptions {
+        method,
+        start_slice,
+        stop_slice,
+    }
+}
+
+fn dispatch_zproject(session: &mut Session, options: ZProjectionOptions) -> ij_session::ImageId {
+    match session.dispatch(Command::ZProject { options }) {
+        Ok(CommandOutcome::ImageOpened(id)) => id,
+        other => panic!("ZProject must open a projection image, got {other:?}"),
+    }
+}
+
+/// All six ZProjector methods in dialog order (ZProjector.java 24-25): test
+/// tag, GenericDialog choice label, Rust enum.
+const ZP_ALL_METHODS: [(&str, &str, ZProjectionMethod); 6] = [
+    ("avg", "Average Intensity", ZProjectionMethod::Average),
+    ("max", "Max Intensity", ZProjectionMethod::Max),
+    ("min", "Min Intensity", ZProjectionMethod::Min),
+    ("sum", "Sum Slices", ZProjectionMethod::Sum),
+    ("sd", "Standard Deviation", ZProjectionMethod::StandardDeviation),
+    ("med", "Median", ZProjectionMethod::Median),
+];
+
+/// Runs `run("Z Project...", "projection=[<label>]")` for each method on the
+/// opened input image, prints TITLE/BITDEPTH/MINMAX for every output window
+/// and saves each projection TIFF into `dir` for plane comparison.
+fn zproject_oracle_methods(
+    bridge: &JavaOracleBridge,
+    source: &ImageDocument,
+    dir: &std::path::Path,
+    methods: &[(&str, &str, ZProjectionMethod)],
+) -> ij_bridge::OracleRunOutput {
+    let mut body = String::new();
+    for (tag, label, _) in methods {
+        body.push_str(&format!(
+            "selectWindow(\"input.tif\");\n\
+             run(\"Z Project...\", \"projection=[{label}]\");\n\
+             print(\"{tag}_TITLE=\"+getTitle());\n\
+             print(\"{tag}_BITDEPTH=\"+bitDepth());\n\
+             getMinAndMax(zpmin,zpmax); print(\"{tag}_MINMAX=\"+zpmin+\",\"+zpmax);\n\
+             print(\"{tag}_SEL=\"+selectionType());\n\
+             saveAs(\"Tiff\", \"{}\");\n",
+            dir.join(format!("{tag}.tif")).display()
+        ));
+    }
+    bridge.run_macro_on_image(source, &body).unwrap()
+}
+
+fn parse_minmax(field: &str) -> (f64, f64) {
+    let (min, max) = field.split_once(',').unwrap();
+    (min.parse().unwrap(), max.parse().unwrap())
+}
+
+fn zproject_field<'a>(stdout: &'a str, tag: &str, key: &str) -> &'a str {
+    oracle_line(stdout, &format!("{tag}_{key}=")).trim_start_matches(&format!("{tag}_{key}="))
+}
+
+fn assert_display_range(doc: &ImageDocument, minmax: (f64, f64), context: &str) {
+    if minmax.0.is_nan() {
+        assert!(
+            doc.display_range.min.is_nan() && doc.display_range.max.is_nan(),
+            "{context}: expected NaN display range, got {:?}",
+            doc.display_range
+        );
+    } else {
+        assert_eq!(
+            (doc.display_range.min, doc.display_range.max),
+            minmax,
+            "{context}: display range"
+        );
+    }
+}
+
+fn zproject_expected_bitdepth(plane: &PixelPlane) -> u8 {
+    match plane {
+        PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => 8,
+        PixelPlane::Gray16(_) => 16,
+        PixelPlane::Gray32(_) => 32,
+        PixelPlane::ColorRgb(_) => 24,
+    }
+}
+
+/// Dispatches `Command::ZProject` on a fresh session and returns the session
+/// plus the new projection id.
+fn zproject_session(
+    source: &ImageDocument,
+    options: ZProjectionOptions,
+) -> (Session, ij_session::ImageId) {
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    let id = dispatch_zproject(&mut session, options);
+    (session, id)
+}
+
+#[test]
+fn parity_zproject_all_methods_8bit() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // ZProjector.java 318-357: slices are visited in order; use per-slice
+    // offsets so every method is distinguishable.
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8(
+                    (0..12).map(|i| s * 10 + i).collect::<Vec<u8>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    let stack_size = source.stack_size() as f64;
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) =
+            zproject_session(&source, zproject_options(method, 1.0, stack_size));
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{label}: title"
+        );
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "BITDEPTH").parse::<u8>().unwrap(),
+            zproject_expected_bitdepth(proj.plane()),
+            "{label}: bit depth"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            label,
+        );
+        // ZProjector never copies the selection onto the projection.
+        assert_eq!(zproject_field(&java.stdout, tag, "SEL"), "-1");
+        assert!(proj.roi.is_none(), "{label}: projection must have no ROI");
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_all_methods_16bit() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u16)
+            .map(|s| {
+                PixelPlane::Gray16(
+                    (0..12).map(|i| s * 1000 + i as u16).collect::<Vec<u16>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    let stack_size = source.stack_size() as f64;
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) =
+            zproject_session(&source, zproject_options(method, 1.0, stack_size));
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{label}: title"
+        );
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "BITDEPTH").parse::<u8>().unwrap(),
+            zproject_expected_bitdepth(proj.plane()),
+            "{label}: bit depth"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            label,
+        );
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_all_methods_32bit_with_nan_and_infinity() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // (1,1) carries NaN on slice 2; (2,0) is -inf/+inf on slices 1/3 to pin
+    // down each RayFunction's non-finite rules (ZProjector.java 714-870).
+    let mut slices: Vec<Vec<f32>> = (1..=3u8)
+        .map(|s| (0..12).map(|i| s as f32 * 10.5 + i as f32).collect())
+        .collect();
+    slices[1][1 + 4] = f32::NAN;
+    slices[0][2] = f32::NEG_INFINITY;
+    slices[2][2] = f32::INFINITY;
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        slices.into_iter().map(PixelPlane::Gray32).collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    let stack_size = source.stack_size() as f64;
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) =
+            zproject_session(&source, zproject_options(method, 1.0, stack_size));
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{label}: title"
+        );
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "BITDEPTH").parse::<u8>().unwrap(),
+            zproject_expected_bitdepth(proj.plane()),
+            "{label}: bit depth"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            label,
+        );
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_slice_range_and_invalid_fields() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=5u8)
+            .map(|s| {
+                PixelPlane::Gray8(
+                    (0..12).map(|i| s * 20 + i).collect::<Vec<u8>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    // (options text, dispatch start/stop): mirrors probes run against the
+    // oracle — out-of-range numbers are ignored by
+    // ZProjector.setStartSlice/setStopSlice (ZProjector.java 110-120).
+    for (tag, options_text, start, stop) in [
+        ("r", "start=2 stop=4 ", 2.0_f64, 4.0_f64),
+        ("f", "start=2.7 stop=99 ", 2.7, 99.0),
+        ("o", "start=0 stop=99 ", 0.0, 99.0),
+        ("n", "start=-2 stop=3 ", -2.0, 3.0),
+        ("s", "start=3 stop=3 ", 3.0, 3.0),
+    ] {
+        let java = bridge
+            .run_macro_on_image(
+                &source,
+                &format!(
+                    "run(\"Z Project...\", \"{options_text}projection=[Average Intensity]\");\n\
+                     print(\"{tag}_TITLE=\"+getTitle());\n\
+                     print(\"{tag}_BITDEPTH=\"+bitDepth());\n\
+                     getMinAndMax(zpmin,zpmax); print(\"{tag}_MINMAX=\"+zpmin+\",\"+zpmax);\n\
+                     saveAs(\"Tiff\", \"{}\");\n",
+                    dir.path().join(format!("{tag}.tif")).display()
+                ),
+            )
+            .unwrap();
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) = zproject_session(
+            &source,
+            zproject_options(ZProjectionMethod::Average, start, stop),
+        );
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{options_text}: title"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            options_text,
+        );
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{options_text}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_empty_slice_range_matches_java_degenerate_outputs() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>())
+            })
+            .collect(),
+    )
+    .unwrap();
+    // ZProjector.java 318-324: a start>stop range projects zero slices; each
+    // RayFunction emits its initializer/divide-by-zero value.
+    let methods = &ZP_ALL_METHODS[..5];
+    let mut body = String::new();
+    for (tag, label, _) in methods {
+        body.push_str(&format!(
+            "selectWindow(\"input.tif\");\n\
+             run(\"Z Project...\", \"start=3 stop=2 projection=[{label}]\");\n\
+             saveAs(\"Tiff\", \"{}\");\n",
+            dir.path().join(format!("{tag}.tif")).display()
+        ));
+    }
+    bridge.run_macro_on_image(&source, &body).unwrap();
+    for (tag, label, method) in methods {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) = zproject_session(
+            &source,
+            zproject_options(*method, 3.0, 2.0),
+        );
+        let proj = session.get_image(id).unwrap();
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: empty range pixels"),
+        );
+    }
+
+    // ZProjector.java 625: median on an empty range indexes slices[0] and
+    // dies with ArrayIndexOutOfBoundsException. ImageJ logs the plugin
+    // exception and the macro continues without a new image; the Rust
+    // command must fail instead of producing a bogus image.
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            "run(\"Z Project...\", \"start=3 stop=2 projection=Median\");\n\
+             print(\"AFTER=\"+getTitle());\n",
+        )
+        .unwrap();
+    assert!(
+        java.stdout.contains("ArrayIndexOutOfBoundsException"),
+        "Java median empty range must throw; stdout={}",
+        java.stdout
+    );
+    assert_eq!(
+        oracle_line(&java.stdout, "AFTER=").trim_start_matches("AFTER="),
+        "input.tif",
+        "no projection image is created after the Java exception"
+    );
+    assert!(dispatch_zproject_error(
+        &source,
+        zproject_options(ZProjectionMethod::Median, 3.0, 2.0)
+    ));
+
+    // 32-bit average on an empty range produces an all-NaN projection
+    // (ZProjector.java 676-678: 0.0/0).
+    let source32 = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![
+            PixelPlane::Gray32(vec![1.0; 12]),
+            PixelPlane::Gray32(vec![2.0; 12]),
+            PixelPlane::Gray32(vec![3.0; 12]),
+        ],
+    )
+    .unwrap();
+    let java = bridge
+        .run_macro_on_image(
+            &source32,
+            &format!(
+                "run(\"Z Project...\", \"start=3 stop=2 projection=[Average Intensity]\");\n\
+                 getMinAndMax(zpmin,zpmax); print(\"E_MINMAX=\"+zpmin+\",\"+zpmax);\n\
+                 saveAs(\"Tiff\", \"{}\");\n",
+                dir.path().join("empty32.tif").display()
+            ),
+        )
+        .unwrap();
+    let oracle = load_tiff(dir.path().join("empty32.tif")).unwrap();
+    let (session, id) = zproject_session(
+        &source32,
+        zproject_options(ZProjectionMethod::Average, 3.0, 2.0),
+    );
+    let proj = session.get_image(id).unwrap();
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "32-bit empty avg");
+    assert_display_range(
+        proj,
+        parse_minmax(zproject_field(&java.stdout, "E", "MINMAX")),
+        "32-bit empty avg",
+    );
+}
+
+fn dispatch_zproject_error(source: &ImageDocument, options: ZProjectionOptions) -> bool {
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    match session.dispatch(Command::ZProject { options }) {
+        Err(_) => {
+            // A failed projection must not create or alter images.
+            let after: Vec<String> = session
+                .image_ids()
+                .iter()
+                .map(|id| session.get_image(*id).unwrap().title.clone())
+                .collect();
+            assert_eq!(after, ["input.tif".to_string()]);
+            assert_eq!(
+                session.get_image(source_id).unwrap().slices,
+                source.slices,
+                "failed ZProject must leave the source untouched"
+            );
+            true
+        }
+        Ok(outcome) => panic!("expected ZProject error, got {outcome:?}"),
+    }
+}
+
+#[test]
+fn parity_zproject_single_slice_is_stack_required_error() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new("input.tif", 4, 3, PixelPlane::Gray8(vec![7; 12])).unwrap();
+    // ZProjector.java 144-147: IJ.error("Z Project", "Stack required").
+    let aborted = bridge
+        .run_macro_on_image(&source, "run(\"Z Project...\", \"projection=[Max Intensity]\");")
+        .unwrap_err();
+    let message = format!("{aborted:?}");
+    assert!(message.contains("Stack required"), "{message}");
+    assert!(dispatch_zproject_error(
+        &source,
+        zproject_options(ZProjectionMethod::Max, 1.0, 1.0)
+    ));
+}
+
+#[test]
+fn parity_zproject_preserves_source_state_and_ignores_roi() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>())
+            })
+            .collect(),
+    )
+    .unwrap();
+    // 0.5 µm pixels: projection copies Calibration (ZProjector.java 393-395).
+    source.calibration.pixel_width = 0.5;
+    source.calibration.pixel_height = 0.5;
+    source.calibration.unit = "µm".into();
+    source.set_rect_roi(0, 0, 2, 2).unwrap();
+    source.set_slice(2).unwrap();
+
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            &format!(
+                "run(\"Z Project...\", \"projection=[Max Intensity]\");\n\
+                 print(\"OUT_SEL=\"+selectionType());\n\
+                 getVoxelSize(pw,ph,pd,unit); print(\"OUT_CAL=\"+pw+\",\"+unit);\n\
+                 saveAs(\"Tiff\", \"{}\");\n\
+                 selectWindow(\"input.tif\");\n\
+                 print(\"SRC_PIX=\"+getPixel(0,0));\n\
+                 print(\"SRC_SLICE=\"+getSliceNumber());\n\
+                 print(\"SRC_SEL=\"+selectionType());\n",
+                dir.path().join("proj.tif").display()
+            ),
+        )
+        .unwrap();
+
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    let proj_id = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Max, 1.0, 3.0),
+    );
+
+    let oracle = load_tiff(dir.path().join("proj.tif")).unwrap();
+    let proj = session.get_image(proj_id).unwrap();
+    // The Java projection covers the full frame regardless of the source ROI.
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "projection pixels");
+    assert_eq!(zproject_field(&java.stdout, "OUT", "SEL"), "-1");
+    assert!(proj.roi.is_none());
+    assert_eq!(
+        zproject_field(&java.stdout, "OUT", "CAL"),
+        format!("{},{}", proj.calibration.pixel_width, proj.calibration.unit),
+        "projection calibration"
+    );
+    assert_eq!(session.active_image_id(), Some(proj_id), "projection becomes active");
+
+    // Source image state is untouched by the projection. The TIFF reload
+    // resets Java to slice 1, so the Java-side evidence is the unchanged
+    // slice-1 pixel value and ROI; the Rust side is compared to the
+    // pre-dispatch document.
+    let src = session.get_image(source_id).unwrap();
+    assert_eq!(src.slices, source.slices, "source pixels unchanged");
+    assert_eq!(src.current_slice, source.current_slice, "current slice kept");
+    assert_eq!(src.roi, source.roi, "source ROI kept");
+    assert_eq!(zproject_field(&java.stdout, "SRC", "PIX"), "10");
+    assert_eq!(zproject_field(&java.stdout, "SRC", "SLICE"), "1");
+    assert!(zproject_field(&java.stdout, "SRC", "SEL").parse::<i8>().unwrap() >= 0);
+}
+
+#[test]
+fn parity_zproject_source_snapshot_and_dirty_state_survive() {
+    let mut source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![
+            PixelPlane::Gray8(vec![10; 12]),
+            PixelPlane::Gray8(vec![20; 12]),
+            PixelPlane::Gray8(vec![30; 12]),
+        ],
+    )
+    .unwrap();
+    source.snapshot = Some(source.slices.clone());
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    session.set_dirty(source_id, false);
+    let proj_id = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Sum, 1.0, 3.0),
+    );
+    let src = session.get_image(source_id).unwrap();
+    assert_eq!(src.snapshot, source.snapshot, "undo snapshot preserved");
+    assert!(!session.is_dirty(source_id), "projection must not dirty source");
+    assert!(session.is_dirty(proj_id), "new projection is unsaved");
+}
+
+#[test]
+fn parity_zproject_composite_sized_stack_uses_plain_java_path() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // channels==stackSize makes ZProjector treat the image as a plain stack
+    // (simpleComposite, ZProjector.java 217-220).
+    let java = bridge
+        .eval_macro(&format!(
+            "newImage(\"cstk\",\"8-bit black\",4,3,3);\n\
+             for(s=1;s<=3;s++){{setSlice(s);for(y=0;y<3;y++)for(x=0;x<4;x++)setPixel(x,y,s*10+x+y*4);}}\n\
+             Stack.setDimensions(3,1,1);\n\
+             run(\"Z Project...\", \"projection=[Average Intensity]\");\n\
+             print(\"C_TITLE=\"+getTitle());\n\
+             saveAs(\"Tiff\", \"{}\");\n",
+            dir.path().join("comp.tif").display()
+        ))
+        .unwrap();
+    let oracle = load_tiff(dir.path().join("comp.tif")).unwrap();
+    let source = ImageDocument::new_hyperstack(
+        "cstk",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>())
+            })
+            .collect(),
+        3,
+        1,
+        1,
+    )
+    .unwrap();
+    let (session, id) = zproject_session(
+        &source,
+        zproject_options(ZProjectionMethod::Average, 1.0, 3.0),
+    );
+    let proj = session.get_image(id).unwrap();
+    assert_eq!(oracle_line(&java.stdout, "C_TITLE=").trim_start_matches("C_TITLE="), proj.title);
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "composite path");
+}
+
+#[test]
+fn zproject_rejects_hyperstack_and_rgb_inputs() {
+    let hyperstack = ImageDocument::new_hyperstack(
+        "input.tif",
+        4,
+        3,
+        vec![PixelPlane::Gray8(vec![1; 12]); 4],
+        2,
+        2,
+        1,
+    )
+    .unwrap();
+    assert!(dispatch_zproject_error(
+        &hyperstack,
+        zproject_options(ZProjectionMethod::Average, 1.0, 4.0)
+    ));
+    let rgb = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![PixelPlane::ColorRgb(vec![0x102030; 12]); 3],
+    )
+    .unwrap();
+    assert!(dispatch_zproject_error(
+        &rgb,
+        zproject_options(ZProjectionMethod::Average, 1.0, 3.0)
+    ));
+}
+
+#[test]
+fn parity_zproject_macro_recording_and_roundtrip() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![
+            PixelPlane::Gray8(vec![10; 12]),
+            PixelPlane::Gray8(vec![20; 12]),
+            PixelPlane::Gray8(vec![30; 12]),
+            PixelPlane::Gray8(vec![40; 12]),
+            PixelPlane::Gray8(vec![50; 12]),
+        ],
+    )
+    .unwrap();
+
+    // Smart recording suppresses fields that still hold their default text
+    // (ZProjector.java 164-172, GenericDialog.java 1203-1205); the choice is
+    // always written (ZProjector.java 172-173).
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Max, 1.0, 5.0),
+    );
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Z Project...\", \"projection=[Max Intensity]\");")
+    );
+
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Sum, 2.0, 4.0),
+    );
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Z Project...\", \"start=2 stop=4 projection=[Sum Slices]\");")
+    );
+
+    // The recorded option string must be accepted by the Java dialog parser:
+    // feed both literals back through the oracle.
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            "run(\"Z Project...\", \"start=2 stop=4 projection=[Sum Slices]\");\n\
+             print(\"RT_PIX=\"+getPixel(0,0));\n",
+        )
+        .unwrap();
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    let id = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Sum, 2.0, 4.0),
+    );
+    let PixelPlane::Gray32(pixels) = session.get_image(id).unwrap().plane() else {
+        panic!("Sum Slices must produce 32-bit output");
+    };
+    assert_eq!(
+        zproject_field(&java.stdout, "RT", "PIX").parse::<f32>().unwrap(),
+        pixels[0]
+    );
+}
+
+#[test]
+fn parity_zproject_even_slice_count_median() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Four slices exercise the even-count branch (ZProjector.java 647-650):
+    // (a[middle-1]+a[middle])/2f in float arithmetic.
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=4u16)
+            .map(|s| {
+                PixelPlane::Gray16(
+                    (0..12).map(|i| s * 1000 + i as u16 * 7).collect::<Vec<u16>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS[5..]);
+    let oracle = load_tiff(dir.path().join("med.tif")).unwrap();
+    let (session, id) = zproject_session(
+        &source,
+        zproject_options(ZProjectionMethod::Median, 1.0, 4.0),
+    );
+    let proj = session.get_image(id).unwrap();
+    assert_eq!(
+        zproject_field(&java.stdout, "med", "BITDEPTH").parse::<u8>().unwrap(),
+        zproject_expected_bitdepth(proj.plane())
+    );
+    assert_display_range(
+        proj,
+        parse_minmax(zproject_field(&java.stdout, "med", "MINMAX")),
+        "median even",
+    );
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "median even pixels");
+}
+
+#[test]
+fn parity_zproject_constant_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![PixelPlane::Gray8(vec![100; 12]); 3],
+    )
+    .unwrap();
+    zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) = zproject_session(
+            &source,
+            zproject_options(method, 1.0, 3.0),
+        );
+        let proj = session.get_image(id).unwrap();
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: constant stack"),
+        );
+    }
+}

@@ -10,6 +10,7 @@ pub mod particles;
 pub mod threshold_palette;
 pub mod transform;
 pub mod wand;
+pub mod zproject;
 
 pub use binary::StackBinaryOptions;
 pub use contrast::{
@@ -28,6 +29,7 @@ pub use threshold_palette::{
     FLOAT_NEG_LIMIT, FLOAT_POS_LIMIT, NO_THRESHOLD_PLOT_BIN, THRESHOLD_SLIDER_RANGE,
 };
 pub use wand::{Wand, WandMode};
+pub use zproject::{ZProjectionMethod, ZProjectionOptions};
 pub use edit::{CREATE_SELECTION_NOT_MASK_OR_THRESHOLDED, CREATE_SELECTION_REQUIRES_SHAPE_ROI};
 
 use serde::{Deserialize, Serialize};

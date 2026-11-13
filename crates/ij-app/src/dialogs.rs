@@ -123,6 +123,21 @@ pub struct MathDialog {
     pub operation: ij_core::math::MathOperation,
 }
 
+/// Editable state of `Image > Stacks > Z Project...`
+/// (ZProjector.buildControlDialog, original_imagej/ij/plugin/ZProjector.java
+/// 285-297): "Start slice:", "Stop slice:" and the "Projection type" choice.
+/// The numeric fields stay text so an invalid entry re-shows the dialog like
+/// GenericDialog.invalidNumber; `source` pins the image the command ran on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ZProjectDialog {
+    pub open: bool,
+    pub source: Option<ImageId>,
+    pub start: String,
+    pub stop: String,
+    /// Index into `ij_core::zproject::Z_PROJECT_METHODS`.
+    pub method_index: usize,
+}
+
 /// The dialog choice labels in ImageCalculator's order
 /// (ImageCalculator.java 21).
 pub const CALCULATOR_OPERATORS: [ij_core::math::CalculatorOperation; 13] = [
@@ -230,6 +245,13 @@ pub struct DialogState {
     pub new_image_defaults: NewImageDefaults,
     pub math: Option<MathDialog>,
     pub math_defaults: MathDefaults,
+    pub zproject: ZProjectDialog,
+    /// ZProjector persists the chosen method via `Prefs.set(METHOD_KEY, ...)`
+    /// (ZProjector.java 26-27, 173); modeled per app run.
+    pub zproject_method: usize,
+    /// Pending `IJ.showMessageWithCancel` inverting-LUT warning holding the
+    /// image the command ran on (ZProjector.java 149-153).
+    pub zproject_lut_pending: Option<ImageId>,
     pub calculator: Option<ImageCalculatorDialog>,
     pub calculator_last: ImageCalculatorLast,
     /// Duplicator's `staticDuplicateStack`: the checkbox starts checked again
@@ -279,6 +301,9 @@ impl DialogState {
             new_image_defaults: NewImageDefaults::default(),
             math: None,
             math_defaults: MathDefaults::default(),
+            zproject: ZProjectDialog::default(),
+            zproject_method: 0,
+            zproject_lut_pending: None,
             calculator: None,
             calculator_last: ImageCalculatorLast::default(),
             duplicate_stack_default: false,

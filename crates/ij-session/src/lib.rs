@@ -540,6 +540,16 @@ pub enum Command {
     /// active threshold without touching pixels.
     ResetThreshold,
     InvertStack,
+    /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`). Projects a
+    /// grayscale stack over `start_slice..=stop_slice` (one-based) into a new
+    /// image. `start_slice`/`stop_slice` are the raw dialog numbers cast like
+    /// `(int)gd.getNextNumber()`; out-of-range values are ignored exactly
+    /// like `ZProjector.setStartSlice/setStopSlice` (ZProjector.java
+    /// 110-120). RGB stacks and hyperstacks are rejected because the Java
+    /// RGB/C/Z/T branches are not implemented yet.
+    ZProject {
+        options: ij_core::ZProjectionOptions,
+    },
     /// Whole-stack answers to the "Process Stack?" prompt for the grayscale
     /// filters. Each one records ImageJ's `stack` option
     /// (original_imagej/ij/IJ.java 1287).
@@ -2301,6 +2311,50 @@ impl Session {
                 }
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
+            }
+            Command::ZProject { options } => {
+                let (stack_size, new_doc) = {
+                    let doc = self.active_doc()?;
+                    let base = format!("{}{}", options.method.title_prefix(), doc.title);
+                    // WindowManager.makeUniqueName (WindowManager.java
+                    // 385-387): the prefixed title is kept unless another
+                    // image already uses it.
+                    let titles: Vec<&str> =
+                        self.images.values().map(|doc| doc.title.as_str()).collect();
+                    let title = if titles.iter().any(|title| *title == base) {
+                        default_duplicate_title(&titles, &base)
+                    } else {
+                        base
+                    };
+                    (
+                        doc.stack_size() as u32,
+                        ij_core::zproject::z_project(doc, &options, title)?,
+                    )
+                };
+                let new_id = self.insert_doc(new_doc);
+                self.dirty_images.insert(new_id);
+                // GenericDialog smart recording only emits the Start/Stop
+                // slice fields when the typed text differs from the defaults
+                // (ZProjector.java 164-172, GenericDialog.java 1203-1205);
+                // the Projection type choice is recorded unconditionally
+                // after smart recording is switched off
+                // (ZProjector.java 172-173).
+                let mut parts = Vec::new();
+                let start_text = format_scale_number(options.start_slice);
+                if start_text != "1" {
+                    parts.push(format!("start={start_text}"));
+                }
+                let stop_text = format_scale_number(options.stop_slice);
+                if stop_text != stack_size.to_string() {
+                    parts.push(format!("stop={stop_text}"));
+                }
+                parts.push(format!(
+                    "projection={}",
+                    macro_option_value(options.method.label())
+                ));
+                self.macro_recorder
+                    .push(format!("run(\"Z Project...\", \"{}\");", parts.join(" ")));
+                Ok(CommandOutcome::ImageOpened(new_id))
             }
             Command::SmoothStack => {
                 let doc = self.active_doc_mut()?;

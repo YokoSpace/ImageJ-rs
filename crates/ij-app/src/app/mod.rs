@@ -41,6 +41,7 @@ mod new_image_dialog;
 mod plugin_ops;
 mod plugins_ui;
 mod shortcuts;
+mod zproject_dialog;
 pub use self::adjust_dialogs::{
     PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SET_MEASUREMENTS_FIRST_GROUP,
     SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS, SET_MEASUREMENTS_OPTIONS,

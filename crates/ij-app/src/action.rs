@@ -45,6 +45,8 @@ pub enum AppAction {
     BrightnessContrast,
     Threshold,
     InvertStack,
+    /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`).
+    ZProject,
     Smooth,
     Sharpen,
     FindEdges,
@@ -217,7 +219,10 @@ const IMAGE_ADJUST: &[MenuNode] = &[
     ),
     item("Threshold...", None, AppAction::Threshold),
 ];
-const IMAGE_STACKS: &[MenuNode] = &[item("Invert Stack", None, AppAction::InvertStack)];
+const IMAGE_STACKS: &[MenuNode] = &[
+    item("Invert Stack", None, AppAction::InvertStack),
+    item("Z Project...", None, AppAction::ZProject),
+];
 const IMAGE_TYPE: &[MenuNode] = &[
     item("8-bit", None, AppAction::ConvertTo8Bit),
     item("16-bit", None, AppAction::ConvertTo16Bit),
@@ -810,6 +815,9 @@ impl ImageJApp {
             }
             InvertStack => {
                 let _ = self.invert_stack_active();
+            }
+            ZProject => {
+                self.open_zproject_dialog();
             }
             Smooth => {
                 let _ = self.smooth_active();
