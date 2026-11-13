@@ -7,6 +7,7 @@ pub mod histogram;
 pub mod math;
 pub mod new_image;
 pub mod particles;
+pub mod stack_convert;
 pub mod stack_edit;
 pub mod threshold_palette;
 pub mod transform;
@@ -23,6 +24,11 @@ pub use filters::{AutoThresholdMethod, RankFilterKind};
 pub use histogram::{display_histogram, DisplayHistogram};
 pub use new_image::{NewImageFill, NewImageType};
 pub use particles::{AnalyzedParticle, ParticleAnalysisOptions};
+pub use stack_convert::{
+    images_to_stack, images_to_stack_plan, stack_to_images, ImagesToStackMethod,
+    ImagesToStackOptions, ImagesToStackOutput, ImagesToStackPlan, StackConvertError, StackType,
+    IMAGES_TO_STACK_METHODS,
+};
 pub use threshold_palette::{
     adjust_max_threshold, adjust_min_threshold, format_threshold_label, plot_threshold_bins,
     scale_down, scale_up, scale_up_and_set, threshold_to_sliders, ThresholdSliders,
@@ -148,6 +154,28 @@ impl Default for Lut256 {
         let g: Vec<u8> = (0..=255).collect();
         let b: Vec<u8> = (0..=255).collect();
         Self { r, g, b }
+    }
+}
+
+impl Lut256 {
+    /// `ImageProcessor.isInvertedLut` (ImageProcessor.java 299-320): true when
+    /// no LUT entry raises the summed RGB value, i.e. zero displays as white.
+    pub fn is_inverted(&self) -> bool {
+        for i in 1..255 {
+            let previous =
+                u32::from(self.r[i - 1]) + u32::from(self.g[i - 1]) + u32::from(self.b[i - 1]);
+            let current = u32::from(self.r[i]) + u32::from(self.g[i]) + u32::from(self.b[i]);
+            if previous < current {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `ImageProcessor.isColorLut` (ImageProcessor.java 327-350): true when any
+    /// entry is not gray.
+    pub fn is_color(&self) -> bool {
+        (0..256).any(|i| self.r[i] != self.g[i] || self.g[i] != self.b[i])
     }
 }
 
@@ -1262,7 +1290,7 @@ pub(crate) fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
 
 /// TypeConverter.convertRGBToByte (TypeConverter.java 95-117) with
 /// ColorProcessor's default equal weights (ColorProcessor.java 26).
-fn rgb_to_byte(pixel: u32) -> u8 {
+pub(crate) fn rgb_to_byte(pixel: u32) -> u8 {
     let r = f64::from((pixel >> 16) & 0xff);
     let g = f64::from((pixel >> 8) & 0xff);
     let b = f64::from(pixel & 0xff);
@@ -1272,7 +1300,7 @@ fn rgb_to_byte(pixel: u32) -> u8 {
 
 /// TypeConverter.convertRGBToFloat (TypeConverter.java 123-139) with
 /// ColorProcessor's default equal weights (ColorProcessor.java 26).
-fn rgb_to_float(pixel: u32) -> f32 {
+pub(crate) fn rgb_to_float(pixel: u32) -> f32 {
     let r = f64::from((pixel >> 16) & 0xff);
     let g = f64::from((pixel >> 8) & 0xff);
     let b = f64::from(pixel & 0xff);
@@ -1314,7 +1342,7 @@ fn byte_display_rgb_table(lut: &Lut256, min: f64, max: f64) -> [u32; 256] {
 /// model. 8-bit planes display through their LUT with the range baked in; a
 /// stack's slices take that range from the current processor, which has
 /// already rounded it (ImageStack.java 205-208, 330-331).
-fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) -> PixelPlane {
+pub(crate) fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) -> PixelPlane {
     let gray = |value: u8| 0xff00_0000 | u32::from(value) * 0x0001_0101;
     match plane {
         PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => {
@@ -1365,7 +1393,7 @@ fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) 
 
 /// ImageProcessor.isPseudoColorLut (ImageProcessor.java 351-386). The active
 /// threshold case cannot occur because `Converter.java 55-56` resets it first.
-fn is_pseudo_color_lut(lut: &Lut256) -> bool {
+pub(crate) fn is_pseudo_color_lut(lut: &Lut256) -> bool {
     let mut r2 = i32::from(lut.r[0]);
     let mut g2 = i32::from(lut.g[0]);
     let mut b2 = i32::from(lut.b[0]);
@@ -1463,6 +1491,11 @@ pub struct ImageDocument {
     pub slices: Vec<PixelPlane>,
     /// Optional ImageJ slice labels in stack order.
     pub slice_labels: Vec<Option<String>>,
+    /// `ImagePlus.getProp("Slice_Label")`, separate from a one-slice stack's
+    /// label. Delete Slice sets it when collapsing a stack (StackEditor.java
+    /// 63-66); Images to Stack reads this property, not the stack label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_label_property: Option<String>,
     /// One-based dimensions matching ImagePlus.nChannels/nSlices/nFrames.
     pub n_channels: u32,
     pub n_slices: u32,
@@ -1540,6 +1573,7 @@ impl ImageDocument {
             height,
             slices,
             slice_labels,
+            slice_label_property: None,
             n_channels,
             n_slices,
             n_frames,

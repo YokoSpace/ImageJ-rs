@@ -173,6 +173,8 @@ pub enum SessionError {
     InvalidNewImageDimensions,
     #[error("unsupported newImage type: {0}")]
     UnsupportedNewImageType(String),
+    #[error("{0}")]
+    StackConvert(#[from] ij_core::StackConvertError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -566,6 +568,23 @@ pub enum Command {
         start: String,
         stop: String,
     },
+    /// `Image > Stacks > Images to Stack` with explicit dialog options
+    /// (`ij.plugin.ImagesToStack.convertImagesToStack`,
+    /// original_imagej/ij/plugin/ImagesToStack.java 36-116). Every open 2D
+    /// image (optionally filtered by title) becomes one slice of a new stack;
+    /// the sources are closed unless `keep` is set.
+    ImagesToStack {
+        options: ij_core::ImagesToStackOptions,
+    },
+    /// `run("Images to Stack")` with no options: Java skips the dialog, forces
+    /// `keep=false` and rejects differing image sizes
+    /// (ImagesToStack.java 64-75, 114-115).
+    ImagesToStackMacro,
+    /// `Image > Stacks > Stack to Images`
+    /// (`ij.plugin.StackEditor.convertStackToImages`,
+    /// original_imagej/ij/plugin/StackEditor.java 240-310). Every slice of the
+    /// active stack becomes its own window and the source stack is closed.
+    StackToImages,
     /// Whole-stack answers to the "Process Stack?" prompt for the grayscale
     /// filters. Each one records ImageJ's `stack` option
     /// (original_imagej/ij/IJ.java 1287).
@@ -640,6 +659,9 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CommandOutcome {
     ImageOpened(ImageId),
+    /// Several windows were opened at once, in creation order
+    /// (`StackEditor.convertStackToImages`).
+    ImagesOpened(Vec<ImageId>),
     Saved(PathBuf),
     Updated,
     Measured(MeasurementSummary),
@@ -1183,6 +1205,177 @@ impl Session {
             macro_string(&parts.join(" "))
         ));
         Ok(CommandOutcome::ImageOpened(new_id))
+    }
+
+    /// `ImagesToStack.convertImagesToStack` (ImagesToStack.java 36-116) plus
+    /// `convert` (118-253). `macro_without_options` selects the branch where
+    /// Java skips the dialog, forces `keep=false` and rejects differing sizes.
+    fn dispatch_images_to_stack(
+        &mut self,
+        options: ij_core::ImagesToStackOptions,
+        macro_without_options: bool,
+    ) -> Result<CommandOutcome, SessionError> {
+        let ids = self.image_ids();
+        // `ImagesToStackPlan::included` indexes the eligible 2D windows, i.e.
+        // `WindowManager.getIDList` with the stacks removed
+        // (ImagesToStack.java 60-66), so the ids used to close the sources must
+        // be built from that same filter. Using the full id list here would
+        // close a stack window and leave a merged 2D image open.
+        let eligible_ids: Vec<ImageId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.images
+                    .get(id)
+                    .is_some_and(|doc| doc.stack_size() == 1)
+            })
+            .collect();
+        let (output, sizes_differ) = {
+            let docs: Vec<&ImageDocument> =
+                ids.iter().filter_map(|id| self.images.get(id)).collect();
+            // `sizesDiffer` is computed before the "Title contains" filter is
+            // applied (ImagesToStack.java 78-79 vs 108-113), so it decides
+            // whether the dialog shows the Method choice and Bicubic checkbox
+            // and therefore whether the recorder writes them.
+            let unfiltered = ij_core::images_to_stack_plan(
+                &docs,
+                &ij_core::ImagesToStackOptions {
+                    title_filter: String::new(),
+                    ..options.clone()
+                },
+            )?;
+            if macro_without_options && unfiltered.sizes_differ() {
+                return Err(ij_core::StackConvertError::SizeMismatch.into());
+            }
+            let output = ij_core::images_to_stack(&docs, &options, options.name.clone())?;
+            (output, unfiltered.sizes_differ())
+        };
+        let doc = output.document;
+        // ImagesToStack.java 208-211: the sources are closed inside the
+        // conversion loop, before the new window is created. `included` holds
+        // positions in `eligible_ids`, not in `ids`.
+        if !options.keep {
+            for &index in &output.included {
+                self.close_image(eligible_ids[index]);
+            }
+        }
+        // ImagesToStack never calls WindowManager.checkForDuplicateName, so a
+        // new stack may share a title with an existing window
+        // (ImagesToStack.java 240-252 creates the ImagePlus directly).
+        let new_id = self.insert_doc(doc);
+        self.dirty_images.insert(new_id);
+        // GenericDialog smart recording (GenericDialog.java 1327-1336,
+        // 1261-1271): string fields only when they differ from their default,
+        // and checkboxes by their label's first word lowercased. The getters
+        // run in dialog order (ImagesToStack.java 107-115), and
+        // `Recorder.commandOptions` is a state machine: an unchanged field or
+        // unchecked box only seeds the single-space placeholder when nothing
+        // has been recorded yet (Recorder.java 521-531), while a changed field
+        // appends to it verbatim (Recorder.java 472-482), which is why a
+        // changed "Fill color:" after an unchanged "Name:" yields two spaces.
+        let mut recorded: Option<String> = None;
+        let record_option = |recorded: &mut Option<String>, key: &str, value: &str| {
+            match recorded {
+                Some(existing) => {
+                    existing.push(' ');
+                    existing.push_str(key);
+                    existing.push('=');
+                    existing.push_str(value);
+                }
+                None => *recorded = Some(format!("{key}={value}")),
+            }
+        };
+        let record_flag = |recorded: &mut Option<String>, key: &str| match recorded {
+            Some(existing) if existing != " " => {
+                existing.push(' ');
+                existing.push_str(key);
+            }
+            _ => *recorded = Some(key.to_string()),
+        };
+        // GenericDialog.getNextChoiceIndex records the choice only when it
+        // differs from the dialog's initial index (GenericDialog.java
+        // 1428-1436), and the choice only exists when the sizes differ.
+        if sizes_differ && options.method != options.method_default {
+            record_option(
+                &mut recorded,
+                "method",
+                &format!("[{}]", options.method.label()),
+            );
+        }
+        for (key, text, default) in [
+            ("name", options.name.as_str(), "Stack"),
+            ("title", options.title_filter.as_str(), ""),
+            ("fill", options.fill.as_str(), ""),
+        ] {
+            if text != default {
+                record_option(
+                    &mut recorded,
+                    key,
+                    &if text.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        macro_option_value(text)
+                    },
+                );
+            } else if recorded.is_none() {
+                recorded = Some(" ".to_string());
+            }
+        }
+        if sizes_differ {
+            if options.bicubic {
+                record_flag(&mut recorded, "bicubic");
+            } else if recorded.is_none() {
+                recorded = Some(" ".to_string());
+            }
+        }
+        for (key, checked) in [
+            ("use", options.titles_as_labels),
+            ("keep", options.keep),
+        ] {
+            if checked {
+                record_flag(&mut recorded, key);
+            } else if recorded.is_none() {
+                recorded = Some(" ".to_string());
+            }
+        }
+        // `Recorder.saveCommand` writes `run("Images to Stack");` when the
+        // dialog never ran, which is the macro-without-options branch
+        // (ImagesToStack.java 80-86; Recorder.java 547-556).
+        let line = if macro_without_options {
+            "run(\"Images to Stack\");".to_string()
+        } else {
+            format!(
+                "run(\"Images to Stack\", \"{}\");",
+                macro_string(recorded.as_deref().unwrap_or(""))
+            )
+        };
+        self.macro_recorder.push(line);
+        Ok(CommandOutcome::ImageOpened(new_id))
+    }
+
+    /// `StackEditor.convertStackToImages` (StackEditor.java 240-310): every
+    /// slice becomes its own window and the source stack is closed.
+    fn dispatch_stack_to_images(&mut self) -> Result<CommandOutcome, SessionError> {
+        let source_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+        let images = {
+            let source = self.images.get(&source_id).ok_or(SessionError::NoActiveImage)?;
+            ij_core::stack_to_images(source)?
+        };
+        // StackEditor.java 291-297: the source is closed after the new windows
+        // exist, so its title is still taken when the outputs are named.
+        self.close_image(source_id);
+        let mut ids = Vec::with_capacity(images.len());
+        for doc in images {
+            // StackEditor.convertStackToImages never calls
+            // WindowManager.checkForDuplicateName, so two slices with the same
+            // label produce two windows with the same title
+            // (StackEditor.java 272-290).
+            let id = self.insert_doc(doc);
+            self.dirty_images.insert(id);
+            ids.push(id);
+        }
+        self.macro_recorder.push("run(\"Stack to Images\");".into());
+        Ok(CommandOutcome::ImagesOpened(ids))
     }
 
     pub fn dispatch(&mut self, cmd: Command) -> Result<CommandOutcome, SessionError> {
@@ -2432,6 +2625,11 @@ impl Session {
                 };
                 self.dispatch_zproject(options, Some([start,stop]))
             }
+            Command::ImagesToStack { options } => self.dispatch_images_to_stack(options, false),
+            Command::ImagesToStackMacro => {
+                self.dispatch_images_to_stack(ij_core::ImagesToStackOptions::default(), true)
+            }
+            Command::StackToImages => self.dispatch_stack_to_images(),
             Command::SmoothStack => {
                 let doc = self.active_doc_mut()?;
                 let is_stack = doc.stack_size() > 1;

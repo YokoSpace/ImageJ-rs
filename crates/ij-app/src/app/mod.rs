@@ -41,6 +41,7 @@ mod new_image_dialog;
 mod plugin_ops;
 mod plugins_ui;
 mod shortcuts;
+mod stack_convert_dialog;
 mod zproject_dialog;
 pub use self::adjust_dialogs::{
     PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SET_MEASUREMENTS_FIRST_GROUP,
@@ -57,6 +58,7 @@ pub use self::plugin_ops::{
     PluginCatalogCacheLoad, PluginCatalogCacheState, PluginMenuEntry,
     default_plugin_catalog_cache_path, load_plugin_catalog_cache, save_plugin_catalog_cache,
 };
+pub use self::stack_convert_dialog::images_to_stack_size_message;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {

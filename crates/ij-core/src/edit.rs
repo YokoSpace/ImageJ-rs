@@ -80,7 +80,7 @@ pub fn best_lut_index(color: [u8; 3], lut: &Lut256) -> u8 {
 /// index scaled by the current display min/max, with the all-equal-pixels
 /// special cases. The second element is the display range that the
 /// `setMinAndMax(0, 255)` branch installs for an all-zero image.
-fn gray16_value(color: [u8; 3], display_range: DisplayRange) -> (i64, Option<DisplayRange>) {
+pub(crate) fn gray16_value(color: [u8; 3], display_range: DisplayRange) -> (i64, Option<DisplayRange>) {
     let best = i64::from(best_gray_index(color));
     let min = display_range.min;
     let max = display_range.max;
@@ -98,7 +98,7 @@ fn gray16_value(color: [u8; 3], display_range: DisplayRange) -> (i64, Option<Dis
 /// FloatProcessor.setColor value (FloatProcessor.java 1018-1029): the gray
 /// index scaled by the current display min/max as a float, with the same
 /// all-equal-pixels special cases as the 16-bit processor.
-fn gray32_value(color: [u8; 3], display_range: DisplayRange) -> (f32, Option<DisplayRange>) {
+pub(crate) fn gray32_value(color: [u8; 3], display_range: DisplayRange) -> (f32, Option<DisplayRange>) {
     let best = i64::from(best_gray_index(color));
     let min = display_range.min;
     let max = display_range.max;
@@ -119,7 +119,7 @@ fn gray32_value(color: [u8; 3], display_range: DisplayRange) -> (f32, Option<Dis
 
 /// ColorProcessor.setColor / ColorRgb value: an opaque ARGB int
 /// (ColorProcessor.java 113-115; Toolbar colors have full alpha).
-fn rgb_value(color: [u8; 3]) -> u32 {
+pub(crate) fn rgb_value(color: [u8; 3]) -> u32 {
     0xff00_0000
         | (u32::from(color[0]) << 16)
         | (u32::from(color[1]) << 8)

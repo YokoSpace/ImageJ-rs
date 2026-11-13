@@ -62,6 +62,11 @@ impl ImageDocument {
         self.slices.remove(n - 1);
         self.slice_labels.remove(n - 1);
         self.n_slices = self.slices.len() as u32;
+        if self.slices.len() == 1 {
+            if let Some(label) = &self.slice_labels[0] {
+                self.slice_label_property = Some(label.clone());
+            }
+        }
         // StackEditor.java 67-68: `if (n--<1) n = 1;` leaves 0 for n == 1, and
         // ImagePlus.setSlice ignores an index below 1 (ImagePlus.java 1972),
         // so the current slice stays 1 in that case.

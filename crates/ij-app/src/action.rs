@@ -53,6 +53,11 @@ pub enum AppAction {
     /// `Image > Stacks > Delete Slice` (`ij.plugin.StackEditor("delete")`,
     /// IJ_Props.txt 148).
     DeleteSlice,
+    /// `Image > Stacks > Images to Stack` (`ij.plugin.ImagesToStack`).
+    ImagesToStack,
+    /// `Image > Stacks > Stack to Images`
+    /// (`ij.plugin.StackEditor.convertStackToImages`).
+    StackToImages,
     Smooth,
     Sharpen,
     FindEdges,
@@ -232,6 +237,8 @@ const IMAGE_STACKS: &[MenuNode] = &[
     item("Add Slice", None, AppAction::AddSlice),
     item("Delete Slice", None, AppAction::DeleteSlice),
     item("Invert Stack", None, AppAction::InvertStack),
+    item("Images to Stack", None, AppAction::ImagesToStack),
+    item("Stack to Images", None, AppAction::StackToImages),
     item("Z Project...", None, AppAction::ZProject),
 ];
 const IMAGE_TYPE: &[MenuNode] = &[
@@ -852,6 +859,12 @@ impl ImageJApp {
             }
             DeleteSlice => {
                 let _ = self.delete_slice_active();
+            }
+            ImagesToStack => {
+                self.open_images_to_stack_dialog();
+            }
+            StackToImages => {
+                self.run_stack_to_images(ctx);
             }
             Smooth => {
                 let _ = self.smooth_active();
