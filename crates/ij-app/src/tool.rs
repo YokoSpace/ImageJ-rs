@@ -58,25 +58,6 @@ impl Tool {
         }
     }
 
-    pub fn symbol(&self) -> &'static str {
-        match self {
-            Self::Rectangle => "▭",
-            Self::Oval => "⬭",
-            Self::Polygon => "⬡",
-            Self::Freehand => "✎",
-            Self::Line => "╱",
-            Self::Polyline => "☡",
-            Self::Freeline => "〰",
-            Self::Point => "┼",
-            Self::Wand => "🪄",
-            Self::Text => "A",
-            Self::Magnifier => "🔍",
-            Self::Hand => "✋",
-            Self::Dropper => "💧",
-            Self::Angle => "∠",
-        }
-    }
-
     pub fn is_supported(&self) -> bool {
         matches!(
             self,

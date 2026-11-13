@@ -8,6 +8,7 @@ pub mod roi_edit;
 pub mod stack_process;
 pub mod status_text;
 pub mod tool;
+mod toolbar_icons;
 
 pub use app::{ImageJApp, PluginFilterPhase};
 pub use roi_edit::{drag_handle, hit_test, move_by, nudge, nudge_corner, Arrow, RoiHit};

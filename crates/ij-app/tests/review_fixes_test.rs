@@ -270,11 +270,6 @@ fn toolbar_layout_fits_within_680px_without_clipping() {
     );
 
     for tool in Tool::ALL {
-        assert!(
-            !tool.symbol().is_empty(),
-            "Tool {:?} must have a symbol glyph",
-            tool
-        );
         assert!(!tool.name().is_empty(), "Tool {:?} must have a name", tool);
     }
 }
