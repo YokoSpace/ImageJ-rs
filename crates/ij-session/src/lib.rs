@@ -550,6 +550,12 @@ pub enum Command {
     ZProject {
         options: ij_core::ZProjectionOptions,
     },
+    /// Raw GenericDialog numeric fields retain smart-recording text semantics.
+    ZProjectFromDialog {
+        method: ij_core::ZProjectionMethod,
+        start: String,
+        stop: String,
+    },
     /// Whole-stack answers to the "Process Stack?" prompt for the grayscale
     /// filters. Each one records ImageJ's `stack` option
     /// (original_imagej/ij/IJ.java 1287).
@@ -1087,6 +1093,76 @@ impl Session {
         let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
         self.bump_image_revision(id);
         self.images.get_mut(&id).ok_or(SessionError::NoActiveImage)
+    }
+
+    fn dispatch_zproject(
+        &mut self,
+        options: ij_core::ZProjectionOptions,
+        dialog_fields: Option<[String; 2]>,
+    ) -> Result<CommandOutcome, SessionError> {
+        let (stack_size, new_doc) = {
+            let doc = self.active_doc()?;
+            let base = format!("{}{}", options.method.title_prefix(), doc.title);
+            // WindowManager.makeUniqueName (WindowManager.java
+            // 385-387): the prefixed title is kept unless another
+            // image already uses it.
+            let titles: Vec<&str> = self.images.values().map(|doc| doc.title.as_str()).collect();
+            let title = if titles.iter().any(|title| *title == base) {
+                default_duplicate_title(&titles, &base)
+            } else {
+                base
+            };
+            (
+                doc.stack_size() as u32,
+                ij_core::zproject::z_project(doc, &options, title)?,
+            )
+        };
+        let new_id = self.insert_doc(new_doc);
+        self.dirty_images.insert(new_id);
+        // GenericDialog smart recording only emits the Start/Stop
+        // slice fields when the typed text differs from the defaults
+        // (ZProjector.java 164-172, GenericDialog.java 1203-1205);
+        // the Projection type choice is recorded unconditionally
+        // after smart recording is switched off
+        // (ZProjector.java 172-173).
+        let mut parts = Vec::new();
+        let fields = dialog_fields.unwrap_or_else(|| {
+            [
+                format_scale_number(options.start_slice),
+                format_scale_number(options.stop_slice),
+            ]
+        });
+        for (key, text, default) in [
+            ("start", &fields[0], "1".to_string()),
+            ("stop", &fields[1], stack_size.to_string()),
+        ] {
+            if *text != default {
+                let mut recorded = text.as_str();
+                if let Some(value) = recorded.strip_suffix(".0") {
+                    recorded = value;
+                }
+                if let Some(value) = recorded.strip_suffix(".00") {
+                    recorded = value;
+                }
+                parts.push(format!(
+                    "{key}={}",
+                    if recorded.is_empty() {
+                        "[]".into()
+                    } else {
+                        macro_option_value(recorded)
+                    }
+                ));
+            }
+        }
+        parts.push(format!(
+            "projection={}",
+            macro_option_value(options.method.label())
+        ));
+        self.macro_recorder.push(format!(
+            "run(\"Z Project...\", \"{}\");",
+            macro_string(&parts.join(" "))
+        ));
+        Ok(CommandOutcome::ImageOpened(new_id))
     }
 
     pub fn dispatch(&mut self, cmd: Command) -> Result<CommandOutcome, SessionError> {
@@ -2312,49 +2388,12 @@ impl Session {
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
-            Command::ZProject { options } => {
-                let (stack_size, new_doc) = {
-                    let doc = self.active_doc()?;
-                    let base = format!("{}{}", options.method.title_prefix(), doc.title);
-                    // WindowManager.makeUniqueName (WindowManager.java
-                    // 385-387): the prefixed title is kept unless another
-                    // image already uses it.
-                    let titles: Vec<&str> =
-                        self.images.values().map(|doc| doc.title.as_str()).collect();
-                    let title = if titles.iter().any(|title| *title == base) {
-                        default_duplicate_title(&titles, &base)
-                    } else {
-                        base
-                    };
-                    (
-                        doc.stack_size() as u32,
-                        ij_core::zproject::z_project(doc, &options, title)?,
-                    )
+            Command::ZProject { options } => self.dispatch_zproject(options, None),
+            Command::ZProjectFromDialog { method, start, stop } => {
+                let options = ij_core::ZProjectionOptions {
+                    method, start_slice: zproject_dialog_number(&start), stop_slice: zproject_dialog_number(&stop),
                 };
-                let new_id = self.insert_doc(new_doc);
-                self.dirty_images.insert(new_id);
-                // GenericDialog smart recording only emits the Start/Stop
-                // slice fields when the typed text differs from the defaults
-                // (ZProjector.java 164-172, GenericDialog.java 1203-1205);
-                // the Projection type choice is recorded unconditionally
-                // after smart recording is switched off
-                // (ZProjector.java 172-173).
-                let mut parts = Vec::new();
-                let start_text = format_scale_number(options.start_slice);
-                if start_text != "1" {
-                    parts.push(format!("start={start_text}"));
-                }
-                let stop_text = format_scale_number(options.stop_slice);
-                if stop_text != stack_size.to_string() {
-                    parts.push(format!("stop={stop_text}"));
-                }
-                parts.push(format!(
-                    "projection={}",
-                    macro_option_value(options.method.label())
-                ));
-                self.macro_recorder
-                    .push(format!("run(\"Z Project...\", \"{}\");", parts.join(" ")));
-                Ok(CommandOutcome::ImageOpened(new_id))
+                self.dispatch_zproject(options, Some([start,stop]))
             }
             Command::SmoothStack => {
                 let doc = self.active_doc_mut()?;
@@ -3051,6 +3090,97 @@ fn parse_new_image_type(type_name: &str) -> Result<(NewImageType, NewImageFill),
         NewImageFill::White
     };
     Ok((image_type, fill))
+}
+
+// GenericDialog.getNextNumber (1189-1242): lowercase 0x uses parseHex;
+// other fields use Double.valueOf, with invalid input represented as NaN.
+fn zproject_dialog_number(text: &str) -> f64 {
+    if let Some(hex) = text.strip_prefix("0x") {
+        return i32::from_str_radix(hex, 16).unwrap_or(0) as f64;
+    }
+    let number = text.trim_matches(|c: char| c <= '\u{20}');
+    let number = number.strip_suffix(['d', 'D', 'f', 'F']).unwrap_or(number);
+    number
+        .parse()
+        .ok()
+        .or_else(|| zproject_hex_number(number))
+        .unwrap_or(f64::NAN)
+}
+
+// Double.valueOf also accepts signed/uppercase hexadecimal floating values.
+// Retain guard bits and a sticky bit so rounding near an integer slice bound
+// matches Java even when the mantissa has more than 53 significant bits.
+fn zproject_hex_number(text: &str) -> Option<f64> {
+    let (sign, text) = if let Some(s) = text.strip_prefix('-') {
+        (-1.0, s)
+    } else {
+        (1.0, text.strip_prefix('+').unwrap_or(text))
+    };
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))?;
+    let (mantissa, exponent) = text.split_once(['p', 'P'])?;
+    let exp_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exp_digits.is_empty() || !exp_digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let exponent = exponent
+        .parse::<i64>()
+        .unwrap_or(if exponent.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        });
+    let mut significant = 0u64;
+    let mut count = 0i64;
+    let mut sticky = false;
+    let mut any_digit = false;
+    let mut fraction_digits = 0i64;
+    let mut fraction = false;
+    for c in mantissa.chars() {
+        if c == '.' {
+            if fraction {
+                return None;
+            }
+            fraction = true;
+            continue;
+        }
+        let digit = c.to_digit(16)?;
+        any_digit = true;
+        if fraction {
+            fraction_digits += 1;
+        }
+        if count == 0 && digit == 0 {
+            continue;
+        }
+        count += 1;
+        if count <= 15 {
+            significant = significant * 16 + digit as u64;
+        } else {
+            sticky |= digit != 0;
+        }
+    }
+    if !any_digit {
+        return None;
+    }
+    if significant == 0 {
+        return Some(sign * 0.0);
+    }
+    if sticky {
+        significant |= 1;
+    }
+    let power = exponent
+        .saturating_sub(fraction_digits.saturating_mul(4))
+        .saturating_add((count - 15).max(0).saturating_mul(4));
+    // Values outside this range cast to the same out-of-range slice bound.
+    let value = if power > 2000 {
+        f64::INFINITY
+    } else if power < -2000 {
+        0.0
+    } else {
+        significant as f64 * 2.0f64.powi(power as i32)
+    };
+    Some(sign * value)
 }
 
 fn macro_string(value: &str) -> String {

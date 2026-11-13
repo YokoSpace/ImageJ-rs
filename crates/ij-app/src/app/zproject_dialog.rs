@@ -1,13 +1,12 @@
 use super::*;
 use crate::dialogs::ZProjectDialog;
-use ij_core::ZProjectionOptions;
 use ij_core::zproject::{
     Z_PROJECT_INVERTED_LUT_MESSAGE, Z_PROJECT_METHODS, Z_PROJECT_STACK_REQUIRED,
 };
 
 impl ImageJApp {
     /// `Image > Stacks > Z Project...` (ZProjector.run2,
-    /// original_imagej/ij/plugin/ZProjector.java 136-155): a single-slice
+    /// original_imagej/ij/plugin/ZProjector.java 140-155): a single-slice
     /// image errors before the dialog, an inverting LUT warns via
     /// `IJ.showMessageWithCancel`, then the dialog opens.
     pub fn open_zproject_dialog(&mut self) {
@@ -78,13 +77,6 @@ impl ImageJApp {
             return Ok(None);
         }
         let dialog = self.dialogs.zproject.clone();
-        let parse = |field: &str| field.trim().parse::<f64>().ok();
-        let (Some(start), Some(stop)) = (parse(&dialog.start), parse(&dialog.stop)) else {
-            // GenericDialog.getNextNumber flags the field invalid and the
-            // dialog is shown again (GenericDialog.java 1110-1138).
-            self.dialogs.last_error = Some("Invalid numeric field".into());
-            return Ok(None);
-        };
         if dialog.source.is_none() || self.active_image_id() != dialog.source {
             // The projection always targets the image the dialog opened on.
             self.dialogs.last_error = Some("Activate the source image".into());
@@ -95,17 +87,14 @@ impl ImageJApp {
             return Err(err.to_string());
         }
         let method = Z_PROJECT_METHODS[dialog.method_index.min(Z_PROJECT_METHODS.len() - 1)];
-        match self.session.dispatch(Command::ZProject {
-            options: ZProjectionOptions {
-                method,
-                start_slice: start,
-                stop_slice: stop,
-            },
+        // Prefs.set precedes doProjection, even when projection fails.
+        self.dialogs.zproject_method = dialog.method_index.min(Z_PROJECT_METHODS.len() - 1);
+        match self.session.dispatch(Command::ZProjectFromDialog {
+            method,
+            start: dialog.start,
+            stop: dialog.stop,
         }) {
             Ok(CommandOutcome::ImageOpened(id)) => {
-                // Prefs.set(METHOD_KEY, method) stores the choice for the
-                // next invocation (ZProjector.java 173).
-                self.dialogs.zproject_method = dialog.method_index;
                 if let Some(doc) = self.session.get_image(id) {
                     let (width, height, title) = (doc.width, doc.height, doc.title.clone());
                     self.image_views.insert(id, ImageView::new(width, height));
@@ -127,7 +116,7 @@ impl ImageJApp {
     }
 
     /// Content shared by the immediate viewport and headless egui tests, in
-    /// `buildControlDialog` field order (ZProjector.java 289-296).
+    /// `buildControlDialog` field order (ZProjector.java 293-301).
     pub fn render_zproject_content(&mut self, ui: &mut egui::Ui) {
         let mut dialog = self.dialogs.zproject.clone();
         ui.horizontal(|ui| {
@@ -186,7 +175,7 @@ impl ImageJApp {
         }
         if self.dialogs.zproject.open {
             // The Java dialog title is "ZProjection"
-            // (ZProjector.java 288).
+            // (ZProjector.java 293).
             let mut apply = false;
             let mut cancel = false;
             ctx.show_viewport_immediate(

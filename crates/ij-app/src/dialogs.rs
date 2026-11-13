@@ -125,9 +125,9 @@ pub struct MathDialog {
 
 /// Editable state of `Image > Stacks > Z Project...`
 /// (ZProjector.buildControlDialog, original_imagej/ij/plugin/ZProjector.java
-/// 285-297): "Start slice:", "Stop slice:" and the "Projection type" choice.
-/// The numeric fields stay text so an invalid entry re-shows the dialog like
-/// GenericDialog.invalidNumber; `source` pins the image the command ran on.
+/// 293-301): "Start slice:", "Stop slice:" and the "Projection type" choice.
+/// Numeric fields retain the original text for GenericDialog smart recording;
+/// `source` pins the image the command ran on.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ZProjectDialog {
     pub open: bool,

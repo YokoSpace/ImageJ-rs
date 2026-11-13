@@ -79,8 +79,7 @@ pub const Z_PROJECT_EMPTY_RANGE: &str = "Z Project: the slice range contains no 
 /// Warning dialog text `ZProjector.lutMessage` (ZProjector.java 33-36). The
 /// app shows it through `IJ.showMessageWithCancel` before the dialog when the
 /// source has an inverting LUT (ZProjector.java 149-153).
-pub const Z_PROJECT_INVERTED_LUT_MESSAGE: &str =
-    "Stacks with inverting LUTs may not project correctly.\n\
+pub const Z_PROJECT_INVERTED_LUT_MESSAGE: &str = "Stacks with inverting LUTs may not project correctly.\n\
      To create a standard LUT, invert the stack (Edit/Invert)\n\
      and invert the LUT (Image/Lookup Tables/Invert LUT).";
 
@@ -90,6 +89,20 @@ pub const Z_PROJECT_INVERTED_LUT_MESSAGE: &str =
 /// 144-147); the RGB and hyperstack branches are rejected here because this
 /// unit does not implement them.
 pub fn z_project_block_reason(doc: &ImageDocument) -> Option<&'static str> {
+    let Some(first) = doc.slices.first() else {
+        return Some("Z Project: invalid stack layout");
+    };
+    let expected = (doc.width as usize).checked_mul(doc.height as usize);
+    if doc.width == 0
+        || doc.height == 0
+        || expected.is_none()
+        || doc
+            .slices
+            .iter()
+            .any(|p| Some(p.len()) != expected || plane_kind(p) != plane_kind(first))
+    {
+        return Some("Z Project: invalid stack layout");
+    }
     if doc.stack_size() == 1 {
         return Some(Z_PROJECT_STACK_REQUIRED);
     }
@@ -195,8 +208,8 @@ fn java_float_compare(a: f32, b: f32) -> std::cmp::Ordering {
 
 /// `ZProjector.doMedianProjection` (ZProjector.java 618-643): medians are
 /// computed in a FloatProcessor; only 8-bit input converts back to byte
-/// (`convertToByte(false)` → `ByteProcessor.setPixels(0, fp)`, clamping
-/// `value+0.5` into [0,255], ByteProcessor.java 1268-1279). 16-bit input
+/// (`convertToByte(false)` preserves the color model and resets the byte
+/// range to [0,255] in TypeConverter.convertFloatToByte). 16-bit input
 /// therefore produces 32-bit output.
 fn median_projection(
     source: &ImageDocument,
@@ -207,7 +220,7 @@ fn median_projection(
     if slice_count == 0 {
         return Err(CoreError::InvalidOperation(Z_PROJECT_EMPTY_RANGE));
     }
-    let len = (source.width * source.height) as usize;
+    let len = source.slices[0].len();
     let mut out = vec![0f32; len];
     let mut values = vec![0f32; slice_count];
     for (i, pixel) in out.iter_mut().enumerate() {
@@ -242,8 +255,11 @@ fn median_projection(
                 })
                 .collect();
             Ok((
-                PixelPlane::Gray8(pixels),
-                DisplayRange { min: 0.0, max: 255.0 },
+                byte_output(pixels, &source.slices[start], source),
+                DisplayRange {
+                    min: 0.0,
+                    max: 255.0,
+                },
             ))
         }
         Some(PlaneKind::Short) => {
@@ -271,7 +287,7 @@ fn accumulate(
     stop: usize,
     kind: PlaneKind,
 ) -> Vec<f32> {
-    let len = (source.width * source.height) as usize;
+    let len = source.slices[0].len();
     let init = match method {
         ZProjectionMethod::Max => -f32::MAX,
         ZProjectionMethod::Min => f32::MAX,
@@ -325,7 +341,7 @@ fn standard_deviation_projection(
     stop: usize,
     slice_count: usize,
 ) -> Vec<f32> {
-    let len = (source.width * source.height) as usize;
+    let len = source.slices[0].len();
     let mut sum = vec![0f64; len];
     let mut sum2 = vec![0f64; len];
     for slice in &source.slices[start..stop] {
@@ -352,7 +368,7 @@ fn standard_deviation_projection(
 /// 32-bit-only average accumulates in double and ignores NaNs, so a pixel
 /// that is NaN in every slice becomes 0.0/0 → NaN.
 fn average_float_projection(source: &ImageDocument, start: usize, stop: usize) -> Vec<f32> {
-    let len = (source.width * source.height) as usize;
+    let len = source.slices[0].len();
     let mut sum = vec![0f64; len];
     let mut count = vec![0u32; len];
     for slice in &source.slices[start..stop] {
@@ -371,6 +387,19 @@ fn average_float_projection(source: &ImageDocument, start: usize, stop: usize) -
     out
 }
 
+fn byte_output(pixels: Vec<u8>, processor: &PixelPlane, source: &ImageDocument) -> PixelPlane {
+    // run2 converts simpleComposite output to Grays (ZProjector.java 181-182).
+    if source.n_channels as usize != source.stack_size() {
+        if let PixelPlane::Color256 { lut, .. } = processor {
+            return PixelPlane::Color256 {
+                pixels,
+                lut: lut.clone(),
+            };
+        }
+    }
+    PixelPlane::Gray8(pixels)
+}
+
 /// `makeOutputImage` converts the float accumulator back to the input's
 /// processor type for Average/Max/Min (ZProjector.java 549-586). Byte output
 /// gets `ByteProcessor.resetMinAndMax` → 0..255; short/float get the actual
@@ -378,11 +407,19 @@ fn average_float_projection(source: &ImageDocument, start: usize, stop: usize) -
 fn same_type_output(
     fp: &[f32],
     kind: PlaneKind,
+    source: &ImageDocument,
 ) -> (PixelPlane, DisplayRange) {
     match kind {
         PlaneKind::Byte => (
-            PixelPlane::Gray8(fp.iter().map(|&v| narrow_to_byte(v)).collect()),
-            DisplayRange { min: 0.0, max: 255.0 },
+            byte_output(
+                fp.iter().map(|&v| narrow_to_byte(v)).collect(),
+                source.plane(),
+                source,
+            ),
+            DisplayRange {
+                min: 0.0,
+                max: 255.0,
+            },
         ),
         PlaneKind::Short => {
             let pixels: Vec<u16> = fp.iter().map(|&v| narrow_to_short(v)).collect();
@@ -430,8 +467,8 @@ pub fn z_project(
         (start - 1)..stop
     };
 
-    let kind = plane_kind(&source.slices[0])
-        .ok_or(CoreError::InvalidOperation(Z_PROJECT_UNSUPPORTED))?;
+    let kind =
+        plane_kind(&source.slices[0]).ok_or(CoreError::InvalidOperation(Z_PROJECT_UNSUPPORTED))?;
     let (plane, range_display) = match options.method {
         ZProjectionMethod::Median => {
             median_projection(source, range.start, range.end, slice_count)?
@@ -450,8 +487,7 @@ pub fn z_project(
             (PixelPlane::Gray32(fp), range)
         }
         ZProjectionMethod::StandardDeviation => {
-            let result =
-                standard_deviation_projection(source, range.start, range.end, slice_count);
+            let result = standard_deviation_projection(source, range.start, range.end, slice_count);
             let range = float_min_max(&result);
             (PixelPlane::Gray32(result), range)
         }
@@ -465,7 +501,7 @@ pub fn z_project(
                     *acc /= fnum;
                 }
             }
-            same_type_output(&fp, kind)
+            same_type_output(&fp, kind, source)
         }
     };
 

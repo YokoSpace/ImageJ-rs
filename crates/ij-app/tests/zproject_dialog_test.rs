@@ -50,7 +50,8 @@ fn zproject_menu_entry_and_enablement() {
     assert!(app.action_enabled(AppAction::ZProject).is_err());
     let (app, _) = app_with(gray8_stack(3));
     assert!(app.action_enabled(AppAction::ZProject).is_ok());
-    let (app, _) = app_with(ImageDocument::new("one", 4, 3, PixelPlane::Gray8(vec![7; 12])).unwrap());
+    let (app, _) =
+        app_with(ImageDocument::new("one", 4, 3, PixelPlane::Gray8(vec![7; 12])).unwrap());
     assert!(
         app.action_enabled(AppAction::ZProject).is_ok(),
         "single-slice images keep the item enabled like Java"
@@ -142,30 +143,35 @@ fn zproject_cancel_creates_nothing() {
 #[test]
 fn zproject_stack_required_error() {
     let ctx = egui::Context::default();
-    let (mut app, _) = app_with(
-        ImageDocument::new("one", 4, 3, PixelPlane::Gray8(vec![7; 12])).unwrap(),
-    );
+    let (mut app, _) =
+        app_with(ImageDocument::new("one", 4, 3, PixelPlane::Gray8(vec![7; 12])).unwrap());
     // IJ.error("Z Project", "Stack required") precedes the dialog
     // (ZProjector.java 143-147).
     app.perform(AppAction::ZProject, &ctx);
     assert!(!app.dialogs.zproject.open);
-    assert_eq!(
-        app.dialogs.last_error.as_deref(),
-        Some("Stack required")
-    );
+    assert_eq!(app.dialogs.last_error.as_deref(), Some("Stack required"));
 }
 
 #[test]
-fn zproject_invalid_numeric_field_keeps_dialog() {
+fn zproject_invalid_numeric_field_uses_default_bounds() {
     let ctx = egui::Context::default();
-    let (mut app, _) = app_with(gray8_stack(3));
+    let (mut app, source) = app_with(gray8_stack(3));
     app.perform(AppAction::ZProject, &ctx);
     app.dialogs.zproject.start = "abc".into();
-    // GenericDialog.getNextNumber flags the field and re-shows the dialog
-    // (GenericDialog.java 1110-1138).
-    assert!(app.apply_zproject_dialog(&ctx).unwrap().is_none());
-    assert!(app.dialogs.zproject.open);
-    assert!(app.dialogs.last_error.is_some());
+    // GenericDialog.getNextNumber returns NaN; ZProjector never checks
+    // invalidNumber(), so Java's (int)NaN is ignored by setStartSlice.
+    let id = app.apply_zproject_dialog(&ctx).unwrap().unwrap();
+    assert!(!app.dialogs.zproject.open);
+    assert!(app.dialogs.last_error.is_none());
+    assert_eq!(app.session.get_image(source).unwrap().stack_size(), 3);
+    let PixelPlane::Gray8(pixels) = app.session.get_image(id).unwrap().plane() else {
+        panic!("8-bit average")
+    };
+    assert_eq!(pixels[0], 20);
+    assert_eq!(
+        app.session.macro_recorder.last().unwrap(),
+        "run(\"Z Project...\", \"start=abc projection=[Average Intensity]\");"
+    );
 }
 
 #[test]
@@ -259,6 +265,54 @@ fn zproject_inverted_lut_warns_before_dialog() {
     let id = app.apply_zproject_dialog(&ctx).unwrap().unwrap();
     assert!(matches!(
         app.session.get_image(id).unwrap().plane(),
-        PixelPlane::Gray8(_)
+        PixelPlane::Color256 { .. }
     ));
+}
+
+#[test]
+fn zproject_records_original_numeric_fields() {
+    // GenericDialog 1200-1205 compares original text; trim (1245-1250)
+    // removes .0/.00, and Recorder.recordOption keeps hex text verbatim.
+    for (start, stop, expected) in [
+        ("1.0", "3.00", "start=1 stop=3"),
+        ("0x2", "3", "start=0x2"),
+        ("0xz", "3", "start=0xz"),
+        ("2d", "3", "start=2d"),
+    ] {
+        let ctx = egui::Context::default();
+        let (mut app, _) = app_with(gray8_stack(3));
+        app.perform(AppAction::ZProject, &ctx);
+        app.dialogs.zproject.start = start.into();
+        app.dialogs.zproject.stop = stop.into();
+        let id = app.apply_zproject_dialog(&ctx).unwrap().unwrap();
+        assert_eq!(
+            app.session.macro_recorder.last().unwrap(),
+            &format!("run(\"Z Project...\", \"{expected} projection=[Average Intensity]\");")
+        );
+        let PixelPlane::Gray8(pixels) = app.session.get_image(id).unwrap().plane() else {
+            panic!("8-bit average")
+        };
+        assert_eq!(
+            pixels[0],
+            if start == "0x2" || start == "2d" {
+                25
+            } else {
+                20
+            }
+        );
+    }
+}
+
+#[test]
+fn zproject_failed_projection_still_remembers_method() {
+    let ctx = egui::Context::default();
+    let (mut app, _) = app_with(gray8_stack(3));
+    app.perform(AppAction::ZProject, &ctx);
+    app.dialogs.zproject.method_index = 5;
+    app.dialogs.zproject.start = "3".into();
+    app.dialogs.zproject.stop = "1".into();
+    assert!(app.apply_zproject_dialog(&ctx).is_err());
+    assert_eq!(app.dialogs.zproject_method, 5);
+    app.perform(AppAction::ZProject, &ctx);
+    assert_eq!(app.dialogs.zproject.method_index, 5);
 }

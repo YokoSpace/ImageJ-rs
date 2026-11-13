@@ -11,6 +11,45 @@ import sun.misc.Unsafe;
 public final class UiProbe {
     private UiProbe() {}
 
+    /** Reads real non-macro numeric fields without displaying a dialog. */
+    public static String zProjectNumbers(String start, String stop, String stackSize) {
+        String savedMacroOptions = ij.Macro.getOptions();
+        boolean savedRecord = ij.plugin.frame.Recorder.record;
+        ij.gui.GenericDialog dialog = null;
+        boolean disposed = false;
+        try {
+            Field options = ij.plugin.frame.Recorder.class.getDeclaredField("commandOptions");
+            options.setAccessible(true);
+            Object savedOptions = options.get(null);
+            try {
+                ij.Macro.setOptions(null);
+                ij.plugin.frame.Recorder.record = true;
+                dialog = new ij.gui.GenericDialog("ZProjection");
+                dialog.addNumericField("Start slice:", 1, 0);
+                dialog.addNumericField("Stop slice:", Integer.parseInt(stackSize), 0);
+                ((java.awt.TextField)dialog.getNumericFields().get(0)).setText(start);
+                ((java.awt.TextField)dialog.getNumericFields().get(1)).setText(stop);
+                // dispose enables recording just as clicking OK does, without showDialog.
+                dialog.dispose();
+                disposed = true;
+                ij.plugin.frame.Recorder.resetCommandOptions();
+                dialog.setSmartRecording(true);
+                double first = dialog.getNextNumber();
+                double last = dialog.getNextNumber();
+                String recorded = ij.plugin.frame.Recorder.getCommandOptions();
+                return first + "," + last + "|" + (recorded == null ? "" : recorded);
+            } finally {
+                options.set(null, savedOptions);
+            }
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Could not inspect Z Project numeric fields", e);
+        } finally {
+            ij.plugin.frame.Recorder.record = savedRecord;
+            if (dialog != null && !disposed) dialog.dispose();
+            ij.Macro.setOptions(savedMacroOptions);
+        }
+    }
+
     private static ImagePlus currentImage() {
         ImagePlus image = WindowManager.getCurrentImage();
         if (image == null)

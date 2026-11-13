@@ -21923,3 +21923,156 @@ fn parity_zproject_constant_stack() {
         );
     }
 }
+
+#[test]
+fn parity_zproject_indexed_lut_survives_byte_outputs() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut lut = ij_core::Lut256::default();
+    lut.g.fill(0);
+    lut.b.fill(0);
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        [10, 20, 30]
+            .iter()
+            .map(|&v| PixelPlane::Color256 {
+                pixels: vec![v; 12],
+                lut: Box::new(lut.clone()),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let path = dir.path().join(format!("{tag}-rgb.tif"));
+        bridge.run_macro_on_image(&source, &format!(
+            "run(\"Z Project...\", \"projection=[{label}]\"); run(\"RGB Color\"); saveAs(\"Tiff\", \"{}\");",path.display())).unwrap();
+        let oracle = load_tiff(&path).unwrap();
+        let (session, id) = zproject_session(&source, zproject_options(method, 1., 3.));
+        let mut projected = session.get_image(id).unwrap().clone();
+        if matches!(
+            method,
+            ZProjectionMethod::Average
+                | ZProjectionMethod::Max
+                | ZProjectionMethod::Min
+                | ZProjectionMethod::Median
+        ) {
+            assert!(
+                matches!(projected.plane(),PixelPlane::Color256 {lut: actual,..} if **actual == lut),
+                "{label}: missing source LUT"
+            );
+        } else {
+            assert!(matches!(projected.plane(), PixelPlane::Gray32(_)));
+        }
+        projected.convert_to_rgb();
+        assert_plane_matches_oracle_nan_aware(projected.plane(), oracle.plane(), label);
+    }
+}
+
+#[test]
+fn zproject_invalid_stack_layout_returns_error_without_mutation() {
+    let source =
+        ImageDocument::new_stack("invalid", 4, 3, vec![PixelPlane::Gray8(vec![10; 12]); 3])
+            .unwrap();
+    let mut invalid = vec![];
+    let mut doc = source.clone();
+    doc.slices.clear();
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.slices[1] = PixelPlane::Gray8(vec![1; 5]);
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.slices[1] = PixelPlane::Gray16(vec![700; 12]);
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.width = 0;
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.width = u32::MAX;
+    invalid.push(doc);
+    for doc in invalid {
+        let before = doc.clone();
+        for (_, _, method) in ZP_ALL_METHODS {
+            assert!(
+                ij_core::zproject::z_project(&doc, &zproject_options(method, 1., 3.), "out")
+                    .is_err()
+            );
+            assert_eq!(doc, before);
+        }
+    }
+}
+
+#[test]
+fn parity_zproject_dialog_fields_match_real_generic_dialog() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        [10, 20, 30]
+            .iter()
+            .map(|&v| PixelPlane::Gray8(vec![v; 12]))
+            .collect(),
+    )
+    .unwrap();
+    for (start, stop) in [
+        ("1", "3"),
+        ("1.0", "3.00"),
+        ("abc", "3"),
+        ("0x2", "3"),
+        ("0xz", "3"),
+        ("2d", "3"),
+        (" 2 ", "3"),
+        ("", "3"),
+        ("NaN", "3"),
+        ("Infinity", "3"),
+        (" 0x1p1", "3"),
+        ("0X1.8p1", "3"),
+        ("+0x1.ffffffffffffffffp0", "3"),
+        ("-0x1p-2000", "3"),
+    ] {
+        let result=bridge.run_macro_on_image(&source,&format!(
+            "print(\"FIELDS=\"+call(\"tools.oracle.UiProbe.zProjectNumbers\",\"{start}\",\"{stop}\",\"3\"));")).unwrap();
+        let line = oracle_line(&result.stdout, "FIELDS=")
+            .strip_prefix("FIELDS=")
+            .unwrap();
+        let (values, recorded) = line.split_once('|').unwrap();
+        let (first, last) = values.split_once(',').unwrap();
+        let (expected, id) = zproject_session(
+            &source,
+            zproject_options(
+                ZProjectionMethod::Average,
+                first.parse().unwrap(),
+                last.parse().unwrap(),
+            ),
+        );
+        let mut actual = Session::new();
+        actual.insert_doc(source.clone());
+        let CommandOutcome::ImageOpened(output) = actual
+            .dispatch(Command::ZProjectFromDialog {
+                method: ZProjectionMethod::Average,
+                start: start.into(),
+                stop: stop.into(),
+            })
+            .unwrap()
+        else {
+            panic!("projection output")
+        };
+        assert_eq!(
+            actual.get_image(output).unwrap().plane(),
+            expected.get_image(id).unwrap().plane(),
+            "field {start:?}"
+        );
+        let prefix = if recorded.is_empty() {
+            String::new()
+        } else {
+            format!("{recorded} ")
+        };
+        assert_eq!(
+            actual.macro_recorder.last().unwrap(),
+            &format!("run(\"Z Project...\", \"{prefix}projection=[Average Intensity]\");"),
+            "field {start:?}"
+        );
+    }
+}
