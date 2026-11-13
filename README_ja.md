@@ -32,12 +32,13 @@ cargo run --release -p ij-app -- /path/to/image.tif
 - ポイント、角度、折れ線、フリーハンド線、Text、Color Picker を含む全 14 種類のツールバー操作。ROI Manager では選択領域の登録、選択、削除、計測ができます。
 - 表示範囲、Brightness & Contrast、ヒストグラムを伴うしきい値のライブ表示とマスク変換、二値画像の Erode／Dilate／Open／Close、計測、対応コマンドのマクロ記録。
 - Edit → Cut、Copy、Paste、Clear、Fill、Draw。前景色・背景色、ROI マスク、Undo に対応します。
+- File → New → Image、Edit → Clear Outside と Selection → Create Mask/Create Selection、Image → Transform の反転・回転、Image → Adjust → Size。自動しきい値選択は32-bit float画像とスタック全体のヒストグラムにも対応します。
 - Crop、Duplicate、8-bit/16-bit/32-bit/RGB の画像型変換、Set Measurements、Set Scale、Analyze Particles、Histogram、Plot Profile、14 種類の Process → Math 演算、Image Calculator。対応するフィルタ、演算、二値変換はスタックにも適用できます。
 - TIFF、PNG、JPEG の読み書きと Results 表の保存。対応する可逆形式の PNG と TIFF では画素を保持し、JPEG は非可逆圧縮で保存します。
 - ハイパースタックの C/Z/T 操作、スライスのアニメーション再生、ImageJ に合わせた macOS のネイティブメニューバー（ほかの OS ではウィンドウ内メニュー）。
 - 後述する**限定的な範囲**での従来の Java プラグイン実行と、Rust 製画像プラグイン用 API。
 
-[Phase 3 の日常ワークフロー](docs/roadmap_phase3_practical_workflows.md) は、対応する画像形式で実装しました。ただし ImageJ の全機能を再現したわけではなく、一部の TIFF 形式、高度なプラグイン API とダイアログ、専門的な画像コマンドは未対応です。Text は組み込みの小さなビットマップフォントを使用し、32-bit 画像とスタックでは自動しきい値選択を利用できません。以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
+[Phase 3 の日常ワークフロー](docs/roadmap_phase3_practical_workflows.md) と [Phase 4のWave 1](docs/roadmap_phase4_completeness.md) は、テスト対象の画像型で実装しました。ただし ImageJ の全機能を再現したわけではなく、一部の TIFF 形式、高度なプラグイン API とダイアログ、専門的な画像コマンドは未対応です。Text は組み込みの小さなビットマップフォントを使用します。複数領域や穴があり、複合選択領域のShapeRoiを必要とするマスクは未対応です。以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
 
 ## ベンチマーク
 
