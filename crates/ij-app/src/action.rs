@@ -92,6 +92,8 @@ pub enum AppAction {
     PlotProfile,
     SetMeasurements,
     AnalyzeParticles,
+    /// `Analyze > Summarize` (`Analyzer.summarize`, Analyzer.java 888-927).
+    Summarize,
     SetScale,
     ClearResults,
     InstalledPlugins,
@@ -312,6 +314,8 @@ const ANALYZE_MENU: &[MenuNode] = &[
     item("Histogram", Some("H"), AppAction::Histogram),
     item("Clear Results", None, AppAction::ClearResults),
     item("Analyze Particles...", None, AppAction::AnalyzeParticles),
+    // Menus.java 212 places Summarize directly after Analyze Particles.
+    item("Summarize", None, AppAction::Summarize),
     item("Set Measurements...", None, AppAction::SetMeasurements),
     item("Set Scale...", None, AppAction::SetScale),
     item("Plot Profile", Some("K"), AppAction::PlotProfile),
@@ -515,9 +519,9 @@ impl ImageJApp {
             // ImageJ's Analyze menu enables it with no image open.
             NewImage | NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
             | SetMeasurements | RoiManager => Ok(()),
-            SaveResults | ClearResults => {
+            SaveResults | ClearResults | Summarize => {
                 if self.session.results.rows.is_empty() {
-                    Err("No results to save or clear".into())
+                    Err("No results to save, clear or summarize".into())
                 } else {
                     Ok(())
                 }
@@ -966,6 +970,23 @@ impl ImageJApp {
             ClearResults => {
                 let _ = self.session.dispatch(Command::ClearResults);
                 self.status_message = "Results cleared".to_string();
+            }
+            Summarize => {
+                // Analyzer.summarize returns before rt.show when the table has
+                // fewer than two rows or already ends with a "Max" summary row
+                // (Analyzer.java 889-897), so only a real summary opens the
+                // Results window and reports a status.
+                match self.session.dispatch(Command::Summarize) {
+                    Ok(CommandOutcome::Summarized { appended: true }) => {
+                        self.show_results_window = true;
+                        self.status_message = "Summarized results".to_string();
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.status_message = format!("Summarize failed: {error}");
+                        self.dialogs.last_error = Some(format!("Summarize failed: {error}"));
+                    }
+                }
             }
             InstalledPlugins => {
                 let _ = self.open_plugins_browser();

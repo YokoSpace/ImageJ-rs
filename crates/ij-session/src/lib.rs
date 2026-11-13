@@ -613,6 +613,10 @@ pub enum Command {
     /// profile data is returned and `run("Plot Profile");` is recorded.
     PlotProfile,
     ClearResults,
+    /// `Analyze > Summarize` (`Analyzer.summarize`, Analyzer.java 888-927).
+    /// Appends the Mean/SD/Min/Max rows to the existing Results table; the
+    /// active image is not read.
+    Summarize,
     SaveResultsTsv {
         path: PathBuf,
     },
@@ -642,6 +646,10 @@ pub enum CommandOutcome {
     HistogramComputed(HistogramSummary),
     ProfileComputed(ProfileData),
     ResultsCleared,
+    /// `Analyze > Summarize` appended the four summary rows. `appended` is
+    /// false when `Analyzer.summarize` returned before `rt.show`
+    /// (Analyzer.java 889-897).
+    Summarized { appended: bool },
     /// New `minThreshold`/`maxThreshold` state; pixels are unchanged.
     Thresholded(ThresholdLevels),
     /// `resetThreshold()` succeeded; threshold state was cleared and pixels
@@ -915,7 +923,9 @@ impl Session {
             self.bump_image_revision(id);
             self.dirty_images.insert(id);
         }
-        self.results.rows.extend(rows);
+        for row in rows {
+            self.results.push(row);
+        }
         Ok(())
     }
 
@@ -2543,7 +2553,23 @@ impl Session {
                     flags,
                     precision: precision.min(9),
                 };
+                let previous = self.results.config;
+                // Analyzer.setOptions (Analyzer.java 235-255): a changed option
+                // set clears the trailing summary rows and then updates the
+                // columns. Scientific notation is excluded from the comparison
+                // because it only changes formatting.
+                if (previous.flags & !MeasurementFlags::SCIENTIFIC_NOTATION)
+                    != (config.flags & !MeasurementFlags::SCIENTIFIC_NOTATION)
+                    && !self.results.rows.is_empty()
+                {
+                    self.results.clear_summary();
+                    let image = self.active_image.and_then(|id| self.images.get(&id));
+                    self.results.update_columns(config.flags, image);
+                }
                 self.results.config = config;
+                if !config.contains(MeasurementFlags::LABELS) {
+                    self.results.disable_row_labels();
+                }
                 self.macro_recorder.push(format!(
                     "run(\"Set Measurements...\", \"{}\");",
                     measurement_macro_options(config)
@@ -2574,7 +2600,18 @@ impl Session {
                 if clear_results {
                     self.results.clear();
                 }
-                for particle in particles {
+                // ParticleAnalyzer.saveResults delegates to Analyzer.saveResults
+                // (ParticleAnalyzer.java 967-968), which clears the trailing
+                // summary rows before the first particle row is appended and
+                // writes the image name into the Label column when Display
+                // label is on (Analyzer.java 554-555).
+                let particle_label = if self.results.config.contains(MeasurementFlags::LABELS) {
+                    Some(self.active_doc()?.results_label())
+                } else {
+                    None
+                };
+                self.results.clear_summary();
+                for mut particle in particles {
                     if add_to_manager {
                         let doc = self.active_doc()?;
                         self.roi_manager.push(NamedRoi {
@@ -2587,6 +2624,9 @@ impl Session {
                                 .then(|| doc.convert_index_to_position(doc.current_slice as i32))
                                 .transpose()?,
                         });
+                    }
+                    if let Some(label) = &particle_label {
+                        particle.measurement.label = label.clone();
                     }
                     self.results.push(particle.measurement);
                 }
@@ -2656,10 +2696,21 @@ impl Session {
                 Ok(CommandOutcome::Updated)
             }
             Command::Measure => {
-                let rows = self
+                let mut rows = self
                     .active_doc()?
                     .measure_rows_with_config(self.results.config)?;
                 let stats = rows.last().cloned().ok_or(CoreError::EmptySelection)?;
+                // Analyzer.saveResults writes the image name into the Label
+                // column when Display label is on (Analyzer.java 554-555).
+                if self.results.config.contains(MeasurementFlags::LABELS) {
+                    let label = self.active_doc()?.results_label();
+                    for row in &mut rows {
+                        row.label = label.clone();
+                    }
+                }
+                // Analyzer.saveResults clears the trailing summary rows before
+                // it appends (Analyzer.java 544-548, 726-732).
+                self.results.clear_summary();
                 for row in rows {
                     self.results.push(row);
                 }
@@ -2749,6 +2800,11 @@ impl Session {
                 self.results.clear();
                 self.macro_recorder.push("run(\"Clear Results\");".into());
                 Ok(CommandOutcome::ResultsCleared)
+            }
+            Command::Summarize => {
+                let appended = self.results.summarize()?;
+                self.macro_recorder.push("run(\"Summarize\");".into());
+                Ok(CommandOutcome::Summarized { appended })
             }
             Command::SaveResultsTsv { path } => {
                 let tsv = self.results.to_tsv();

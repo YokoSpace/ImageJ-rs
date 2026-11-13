@@ -1,9 +1,10 @@
 use ij_bridge::JavaOracleBridge;
 use ij_core::{
     default_duplicate_title, display_histogram, format_ij_num, CoreError, DisplayHistogram,
-    DisplayRange, ImageDocument, LineRoi, Lut256, MeasurementConfig, MeasurementFlags,
+    DisplayRange, ImageDocument, LineMeasurement, LineRoi, Lut256, MeasurementConfig,
+    MeasurementFlags,
     MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
-    ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions,
+    ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions, RESULT_HEADINGS,
 };
 use ij_io::{load_image, load_tiff, save_jpeg, save_png, save_tiff};
 use ij_session::{Command, CommandOutcome, Session};
@@ -17029,10 +17030,10 @@ fn parity_point_and_multipoint_results_match_java() {
                     ),
                     &format!("p37a_{tag}_{index}_{}", config.flags),
                 );
-                let one_row = ResultsTable {
-                    rows: vec![session.results.rows[index].clone()],
+                let one_row = ResultsTable::from_rows(
+                    vec![session.results.rows[index].clone()],
                     config,
-                };
+                );
                 assert_eq!(one_row.to_tsv().trim(), expected.trim(), "{tag} point {index}: {options}");
             }
         }
@@ -22844,5 +22845,1013 @@ fn parity_slice_edit_rgb_resets_display_range() {
                 max: values[1]
             }
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4.9b: Analyze > Summarize (Analyzer.java 888-927; ResultsTable.java
+// 291-300, 542-545, 556-594, 644-733, 807-839, 1019-1033, 1360-1394).
+// ---------------------------------------------------------------------------
+
+/// Fills the system Results table with `setResult`, the only headless way to
+/// build a multi-row table: a repeated `run("Measure")` resets the counter
+/// because `IJ.isResultsWindow()` is false (Analyzer.java 283-284).
+fn set_result_macro(rows: &[Vec<(&str, f64)>]) -> String {
+    let mut text = String::from("newImage('t','8-bit ramp',16,16,1);");
+    for (row_index, cells) in rows.iter().enumerate() {
+        for (heading, value) in cells {
+            let literal = if value.is_nan() {
+                "0/0".to_string()
+            } else {
+                format!("{value}")
+            };
+            text.push_str(&format!(" setResult('{heading}',{row_index},{literal});"));
+        }
+    }
+    text
+}
+
+/// Rust equivalent of a `setResult` table: each row lists the default
+/// headings it writes and `config` selects exactly those columns.
+fn set_result_table(rows: &[Vec<(&str, f64)>], config: MeasurementConfig) -> ResultsTable {
+    let mut table = ResultsTable::new();
+    table.config = config;
+    for cells in rows {
+        let mut row = MeasurementSummary::default();
+        for (heading, value) in cells {
+            match *heading {
+                "Area" => row.area = *value,
+                "Mean" => row.mean = *value,
+                "StdDev" => row.std_dev = *value,
+                "Min" => row.min = *value,
+                "Max" => row.max = *value,
+                "Median" => row.median = *value,
+                other => panic!("unsupported setResult heading {other}"),
+            }
+        }
+        table.push(row);
+    }
+    table
+}
+
+#[test]
+fn parity_summarize_empty_and_single_row_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Analyzer.java 889 reads rt.getLabel(rt.size()-1) before the n<2 guard,
+    // so an empty table throws "Row out of range" (ResultsTable.java 542-545).
+    let empty = bridge
+        .eval_macro("newImage('t','8-bit ramp',16,16,1); run('Summarize'); print('N='+nResults);")
+        .unwrap();
+    // ImageJ prints the uncaught exception to stdout and keeps running.
+    assert!(
+        empty.stdout.contains("Row out of range")
+            && empty.stdout.contains("Analyzer.summarize(Analyzer.java:889)"),
+        "oracle must reject an empty table:\n{}",
+        empty.stdout
+    );
+    assert_eq!(oracle_line(&empty.stdout, "N="), "N=0");
+
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new_ramp_8bit("t", 16, 16).unwrap());
+    assert!(
+        session.dispatch(Command::Summarize).is_err(),
+        "an empty Results table must fail like Analyzer.java 889"
+    );
+    assert!(session.results.rows.is_empty());
+    assert!(session.macro_recorder.is_empty());
+
+    // One row: Analyzer.java 892-893 returns before touching the table.
+    let rows = vec![vec![("Area", 10.0), ("Mean", 2.0)]];
+    let expected = oracle_saved_results_tsv(
+        &format!("{} run('Summarize');", set_result_macro(&rows)),
+        "summarize_single",
+    );
+    let config = table_config("area mean decimal=3");
+    let mut table = set_result_table(&rows, config);
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new_ramp_8bit("t", 16, 16).unwrap());
+    session.dispatch(Command::Measure).unwrap();
+    let before = session.results.to_tsv();
+    session.dispatch(Command::Summarize).unwrap();
+    assert_eq!(session.results.to_tsv(), before, "one row is a no-op");
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Summarize\");")
+    );
+}
+
+#[test]
+fn parity_summarize_two_rows_matches_java_oracle() {
+    let cases: Vec<(&str, Vec<Vec<(&str, f64)>>, &str)> = vec![
+        (
+            "integer sd keeps AUTO_FORMAT",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+                vec![("Area", 30.0), ("Mean", 6.0), ("Min", 3.0), ("Max", 9.0)],
+            ],
+            "area mean min decimal=3",
+        ),
+        (
+            "fractional sd fixes the column at decimal=2",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+            ],
+            "area mean min decimal=2",
+        ),
+        (
+            "decimal=5",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+            ],
+            "area mean min decimal=5",
+        ),
+        (
+            "scientific notation",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+            ],
+            "area mean min scientific decimal=3",
+        ),
+        (
+            "mean standard median",
+            vec![
+                vec![("Mean", 2.0), ("StdDev", 1.0), ("Median", 2.0)],
+                vec![("Mean", 4.0), ("StdDev", 3.0), ("Median", 5.0)],
+            ],
+            "mean standard median decimal=3",
+        ),
+    ];
+    for (index, (name, rows, options)) in cases.into_iter().enumerate() {
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "{} run('Set Measurements...', '{options}'); run('Summarize');",
+                set_result_macro(&rows)
+            ),
+            &format!("summarize_two_{index}"),
+        );
+        let mut table = set_result_table(&rows, table_config(options));
+        table.summarize().unwrap();
+        assert_eq!(table.to_tsv().trim_end_matches('\n'), expected, "{name}");
+    }
+}
+
+#[test]
+fn parity_summarize_nan_cells_match_java_oracle() {
+    // NaN comparisons are false, so min/max keep the non-NaN bounds while sum
+    // and sum2 turn the Mean/SD cells into NaN (Analyzer.java 907-925).
+    let rows = vec![
+        vec![("Area", 10.0), ("Mean", 2.0)],
+        vec![("Area", f64::NAN), ("Mean", 4.0)],
+    ];
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{} run('Set Measurements...', 'area mean decimal=3'); run('Summarize');",
+            set_result_macro(&rows)
+        ),
+        "summarize_nan",
+    );
+    let mut table = set_result_table(&rows, table_config("area mean decimal=3"));
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_repeated_and_after_new_row_match_java_oracle() {
+    let rows = vec![
+        vec![("Area", 10.0), ("Mean", 2.0)],
+        vec![("Area", 20.0), ("Mean", 4.0)],
+    ];
+    let setup = format!(
+        "{} run('Set Measurements...', 'area mean decimal=3');",
+        set_result_macro(&rows)
+    );
+    let config = table_config("area mean decimal=3");
+
+    // Analyzer.java 889: the second call sees the "Max" label and returns.
+    let repeated = oracle_saved_results_tsv(
+        &format!("{setup} run('Summarize'); run('Summarize');"),
+        "summarize_repeated",
+    );
+    let mut table = set_result_table(&rows, config);
+    table.summarize().unwrap();
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), repeated);
+
+    // A row added after the summary makes the last label null again, so the
+    // next call summarizes all seven rows, summary rows included.
+    let after = oracle_saved_results_tsv(
+        &format!(
+            "{setup} run('Summarize'); setResult('Area',6,5); setResult('Mean',6,1); \
+             run('Summarize');"
+        ),
+        "summarize_after_row",
+    );
+    let mut table = set_result_table(&rows, config);
+    table.summarize().unwrap();
+    table.push(MeasurementSummary {
+        area: 5.0,
+        mean: 1.0,
+        ..Default::default()
+    });
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), after);
+}
+
+#[test]
+fn parity_summarize_clear_then_measure_matches_java_oracle() {
+    let rows = vec![
+        vec![("Area", 10.0), ("Mean", 2.0)],
+        vec![("Area", 20.0), ("Mean", 4.0)],
+    ];
+    // Clear Results resets the table, including the row labels, so the next
+    // measurement has no Label column (ResultsTable.java 1019-1033).
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{} run('Set Measurements...', 'area mean min decimal=3'); run('Summarize'); \
+             run('Clear Results'); makeRectangle(2,3,8,6); run('Measure');",
+            set_result_macro(&rows)
+        ),
+        "summarize_clear",
+    );
+    let config = table_config("area mean min decimal=3");
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags,
+            precision: config.precision,
+        })
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    session.dispatch(Command::ClearResults).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_after_analyze_particles_matches_java_oracle() {
+    let (doc, setup, _blobs) = particle_table_doc();
+    let options = "area mean min decimal=3";
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{setup} setThreshold(200,255); run('Set Measurements...', '{options}'); \
+             run('Analyze Particles...', 'size=0-Infinity display clear'); run('Summarize');"
+        ),
+        "summarize_particles",
+    );
+    let config = table_config(options);
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags,
+            precision: config.precision,
+        })
+        .unwrap();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::AnalyzeParticles {
+            options: ParticleAnalysisOptions {
+                black_background: true,
+                ..Default::default()
+            },
+            clear_results: true,
+            add_to_manager: false,
+            summarize: false,
+        })
+        .unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end_matches('\n'), expected);
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Summarize\");")
+    );
+
+    // Save As > Results writes the same labeled table (ResultsTable.java
+    // 1360-1394).
+    let path = std::env::temp_dir().join(format!(
+        "p4_9b_summarize_save_{}.tsv",
+        std::process::id()
+    ));
+    session
+        .dispatch(Command::SaveResultsTsv { path: path.clone() })
+        .unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(path);
+    assert_eq!(saved.trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_missing_cells_count_as_zero_match_java_oracle() {
+    // A table with an Area row and a Length row: ResultsTable.getValue returns
+    // the zero an unwritten cell holds, so summarize includes it
+    // (ResultsTable.java 470-480, 907-915).
+    let expected = oracle_saved_results_tsv(
+        "newImage('t','8-bit ramp',16,16,1); setResult('Area',0,10); \
+         setResult('Length',1,5); run('Summarize');",
+        "summarize_missing",
+    );
+    let mut table = ResultsTable::new();
+    table.config = MeasurementConfig {
+        flags: MeasurementFlags::AREA,
+        precision: 3,
+    };
+    table.push(MeasurementSummary {
+        area: 10.0,
+        ..Default::default()
+    });
+    table.push(MeasurementSummary {
+        line: Some(LineMeasurement {
+            length: 5.0,
+            angle: 0.0,
+            show_angle: false,
+        }),
+        ..Default::default()
+    });
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_fixes_columns_beyond_the_first_24_rows_match_java_oracle() {
+    // setValue has no counter<25 guard, so a summary row past index 24 still
+    // fixes its column's decimal places (ResultsTable.java 556-594), while the
+    // integer measurement rows alone would keep AUTO_FORMAT.
+    let rows: Vec<Vec<(&str, f64)>> = (0..30)
+        .map(|index| {
+            vec![
+                ("Area", (index + 1) as f64),
+                ("Mean", index as f64 * 0.5),
+            ]
+        })
+        .collect();
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{} run('Set Measurements...', 'area mean decimal=3'); run('Summarize');",
+            set_result_macro(&rows)
+        ),
+        "summarize_beyond_24",
+    );
+    let mut table = set_result_table(&rows, table_config("area mean decimal=3"));
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+}
+
+// ---------------------------------------------------------------------------
+// P4.9b lifecycle corrections: the real Analyzer/ResultsTable sequence.
+//
+// Headless `run("Measure")` cannot accumulate rows because
+// `Analyzer.displayResults` deletes the rows it cannot show when no Results
+// window exists (Analyzer.java 845-865). `UiProbe.resultsLifecycle` installs a
+// real TextPanel as `IJ.textPanel` and drives `Analyzer.saveResults`,
+// `summarize`, `clearSummary`, `setOptions` and `ResultsTable.update`
+// directly, so the window-present branches run.
+// ---------------------------------------------------------------------------
+
+/// One step of the Results lifecycle, shared by the Java probe script and the
+/// Rust session so both sides run the same sequence.
+#[derive(Clone, Copy, Debug)]
+enum ResultsStep {
+    Measure,
+    MeasurePoint(i32, i32),
+    MeasureAngle([i32; 6]),
+    MeasureLine([i32; 4]),
+    Summarize,
+    SetMeasurements(u32, u8),
+}
+
+impl ResultsStep {
+    fn probe_op(self) -> String {
+        match self {
+            Self::Measure => "measure".to_string(),
+            Self::MeasurePoint(x, y) => format!("measurePoint:{x},{y}"),
+            Self::MeasureAngle(p) => format!(
+                "measureAngle:{},{},{},{},{},{}",
+                p[0], p[1], p[2], p[3], p[4], p[5]
+            ),
+            Self::MeasureLine(p) => format!("measureLine:{},{},{},{}", p[0], p[1], p[2], p[3]),
+            Self::Summarize => "summarize".to_string(),
+            Self::SetMeasurements(flags, precision) => format!("set:{flags}:{precision}"),
+        }
+    }
+}
+
+/// Runs the probe script in the Java oracle and returns
+/// `size=<n>;labels=<0|1>` plus the saved table.
+fn oracle_results_lifecycle(steps: &[ResultsStep], tag: &str) -> (String, String) {
+    oracle_results_lifecycle_image(steps, tag, "newImage('t','8-bit ramp',16,16,1);")
+}
+
+fn oracle_results_lifecycle_image(steps: &[ResultsStep], tag: &str, image_macro: &str) -> (String, String) {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let path = std::env::temp_dir().join(format!("p4_9b_life_{}_{tag}.tsv", std::process::id()));
+    let path_text = path.to_str().unwrap();
+    let script: Vec<String> = steps.iter().map(|step| step.probe_op()).collect();
+    let output = bridge
+        .eval_macro(&format!(
+            "{image_macro} makeRectangle(2,3,8,6); \
+             print('STATUS='+call('tools.oracle.UiProbe.resultsLifecycle','{}')); \
+             saveAs('Results','{path_text}'); print('TSV_BEGIN'); \
+             print(File.openAsString('{path_text}'));",
+            script.join(";")
+        ))
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = output.stdout.replace("\r\n", "\n");
+    let status = oracle_line(&stdout, "STATUS=")
+        .trim_start_matches("STATUS=")
+        .split(";resultsWindow=")
+        .next()
+        .unwrap()
+        .to_string();
+    let (_, tsv) = stdout
+        .split_once("TSV_BEGIN\n")
+        .unwrap_or_else(|| panic!("oracle did not print the saved table:\n{stdout}"));
+    (status, tsv.trim_end_matches('\n').to_string())
+}
+
+/// Runs the same steps through `Session::dispatch` and returns the same
+/// `size=<n>;labels=<0|1>` status plus the table.
+fn rust_results_lifecycle(steps: &[ResultsStep]) -> (String, String) {
+    rust_results_lifecycle_image(steps, ImageDocument::new_ramp_8bit("t", 16, 16).unwrap())
+}
+
+fn rust_results_lifecycle_image(steps: &[ResultsStep], mut doc: ImageDocument) -> (String, String) {
+    let mut session = Session::new();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    for step in steps {
+        match *step {
+            ResultsStep::Measure => {
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::MeasurePoint(x, y) => {
+                session
+                    .dispatch(Command::MakePointRoi {
+                        points: vec![(x, y)],
+                    })
+                    .unwrap();
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::MeasureAngle(p) => {
+                session
+                    .dispatch(Command::MakeAngleRoi {
+                        points: [(p[0], p[1]), (p[2], p[3]), (p[4], p[5])],
+                    })
+                    .unwrap();
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::MeasureLine(p) => {
+                session
+                    .dispatch(Command::MakeLineRoi {
+                        x1: p[0],
+                        y1: p[1],
+                        x2: p[2],
+                        y2: p[3],
+                    })
+                    .unwrap();
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::Summarize => {
+                session.dispatch(Command::Summarize).unwrap();
+            }
+            ResultsStep::SetMeasurements(flags, precision) => {
+                session
+                    .dispatch(Command::SetMeasurements { flags, precision })
+                    .unwrap();
+            }
+        }
+    }
+    let tsv = session.results.to_tsv().trim_end_matches('\n').to_string();
+    let status = format!(
+        "size={};labels={}",
+        session.results.rows.len(),
+        u8::from(tsv.starts_with(" \tLabel\t"))
+    );
+    (status, tsv)
+}
+
+/// Asserts that Rust and Java agree on both the table and its label state.
+fn assert_results_lifecycle(steps: &[ResultsStep], tag: &str) {
+    let (java_status, java_tsv) = oracle_results_lifecycle(steps, tag);
+    let (rust_status, rust_tsv) = rust_results_lifecycle(steps);
+    assert_eq!(rust_status, java_status, "{tag}: table size and label state");
+    assert_eq!(rust_tsv, java_tsv, "{tag}: saved table");
+}
+
+#[test]
+fn parity_summarize_measure_after_summary_keeps_rows_match_java_oracle() {
+    // Analyzer.saveResults calls clearSummary before appending
+    // (Analyzer.java 544-548), and clearSummary deletes exactly four rows when
+    // the last label is "Max" (Analyzer.java 726-732). Two input rows survive
+    // and the new measurement is appended: three rows, not one.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::Measure,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f1_measure");
+    assert_eq!(java_status, "size=3;labels=1");
+    assert_results_lifecycle(&steps, "f1_measure");
+}
+
+#[test]
+fn parity_summarize_measure_point_angle_and_line_clear_summary_match_java_oracle() {
+    // measurePoint/measureAngle/measureLength all reach saveResults, so the
+    // trailing summary rows are cleared for every ROI kind
+    // (Analyzer.java 379-525).
+    let cases: [(&str, [ResultsStep; 4]); 3] = [
+        (
+            "point",
+            [
+                ResultsStep::MeasurePoint(3, 4),
+                ResultsStep::MeasurePoint(5, 6),
+                ResultsStep::Summarize,
+                ResultsStep::MeasurePoint(7, 8),
+            ],
+        ),
+        (
+            "angle",
+            [
+                ResultsStep::MeasureAngle([2, 2, 6, 6, 10, 2]),
+                ResultsStep::MeasureAngle([3, 3, 7, 7, 11, 3]),
+                ResultsStep::Summarize,
+                ResultsStep::MeasureAngle([4, 4, 8, 8, 12, 4]),
+            ],
+        ),
+        (
+            "line",
+            [
+                ResultsStep::MeasureLine([2, 2, 10, 10]),
+                ResultsStep::MeasureLine([3, 3, 11, 11]),
+                ResultsStep::Summarize,
+                ResultsStep::MeasureLine([4, 4, 12, 12]),
+            ],
+        ),
+    ];
+    for (tag, steps) in cases {
+        let (java_status, _) = oracle_results_lifecycle(&steps, &format!("f1_{tag}"));
+        assert_eq!(java_status, "size=3;labels=1", "{tag}");
+        assert_results_lifecycle(&steps, &format!("f1_{tag}"));
+    }
+}
+
+#[test]
+fn parity_summarize_particles_after_summary_clear_it_match_java_oracle() {
+    // ParticleAnalyzer.saveResults delegates to Analyzer.saveResults
+    // (ParticleAnalyzer.java 967-968), so a particle run after Summarize
+    // deletes the four summary rows before appending its own.
+    let (doc, setup, _blobs) = particle_table_doc();
+    let options = "area mean min decimal=3";
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{setup} setThreshold(200,255); run('Set Measurements...', '{options}'); \
+             run('Analyze Particles...', 'size=0-Infinity display clear'); run('Summarize'); \
+             run('Analyze Particles...', 'size=0-Infinity display');"
+        ),
+        "summarize_particles_after",
+    );
+    let config = table_config(options);
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags,
+            precision: config.precision,
+        })
+        .unwrap();
+    session.insert_doc(doc);
+    let particles = Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions {
+            black_background: true,
+            ..Default::default()
+        },
+        clear_results: true,
+        add_to_manager: false,
+        summarize: false,
+    };
+    session.dispatch(particles).unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    session
+        .dispatch(Command::AnalyzeParticles {
+            options: ParticleAnalysisOptions {
+                black_background: true,
+                ..Default::default()
+            },
+            clear_results: false,
+            add_to_manager: false,
+            summarize: false,
+        })
+        .unwrap();
+    assert_eq!(session.results.rows.len(), 6);
+    assert_eq!(session.results.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_set_measurements_same_flags_disables_labels_match_java_oracle() {
+    // Analyzer.setOptions disables row labels whenever Display label is off,
+    // even when no measurement option changed (Analyzer.java 253-254). The
+    // summary rows stay because clearSummary is only reached on a change.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f2_same");
+    assert_eq!(java_status, "size=6;labels=0");
+    assert!(!java_tsv.starts_with(" \tLabel\t"), "{java_tsv}");
+    assert_results_lifecycle(&steps, "f2_same");
+}
+
+#[test]
+fn parity_set_measurements_same_flags_then_measure_keeps_summary_match_java_oracle() {
+    // With rowLabels null, getLabel returns null (ResultsTable.java 542-548),
+    // so the next saveResults cannot recognise the trailing "Max" row and the
+    // summary rows survive the new measurement.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 3),
+        ResultsStep::Measure,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f2_same_measure");
+    assert_eq!(java_status, "size=7;labels=0");
+    assert_results_lifecycle(&steps, "f2_same_measure");
+}
+
+#[test]
+fn parity_set_measurements_same_flags_then_summarize_restacks_match_java_oracle() {
+    // The same null label defeats the summarize guard (Analyzer.java 889), so
+    // a second Summarize recomputes over all six rows and appends four more.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 3),
+        ResultsStep::Summarize,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f2_same_summarize");
+    assert_eq!(java_status, "size=10;labels=1");
+    assert_results_lifecycle(&steps, "f2_same_summarize");
+}
+
+#[test]
+fn parity_set_measurements_labels_on_keeps_labels_match_java_oracle() {
+    // With Display label on, rt2 built by update() has row labels, so
+    // ResultsTable.update keeps them (ResultsTable.java 1165-1170).
+    let steps = [
+        ResultsStep::SetMeasurements(1043, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(1043, 3),
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f2_labels_on");
+    assert_eq!(java_status, "size=6;labels=1");
+    assert_results_lifecycle(&steps, "f2_labels_on");
+
+    let cleared = [
+        ResultsStep::SetMeasurements(1043, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(1043, 3),
+        ResultsStep::Measure,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&cleared, "f2_labels_on_measure");
+    assert_eq!(java_status, "size=3;labels=1");
+    assert_results_lifecycle(&cleared, "f2_labels_on_measure");
+}
+
+#[test]
+fn parity_set_measurements_removed_flags_drop_columns_match_java_oracle() {
+    // Analyzer.saveResults writes measurement cells through the int addValue
+    // overload, which never sets keep[] (ResultsTable.java 190-218, 245, 263),
+    // so update() drops the Mean/Min/Max columns when the new option set omits
+    // them (ResultsTable.java 1150-1163).
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(1, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f3_removed");
+    assert_eq!(java_status, "size=2;labels=0");
+    assert_eq!(java_tsv.lines().next().unwrap(), " \tArea\t");
+    assert_results_lifecycle(&steps, "f3_removed");
+}
+
+#[test]
+fn parity_set_measurements_new_flags_allocate_zero_columns_match_java_oracle() {
+    // update() allocates a newly selected column with zeros for the rows that
+    // already exist (ResultsTable.java 1155-1161); it never re-derives them
+    // from the stored statistics.
+    let steps = [
+        ResultsStep::SetMeasurements(1, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f3_new");
+    assert_eq!(java_status, "size=2;labels=0");
+    assert_eq!(
+        java_tsv,
+        " \tArea\tMean\tMin\tMax\n1\t48\t0\t0\t0\n2\t48\t0\t0\t0"
+    );
+    assert_results_lifecycle(&steps, "f3_new");
+
+    let measured = [
+        ResultsStep::SetMeasurements(1, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19, 3),
+        ResultsStep::Measure,
+    ];
+    assert_results_lifecycle(&measured, "f3_new_measure");
+}
+
+#[test]
+fn parity_set_measurements_precision_and_scientific_keep_summary_match_java_oracle() {
+    // A precision-only change and a scientific-notation change both skip the
+    // clearSummary/update branch (Analyzer.java 243-249 excludes
+    // SCIENTIFIC_NOTATION), so the summary rows survive while the labels are
+    // still disabled.
+    let precision = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 5),
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&precision, "f3_precision");
+    assert_eq!(java_status, "size=6;labels=0");
+    assert_results_lifecycle(&precision, "f3_precision");
+
+    let scientific = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(2_097_171, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&scientific, "f3_scientific");
+    assert_eq!(java_status, "size=6;labels=0");
+    assert!(java_tsv.contains("4.800E1"), "{java_tsv}");
+    assert_results_lifecycle(&scientific, "f3_scientific");
+}
+
+#[test]
+fn parity_nan_empty_cells_use_the_allocation_time_option_match_java_oracle() {
+    // rt.setNaNEmptyCells is only refreshed by an Analyzer constructor
+    // (Analyzer.java 57-64, 81-90), so update() fills a new column with NaN
+    // only when the option was already on before the dialog ran.
+    let steps = [
+        ResultsStep::SetMeasurements(8_388_609, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(8_388_627, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f10_nan");
+    assert_eq!(java_status, "size=2;labels=0");
+    assert_eq!(
+        java_tsv,
+        " \tArea\tMean\tMin\tMax\n1\t48\tNaN\tNaN\tNaN\n2\t48\tNaN\tNaN\tNaN"
+    );
+    assert_results_lifecycle(&steps, "f10_nan");
+
+    // The same sequence with the option off allocates zeros instead.
+    let zeros = [
+        ResultsStep::SetMeasurements(1, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19, 3),
+    ];
+    assert_results_lifecycle(&zeros, "f10_zeros");
+}
+
+#[test]
+fn parity_summarize_nan_empty_cells_aggregate_like_java_oracle() {
+    // NaN cells make sum/sum2 NaN, so Mean and SD become NaN, while the
+    // min/max comparisons stay false and keep the Double.MAX_VALUE bounds
+    // (Analyzer.java 907-925).
+    let steps = [
+        ResultsStep::SetMeasurements(8_388_609, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(8_388_627, 3),
+        ResultsStep::Summarize,
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f10_nan_summary");
+    assert_eq!(java_status, "size=6;labels=1");
+    assert!(java_tsv.contains("\n5\tMin\t48\t1.798E308"), "{java_tsv}");
+    assert_results_lifecycle(&steps, "f10_nan_summary");
+}
+
+#[test]
+fn parity_summarize_clear_summary_deletes_exactly_four_rows_match_java_oracle() {
+    // Analyzer.clearSummary (Analyzer.java 726-732) is the only place that
+    // removes summary rows; it needs size>=4 and a trailing "Max" label.
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let path = std::env::temp_dir().join(format!("p4_9b_clear_{}.tsv", std::process::id()));
+    let path_text = path.to_str().unwrap();
+    let output = bridge
+        .eval_macro(&format!(
+            "newImage('t','8-bit ramp',16,16,1); makeRectangle(2,3,8,6); \
+             print('STATUS='+call('tools.oracle.UiProbe.resultsLifecycle',\
+             'measure;measure;summarize;clearSummary')); \
+             saveAs('Results','{path_text}'); print('TSV_BEGIN'); \
+             print(File.openAsString('{path_text}'));"
+        ))
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = output.stdout.replace("\r\n", "\n");
+    assert_eq!(
+        oracle_line(&stdout, "STATUS=")
+            .trim_start_matches("STATUS=")
+            .split(";resultsWindow=")
+            .next()
+            .unwrap(),
+        "size=2;labels=1"
+    );
+    let (_, java_tsv) = stdout.split_once("TSV_BEGIN\n").unwrap();
+
+    let mut session = Session::new();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    session.results.clear_summary();
+    assert_eq!(session.results.rows.len(), 2);
+    assert_eq!(
+        session.results.to_tsv().trim_end_matches('\n'),
+        java_tsv.trim_end_matches('\n')
+    );
+}
+
+#[test]
+fn parity_summarize_save_after_config_change_matches_java_oracle() {
+    // Save As > Results writes whatever the table holds after the lifecycle
+    // (ResultsTable.java 1360-1394).
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(147, 3),
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f3_save");
+    assert_eq!(java_status, "size=7;labels=1");
+    assert_results_lifecycle(&steps, "f3_save");
+
+    let mut session = Session::new();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    for step in steps {
+        match step {
+            ResultsStep::Measure => {
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::Summarize => {
+                session.dispatch(Command::Summarize).unwrap();
+            }
+            ResultsStep::SetMeasurements(flags, precision) => {
+                session
+                    .dispatch(Command::SetMeasurements { flags, precision })
+                    .unwrap();
+            }
+            other => panic!("unexpected step {other:?}"),
+        }
+    }
+    let path = std::env::temp_dir().join(format!("p4_9b_save_{}.tsv", std::process::id()));
+    session
+        .dispatch(Command::SaveResultsTsv { path: path.clone() })
+        .unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(path);
+    assert_eq!(saved.trim_end_matches('\n'), java_tsv);
+}
+
+#[test]
+fn summarize_table_to_tsv_basic_falls_back_to_the_full_renderer() {
+    // to_tsv_basic is the Vertical Slice 1 evidence renderer: it prints the
+    // Area/Mean/Min/Max columns only. A summary table has no such shape, so
+    // the documented contract is a full-renderer fallback instead of printing
+    // summary statistics as fake zeros.
+    let mut table = ResultsTable::new();
+    table.push(MeasurementSummary {
+        area: 10.0,
+        mean: 2.0,
+        min: 1.0,
+        max: 3.0,
+        ..Default::default()
+    });
+    table.push(MeasurementSummary {
+        area: 20.0,
+        mean: 4.0,
+        min: 2.0,
+        max: 6.0,
+        ..Default::default()
+    });
+    assert_eq!(
+        table.to_tsv_basic(),
+        table.to_tsv(),
+        "ordinary slice-1 tables keep the basic shape"
+    );
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv_basic(), table.to_tsv());
+    assert!(table.to_tsv_basic().starts_with(" \tLabel\tArea\tMean\tMin\tMax\n"));
+}
+
+#[test]
+fn summary_row_cells_are_indexed_by_the_public_heading_order() {
+    // SummaryRow.cells is indexed by ResultsTable's default headings; the
+    // order must be public so plugin consumers can read a cell safely.
+    let mut table = ResultsTable::new();
+    table.push(MeasurementSummary {
+        area: 10.0,
+        mean: 2.0,
+        min: 1.0,
+        max: 3.0,
+        ..Default::default()
+    });
+    table.push(MeasurementSummary {
+        area: 20.0,
+        mean: 4.0,
+        min: 2.0,
+        max: 6.0,
+        ..Default::default()
+    });
+    table.summarize().unwrap();
+    let mean = table
+        .rows
+        .iter()
+        .find_map(|row| row.summary.as_ref().filter(|summary| summary.label == "Mean"))
+        .expect("Mean summary row");
+    assert_eq!(mean.cell("Area"), Some(15.0));
+    assert_eq!(mean.cell("Mean"), Some(3.0));
+    assert_eq!(mean.cell("Perim."), None, "column absent from the table");
+    assert_eq!(RESULT_HEADINGS[0], "Area");
+    assert_eq!(RESULT_HEADINGS.len(), mean.cells.len());
+}
+
+
+#[test]
+fn parity_set_measurements_removed_then_readded_column_matches_java_oracle() {
+    for (tag, flags) in [("readd_zero", 19), ("readd_fractional", 23), ("readd_nan", 19 | 8_388_608)] {
+        let mut steps = vec![
+            ResultsStep::SetMeasurements(flags, 3),
+            ResultsStep::Measure,
+            ResultsStep::Measure,
+            ResultsStep::SetMeasurements((flags & 8_388_608) | 1, 3),
+            ResultsStep::SetMeasurements(flags, 3),
+        ];
+        assert_results_lifecycle(&steps, tag);
+        steps.push(ResultsStep::Summarize);
+        assert_results_lifecycle(&steps, &format!("{tag}_summary"));
+        steps.push(ResultsStep::Measure);
+        assert_results_lifecycle(&steps, &format!("{tag}_measure"));
+    }
+}
+
+#[test]
+fn parity_set_measurements_limit_and_stack_position_allocate_columns() {
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19 | 256 | 1_048_576, 3),
+    ];
+    assert_results_lifecycle(&steps, "limit_position_2d");
+    for (tag, kind, c, z, t) in [
+        ("stack", "8-bit ramp", 1, 2, 1),
+        ("hyperstack", "8-bit ramp", 2, 2, 2),
+        ("rgb", "RGB black", 1, 1, 1),
+    ] {
+        let slices = c * z * t;
+        let mut doc = if kind == "RGB black" {
+            ImageDocument::new("t", 16, 16, PixelPlane::ColorRgb(vec![0xff000000; 256])).unwrap()
+        } else {
+            let plane = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap().plane().clone();
+            ImageDocument::new_stack("t", 16, 16, vec![plane; slices as usize]).unwrap()
+        };
+        doc.set_dimensions(c, z, t).unwrap();
+        let dimensions = if slices > 1 { format!("Stack.setDimensions({c},{z},{t});") } else { String::new() };
+        let image_macro = format!("newImage('t','{kind}',16,16,{slices}); {dimensions}");
+        let java = oracle_results_lifecycle_image(&steps, tag, &image_macro);
+        let rust = rust_results_lifecycle_image(&steps, doc);
+        assert_eq!(rust, java, "{tag}: updated columns and values");
     }
 }
