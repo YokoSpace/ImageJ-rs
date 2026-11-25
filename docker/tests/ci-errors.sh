@@ -89,6 +89,16 @@ run3=$(run_dir "$fixture/case3.out")
 if ! grep -q 'desktop-smoke' "$STUB_CALLS" && ! grep -q ' cp ' "$STUB_CALLS"; then echo 'PASS no smoke/evidence without marker'; else echo 'FAIL smoke/evidence ran without marker'; fail=1; fi
 [ -s "$run3/docker-logs.txt" ] && echo 'PASS docker-logs.txt saved' || { echo 'FAIL docker-logs.txt missing'; fail=1; }
 
+# A zero smoke exit without the native-window marker must stop before evidence copy.
+: > "$STUB_CALLS"
+STUB_VERIFY_MARKER=1 STUB_SMOKE_RC=0 STUB_SMOKE_MARKER=0 \
+  "$fixture/repo/docker/ci" check > "$fixture/missing-smoke.out" 2>&1 && rc=0 || rc=$?
+note 1 "$rc" 'missing desktop marker fails check'
+if grep -q '^compose cp desktop:/workspace/verification/evidence/latest' "$STUB_CALLS"; then
+  echo 'FAIL evidence copied without desktop marker'
+  fail=1
+fi
+
 # Case 4: all green -> check exits 0 and prints both markers and evidence path.
 : > "$STUB_CALLS"
 STUB_UP_RC=0 STUB_VERIFY_RC=0 STUB_VERIFY_MARKER=1 STUB_SMOKE_RC=0 STUB_SMOKE_MARKER=1 STUB_CP_RC=0 \

@@ -70,3 +70,9 @@ id=$(./docker/ci windows | awk -F '\t' '$2 == "ImageJ 1.54u" {print $1; exit}')
 Desktop CI は push、pull request、手動実行で起動する。`docker/tests/ci-errors.sh` でラッパーの異常系を先に試し、Linux で最終ゲートを実行する。Actions の `desktop-evidence` アーティファクトには成功時も失敗時もその時点までのログが入る。保存期間は7日間。
 
 報告には Issue の受け入れ条件、RED/GREEN のテスト名、最終ゲートの終了コードとマーカー、証跡のパスを記す。停止条件に達した場合は、失敗したステップ、最初の原因行、試した修正を残す。
+
+## 検証コンテナの後片付け
+
+gate の前に `docker ps -as --filter label=com.docker.compose.service=desktop` で停止済みも含めて名前・状態・writable layer のサイズを確認する。前の Issue の検証コンテナが約 2.44 GB を保持し、次のビルドで容量が尽きた事例がある。
+
+自分の検証が終わったら、成功時は evidence のコピー後、失敗時は必要なログ・診断資料を退避した後に、起動時と同じ作業ディレクトリ・Compose 設定で `./docker/ci down` を実行する。プロジェクト名を指定した場合は down にも同じ `COMPOSE_PROJECT_NAME` を渡す。上記の一覧で対象コンテナの削除を確認する。別作業で使用中の desktop はそのままにする。
