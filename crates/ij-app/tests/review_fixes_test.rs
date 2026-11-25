@@ -1,6 +1,6 @@
 use egui::{Context, Pos2, RawInput, Stroke, Vec2};
 use ij_app::app::{ImageJApp, draw_ellipse_stroke};
-use ij_app::pixel_render::plane_to_rgba;
+use ij_app::pixel_render::{plane_to_rgba, plane_to_rgba_with_lut};
 use ij_app::tool::Tool;
 use ij_core::{
     DisplayRange, ImageDocument, Lut256, PixelPlane, Roi, ThresholdLevels, format_ij_num,
@@ -142,6 +142,19 @@ fn rgb_does_not_threshold() {
     let rgba = plane_to_rgba(&plane, 1, 1, range, thresh);
     // RGB must remain original RGB colors unchanged
     assert_eq!(&rgba[0..4], &[10, 20, 30, 255]);
+}
+
+#[test]
+fn gray16_inverted_display_lut_renders_zero_as_white() {
+    let plane = PixelPlane::Gray16(vec![0, 65535]);
+    let range = DisplayRange {
+        min: 0.0,
+        max: 65535.0,
+    };
+    let lut = Lut256::default().inverted();
+    let rgba = plane_to_rgba_with_lut(&plane, 2, 1, range, None, Some(&lut));
+    assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
+    assert_eq!(&rgba[4..8], &[0, 0, 0, 255]);
 }
 
 #[test]

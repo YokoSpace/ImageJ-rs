@@ -355,16 +355,39 @@ fn validate_lut(lut: &Lut256) -> Result<(), IoError> {
 
 /// Describes a slice's on-disk encoding and encoded byte length without
 /// copying pixels, so an oversized stack can be rejected before allocating.
-fn plane_encoding_info(plane: &PixelPlane) -> Result<PlaneEncodingInfo, IoError> {
+fn plane_encoding_info(
+    plane: &PixelPlane,
+    display_lut: Option<&Lut256>,
+) -> Result<PlaneEncodingInfo, IoError> {
+    if let Some(lut) = display_lut {
+        validate_lut(lut)?;
+    }
+    let display_palette = display_lut.map(|lut| Box::new(lut.clone()));
+    let inverted = display_lut.is_some_and(Lut256::is_inverted);
     let (bits_per_sample, samples_per_pixel, sample_format, photometric, palette, bytes_per_pixel) =
         match plane {
-            PixelPlane::Gray8(_) => (8, 1, 1, 1, None, 1usize),
+            PixelPlane::Gray8(_) => {
+                if display_palette.is_some() {
+                    // ImagePlus.getFileInfo saves any non-default 8-bit LUT as
+                    // COLOR8, even when it is an inverted grayscale LUT
+                    // (ImagePlus.java 2409-2418).
+                    (8, 1, 1, 3, display_palette, 1usize)
+                } else {
+                    (8, 1, 1, 1, None, 1usize)
+                }
+            }
             PixelPlane::Color256 { lut, .. } => {
                 validate_lut(lut)?;
                 (8, 1, 1, 3, Some(lut.clone()), 1usize)
             }
-            PixelPlane::Gray16(_) => (16, 1, 1, 1, None, 2),
-            PixelPlane::Gray32(_) => (32, 1, 3, 1, None, 4),
+            PixelPlane::Gray16(_) => {
+                let photometric = if inverted { 0 } else { 1 };
+                (16, 1, 1, photometric, display_palette, 2)
+            }
+            PixelPlane::Gray32(_) => {
+                let photometric = if inverted { 0 } else { 1 };
+                (32, 1, 3, photometric, display_palette, 4)
+            }
             PixelPlane::ColorRgb(_) => (8, 3, 1, 2, None, 3),
         };
     let data_len = plane
@@ -779,10 +802,17 @@ pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoEr
         return Err(IoError::UnsupportedFormat("empty image stack".into()));
     }
 
+    let display_lut = match doc.plane() {
+        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => doc
+            .display_lut
+            .as_ref()
+            .filter(|lut| !lut.is_default()),
+        PixelPlane::Color256 { .. } | PixelPlane::ColorRgb(_) => None,
+    };
     let infos: Vec<PlaneEncodingInfo> = doc
         .slices
         .iter()
-        .map(plane_encoding_info)
+        .map(|plane| plane_encoding_info(plane, display_lut))
         .collect::<Result<_, _>>()?;
     let first = &infos[0];
     for (index, info) in infos.iter().enumerate() {
@@ -1772,9 +1802,15 @@ fn parse_ifd(
         } else if ignored_gray16 {
             color_map = None;
         } else {
-            return Err(IoError::UnsupportedFormat(format!(
-                "ColorMap display LUT on a {bits_per_sample}-bit PhotometricInterpretation={photo_interp} image cannot be represented; ImageJ applies it as the processor LUT (FileOpener.createColorModel)"
-            )));
+            let display_lut_grayscale = samples_per_pixel == 1
+                && photo_interp <= 1
+                && ((bits_per_sample == 16 && sample_format == 1)
+                    || (bits_per_sample == 32 && sample_format == 3));
+            if !display_lut_grayscale {
+                return Err(IoError::UnsupportedFormat(format!(
+                    "ColorMap display LUT on a {bits_per_sample}-bit PhotometricInterpretation={photo_interp} image cannot be represented; ImageJ applies it as the processor LUT (FileOpener.createColorModel)"
+                )));
+            }
         }
     }
 
@@ -2091,7 +2127,7 @@ fn read_color_map(bytes: &[u8], start: usize, le: bool) -> Result<Box<Lut256>, I
 /// image becomes `Color256` carrying the LUT, a GRAY16_UNSIGNED image without
 /// an ImageDescription ignores it exactly like Java's `lutSize = 0` fallback,
 /// and a LUT that ImageJ would apply to a 16-bit (with description) or 32-bit
-/// display is rejected because those planes have no LUT field.
+/// display is restored as the document-level display LUT.
 ///
 /// Metadata that `ImageDocument` cannot represent is rejected instead of being
 /// dropped: custom channel LUTs (`luts`), non-uniform per-channel display
@@ -2308,6 +2344,13 @@ pub fn load_tiff(path: impl AsRef<Path>) -> Result<ImageDocument, IoError> {
         .to_string();
 
     let mut doc = ImageDocument::new_stack(title, w, h, planes)?;
+    if matches!(doc.plane(), PixelPlane::Gray16(_) | PixelPlane::Gray32(_)) {
+        if let Some(format) = &first_format {
+            if let Some(lut) = &format.palette {
+                doc.display_lut = Some((**lut).clone());
+            }
+        }
+    }
     if let Some(props) = &props {
         validate_description_metadata(props)?;
     }
@@ -3895,7 +3938,7 @@ mod tests {
         assert_eq!(doc.slices, vec![PixelPlane::Gray16(values.to_vec())]);
 
         // A description of at least 7 characters makes Java keep and apply the
-        // LUT, which Gray16 cannot represent.
+        // LUT as the processor display LUT.
         let description = b"ImageJ=1.54u\n\0";
         let mut data = pixel_bytes.clone();
         data.extend_from_slice(&map);
@@ -3909,15 +3952,13 @@ mod tests {
             description.len() as u32,
             description_offset as u32,
         ));
-        let err = load_fixture("gray16_color_map_desc", &make_tiff(&entries, &data)).unwrap_err();
-        assert!(
-            err.to_string().contains("16-bit") && err.to_string().contains("LUT"),
-            "unexpected error: {err}"
-        );
+        let doc = load_fixture("gray16_color_map_desc", &make_tiff(&entries, &data)).unwrap();
+        assert_eq!(doc.slices, vec![PixelPlane::Gray16(values.to_vec())]);
+        assert_eq!(doc.display_lut, Some(fixture_lut(3)));
     }
 
     #[test]
-    fn tiff_gray32_color_map_is_rejected() {
+    fn tiff_gray32_color_map_becomes_display_lut() {
         let pixel_bytes: Vec<u8> = [0.5f32, 1.5, 2.5, 3.5]
             .iter()
             .flat_map(|value| value.to_le_bytes())
@@ -3928,13 +3969,9 @@ mod tests {
         let mut entries = base_entries(2, 2, 32, 1, 3, 1, pixel_bytes.len() as u32);
         entries.push((TAG_COLOR_MAP, 3, 768, (8 + pixel_bytes.len()) as u32));
 
-        // 32-bit files keep the LUT regardless of the description, and Float32
-        // has no LUT field in the Rust model.
-        let err = load_fixture("gray32_color_map", &make_tiff(&entries, &data)).unwrap_err();
-        assert!(
-            err.to_string().contains("32-bit") && err.to_string().contains("LUT"),
-            "unexpected error: {err}"
-        );
+        // 32-bit files keep the LUT regardless of the description.
+        let doc = load_fixture("gray32_color_map", &make_tiff(&entries, &data)).unwrap();
+        assert_eq!(doc.display_lut, Some(fixture_lut(3)));
     }
 
     #[test]

@@ -177,6 +177,28 @@ impl Lut256 {
     pub fn is_color(&self) -> bool {
         (0..256).any(|i| self.r[i] != self.g[i] || self.g[i] != self.b[i])
     }
+
+    /// `ImageProcessor.isDefaultLut` (ImageProcessor.java 387-410): entrywise
+    /// equality with the ascending grayscale LUT, not object identity.
+    pub fn is_default(&self) -> bool {
+        self.r.len() == 256
+            && self.g.len() == 256
+            && self.b.len() == 256
+            && (0..256).all(|i| {
+                self.r[i] == i as u8 && self.g[i] == i as u8 && self.b[i] == i as u8
+            })
+    }
+
+    /// `ImageProcessor.invertLut` (ImageProcessor.java 224-245): reverse all
+    /// three LUT channels without changing pixels or the display range.
+    pub fn inverted(&self) -> Self {
+        let reverse = |channel: &[u8]| channel.iter().rev().copied().collect();
+        Self {
+            r: reverse(&self.r),
+            g: reverse(&self.g),
+            b: reverse(&self.b),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1505,6 +1527,10 @@ pub struct ImageDocument {
     /// One-based (channel, slice, frame) (ImagePlus.position).
     pub position: [u32; 3],
     pub display_range: DisplayRange,
+    /// Display LUT for grayscale planes. `None` is ImageJ's default ascending
+    /// grayscale LUT; indexed-color planes carry their LUT in `PixelPlane`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_lut: Option<Lut256>,
     pub calibration: Calibration,
     pub roi: Option<Roi>,
     /// Active threshold levels (`ImageProcessor.NO_THRESHOLD` is modelled as
@@ -1580,6 +1606,7 @@ impl ImageDocument {
             current_slice: 1,
             position: [1, 1, 1],
             display_range,
+            display_lut: None,
             calibration: Calibration::default(),
             roi: None,
             threshold: None,
@@ -2966,6 +2993,56 @@ impl ImageDocument {
         self.snapshot = None;
         self.snapshot_dimensions = None;
         self.snapshot_display_range = None;
+    }
+
+    /// Inverts the current display LUT without changing pixels, matching
+    /// `LutLoader.invertLut` (LutLoader.java 162-182). Grayscale documents
+    /// store the processor LUT at document level because ImageJ shares one
+    /// color model across a stack; indexed-color planes already carry theirs.
+    pub fn invert_lut(&mut self) -> Result<(), CoreError> {
+        let index = self.current_slice_index();
+        match &self.slices[index] {
+            PixelPlane::ColorRgb(_) => {
+                return Err(CoreError::InvalidOperation("RGB images do not use LUTs"));
+            }
+            PixelPlane::Color256 { .. } => {
+                for plane in &mut self.slices {
+                    if let PixelPlane::Color256 { lut, .. } = plane {
+                        *lut = Box::new(lut.inverted());
+                    }
+                }
+            }
+            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
+                let lut = self.display_lut.clone().unwrap_or_default();
+                self.display_lut = Some(lut.inverted());
+            }
+        }
+        Ok(())
+    }
+
+    /// The display LUT for the current plane. RGB planes do not use LUTs;
+    /// grayscale planes fall back to ImageJ's default grayscale LUT, which is
+    /// represented by `None` until a command materializes an inversion.
+    pub fn current_display_lut(&self) -> Option<&Lut256> {
+        match self.plane() {
+            PixelPlane::Color256 { lut, .. } => Some(lut),
+            PixelPlane::ColorRgb(_) => None,
+            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
+                self.display_lut.as_ref()
+            }
+        }
+    }
+
+    /// `ImageProcessor.isInvertedLut` for the current display LUT.
+    pub fn current_lut_is_inverted(&self) -> bool {
+        match self.plane() {
+            PixelPlane::Color256 { lut, .. } => lut.is_inverted(),
+            PixelPlane::ColorRgb(_) => false,
+            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => self
+                .display_lut
+                .as_ref()
+                .is_some_and(Lut256::is_inverted),
+        }
     }
 
     /// Inverts the current stack slice, matching `run("Invert", "slice")`.

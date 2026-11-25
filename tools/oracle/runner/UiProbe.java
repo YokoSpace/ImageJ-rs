@@ -106,6 +106,34 @@ public final class UiProbe {
         }
     }
 
+
+    /** Reports the current processor LUT inversion state and selected entries. */
+    public static String lutState(String indicesCsv) {
+        ImagePlus image = currentImage();
+        ij.process.ImageProcessor ip = image.getProcessor();
+        if (!(ip.getColorModel() instanceof java.awt.image.IndexColorModel))
+            return "cm=none";
+        java.awt.image.IndexColorModel cm = (java.awt.image.IndexColorModel)ip.getColorModel();
+        StringBuilder out = new StringBuilder();
+        out.append("inv=").append(ip.isInvertedLut())
+            .append(";color=").append(ip.isColorLut())
+            .append(";min=").append(ip.getMin())
+            .append(";max=").append(ip.getMax())
+            .append(";changes=").append(image.changes)
+            .append(";entries=");
+        boolean first = true;
+        for (String part : indicesCsv.split(",")) {
+            int index = Integer.parseInt(part.trim());
+            if (!first) out.append(',');
+            first = false;
+            out.append(index).append(':')
+                .append(cm.getRed(index)).append(',')
+                .append(cm.getGreen(index)).append(',')
+                .append(cm.getBlue(index));
+        }
+        return out.toString();
+    }
+
     private static ImagePlus currentImage() {
         ImagePlus image = WindowManager.getCurrentImage();
         if (image == null)

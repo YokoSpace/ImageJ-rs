@@ -1,4 +1,4 @@
-use ij_core::{DisplayRange, PixelPlane, ThresholdLevels};
+use ij_core::{DisplayRange, Lut256, PixelPlane, ThresholdLevels};
 
 /// Converts an ImageJ PixelPlane into an RGBA8 buffer of size (width * height * 4).
 /// Respects DisplayRange (brightness & contrast) and ThresholdLevels (red highlight).
@@ -8,6 +8,20 @@ pub fn plane_to_rgba(
     height: u32,
     range: DisplayRange,
     threshold: Option<ThresholdLevels>,
+) -> Vec<u8> {
+    plane_to_rgba_with_lut(plane, width, height, range, threshold, None)
+}
+
+/// LUT-aware variant used for document rendering. `display_lut` is the
+/// document-level processor LUT for grayscale planes; indexed-color planes
+/// always use the LUT stored in the plane itself.
+pub fn plane_to_rgba_with_lut(
+    plane: &PixelPlane,
+    width: u32,
+    height: u32,
+    range: DisplayRange,
+    threshold: Option<ThresholdLevels>,
+    display_lut: Option<&Lut256>,
 ) -> Vec<u8> {
     let count = (width as usize).saturating_mul(height as usize);
     let mut rgba = vec![255u8; count * 4];
@@ -28,10 +42,17 @@ pub fn plane_to_rgba(
                         continue;
                     }
                 }
-                let norm = ((p as f64 - range.min) / span * 255.0).clamp(0.0, 255.0) as u8;
-                rgba[off] = norm;
-                rgba[off + 1] = norm;
-                rgba[off + 2] = norm;
+                let norm = ((p as f64 - range.min) / span * 255.0).clamp(0.0, 255.0) as usize;
+                if let Some(lut) = display_lut {
+                    rgba[off] = lut.r[norm];
+                    rgba[off + 1] = lut.g[norm];
+                    rgba[off + 2] = lut.b[norm];
+                } else {
+                    let n = norm as u8;
+                    rgba[off] = n;
+                    rgba[off + 1] = n;
+                    rgba[off + 2] = n;
+                }
                 rgba[off + 3] = 255;
             }
         }
@@ -76,10 +97,17 @@ pub fn plane_to_rgba(
                         continue;
                     }
                 }
-                let norm = ((p as f64 - range.min) / span * 255.0).clamp(0.0, 255.0) as u8;
-                rgba[off] = norm;
-                rgba[off + 1] = norm;
-                rgba[off + 2] = norm;
+                let norm = ((p as f64 - range.min) / span * 255.0).clamp(0.0, 255.0) as usize;
+                if let Some(lut) = display_lut {
+                    rgba[off] = lut.r[norm];
+                    rgba[off + 1] = lut.g[norm];
+                    rgba[off + 2] = lut.b[norm];
+                } else {
+                    let n = norm as u8;
+                    rgba[off] = n;
+                    rgba[off + 1] = n;
+                    rgba[off + 2] = n;
+                }
                 rgba[off + 3] = 255;
             }
         }
@@ -96,10 +124,17 @@ pub fn plane_to_rgba(
                         continue;
                     }
                 }
-                let norm = ((p as f64 - range.min) / span * 255.0).clamp(0.0, 255.0) as u8;
-                rgba[off] = norm;
-                rgba[off + 1] = norm;
-                rgba[off + 2] = norm;
+                let norm = ((p as f64 - range.min) / span * 255.0).clamp(0.0, 255.0) as usize;
+                if let Some(lut) = display_lut {
+                    rgba[off] = lut.r[norm];
+                    rgba[off + 1] = lut.g[norm];
+                    rgba[off + 2] = lut.b[norm];
+                } else {
+                    let n = norm as u8;
+                    rgba[off] = n;
+                    rgba[off + 1] = n;
+                    rgba[off + 2] = n;
+                }
                 rgba[off + 3] = 255;
             }
         }

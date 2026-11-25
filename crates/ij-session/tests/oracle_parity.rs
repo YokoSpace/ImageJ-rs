@@ -5188,6 +5188,16 @@ fn fixture_color_map(seed: u8) -> Vec<u8> {
     map
 }
 
+fn fixture_lut(seed: u8) -> Lut256 {
+    let mut lut = Lut256::default();
+    for i in 0..256 {
+        lut.r[i] = (i as u8).wrapping_add(seed);
+        lut.g[i] = (255 - i) as u8;
+        lut.b[i] = seed;
+    }
+    lut
+}
+
 /// Palette whose signed-byte channel sum is zero (red entries 1 and 255), so
 /// TiffDecoder leaves the 8-bit FileInfo at GRAY8 while still installing the
 /// palette as the processor's display LUT.
@@ -5702,19 +5712,18 @@ fn gray16_color_map_is_ignored_only_without_description_like_java() {
     for path in [&no_description, &short_description] {
         let doc = load_tiff(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert_eq!(doc.slices, expected, "{}", path.display());
+        assert_eq!(doc.display_lut, None, "{}", path.display());
     }
 
-    // With a description ImageJ keeps the palette and applies it to the
-    // 8-bit projection of the 16-bit data; Gray16 has no LUT field.
-    let err = load_tiff(&long_description).unwrap_err();
-    assert!(
-        err.to_string().contains("16-bit") && err.to_string().contains("LUT"),
-        "expected an explicit 16-bit display LUT error, got: {err}"
-    );
+    // With a description ImageJ keeps the palette and applies it as the
+    // processor display LUT (FileOpener.createColorModel).
+    let doc = load_tiff(&long_description).unwrap();
+    assert_eq!(doc.slices, expected);
+    assert_eq!(doc.display_lut, Some(fixture_lut(3)));
 }
 
 #[test]
-fn gray32_color_map_is_rejected_because_java_applies_the_lut() {
+fn gray32_color_map_becomes_display_lut_like_java() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let data: Vec<u8> = [0.5f32, 1.5, 2.5, 3.5]
         .iter()
@@ -5753,11 +5762,14 @@ fn gray32_color_map_is_rejected_because_java_applies_the_lut() {
     assert_eq!(oracle_line(&oracle.stdout, "LONG:"), "LONG:3,4,254,3");
 
     for path in [&no_description, &with_description] {
-        let err = load_tiff(path).unwrap_err();
-        assert!(
-            err.to_string().contains("32-bit") && err.to_string().contains("LUT"),
-            "expected an explicit 32-bit display LUT error, got: {err}"
+        let doc = load_tiff(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(
+            doc.slices,
+            vec![PixelPlane::Gray32(vec![0.5, 1.5, 2.5, 3.5])],
+            "{}",
+            path.display()
         );
+        assert_eq!(doc.display_lut, Some(fixture_lut(3)), "{}", path.display());
     }
 }
 
@@ -26191,4 +26203,170 @@ fn parity_images_to_stack_rgb_processor_display_range_is_default() {
         parse_minmax(stack_convert_field(&oracle.stdout, "MINMAX")),
         "RGB stack processor limits",
     );
+}
+
+
+fn lut_probe_line<'a>(stdout: &'a str, prefix: &str) -> &'a str {
+    oracle_line(stdout, prefix).strip_prefix(prefix).unwrap()
+}
+
+#[test]
+fn parity_invert_lut_gray16_is_display_only() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut original = pattern_16bit("lut16.tif", 4, 2, &[0, 1000, 2000, 65535, 7, 8, 9, 10]);
+    original.display_range = DisplayRange {
+        min: 0.0,
+        max: 65535.0,
+    };
+    let oracle = bridge
+        .run_macro_on_image(
+            &original,
+            "print(\"BEFORE=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,1,128,255\")); run(\"Invert LUT\"); print(\"AFTER=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,1,128,255\"));",
+        )
+        .unwrap();
+    let before = lut_probe_line(&oracle.stdout, "BEFORE=");
+    let after = lut_probe_line(&oracle.stdout, "AFTER=");
+    assert!(before.contains("inv=false"), "before: {before}");
+    assert!(before.contains("entries=0:0,0,0,1:1,1,1"), "before: {before}");
+    assert!(after.contains("inv=true"), "after: {after}");
+    assert!(after.contains("changes=false"), "after: {after}");
+    assert!(after.contains("entries=0:255,255,255,1:254,254,254"), "after: {after}");
+    assert!(after.contains("128:127,127,127"), "after: {after}");
+    assert!(after.contains("255:0,0,0"), "after: {after}");
+    let oracle_doc = oracle.output_image.expect("oracle must return the TIFF");
+    assert_eq!(oracle_doc.slices, original.slices, "Invert LUT must not edit pixels");
+
+    let rust_dir = tempfile::tempdir().unwrap();
+    let rust_path = rust_dir.path().join(original.title.clone());
+    save_tiff(&rust_path, &original).unwrap();
+    let mut session = Session::new();
+    let id = match session
+        .dispatch(Command::OpenTiff { path: rust_path })
+        .unwrap()
+    {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("expected ImageOpened, got {other:?}"),
+    };
+    session.dispatch(Command::InvertLut).unwrap();
+    let rust = session.get_image(id).unwrap();
+    assert_eq!(rust.slices, original.slices, "Invert LUT must not edit pixels");
+    assert_eq!(rust.display_range, original.display_range);
+    assert!(rust.current_lut_is_inverted());
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Invert LUT\");")
+    );
+    assert!(!session.is_dirty(id), "ImagePlus.changes remains false for display-only inversion");
+}
+
+#[test]
+fn parity_invert_lut_indexed_color_reverses_every_channel() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let r: Vec<u8> = (0..=255).collect();
+    let g: Vec<u8> = (0..=255).map(|v| 255 - v).collect();
+    let b: Vec<u8> = (0..=255u32).map(|v| ((v * 37) % 256) as u8).collect();
+    let lut = Lut256 { r, g, b };
+    let original = ImageDocument::new(
+        "lut-indexed.tif",
+        2,
+        2,
+        PixelPlane::Color256 {
+            pixels: vec![0, 1, 128, 255],
+            lut: Box::new(lut.clone()),
+        },
+    )
+    .unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &original,
+            "run(\"Invert LUT\"); print(\"AFTER=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,1,255\"));",
+        )
+        .unwrap();
+    let after = lut_probe_line(&oracle.stdout, "AFTER=");
+    let expected_entry = |index: u8| {
+        let source = 255 - index;
+        format!(
+            "{index}:{},{},{}",
+            lut.r[source as usize], lut.g[source as usize], lut.b[source as usize]
+        )
+    };
+    for index in [0u8, 1, 255] {
+        assert!(
+            after.contains(&expected_entry(index)),
+            "missing reversed entry {} in {after}",
+            expected_entry(index)
+        );
+    }
+    let oracle_doc = oracle.output_image.expect("oracle must return the TIFF");
+    let expected_lut = lut.inverted();
+    let PixelPlane::Color256 {
+        pixels: oracle_pixels,
+        lut: oracle_lut,
+    } = oracle_doc.plane()
+    else {
+        panic!("oracle output must remain indexed")
+    };
+    assert_eq!(oracle_pixels, &vec![0, 1, 128, 255], "Invert LUT must not edit pixels");
+    assert_eq!(oracle_lut.as_ref(), &expected_lut);
+
+    let rust_dir = tempfile::tempdir().unwrap();
+    let rust_path = rust_dir.path().join(original.title.clone());
+    save_tiff(&rust_path, &original).unwrap();
+    let mut session = Session::new();
+    let id = match session
+        .dispatch(Command::OpenTiff { path: rust_path })
+        .unwrap()
+    {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("expected ImageOpened, got {other:?}"),
+    };
+    session.dispatch(Command::InvertLut).unwrap();
+    let rust = session.get_image(id).unwrap();
+    let PixelPlane::Color256 { pixels, lut: rust_lut } = rust.plane() else {
+        panic!("indexed input must remain indexed")
+    };
+    assert_eq!(pixels, &vec![0, 1, 128, 255]);
+    for index in 0..256usize {
+        let source = 255 - index;
+        assert_eq!(rust_lut.r[index], lut.r[source], "red[{index}]");
+        assert_eq!(rust_lut.g[index], lut.g[source], "green[{index}]");
+        assert_eq!(rust_lut.b[index], lut.b[source], "blue[{index}]");
+    }
+}
+
+
+#[test]
+fn parity_inverted_gray16_display_lut_survives_rust_tiff_for_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = pattern_16bit("rust-inverted-lut.tif", 2, 2, &[0, 1, 32768, 65535]);
+    doc.invert_lut().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rust-inverted-lut.tif");
+    save_tiff(&path, &doc).unwrap();
+
+    let java = bridge
+        .eval_macro(&format!(
+            "open(\"{}\"); print(\"STATE=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,255\"));",
+            path.display()
+        ))
+        .unwrap();
+    let state = lut_probe_line(&java.stdout, "STATE=");
+    assert!(state.contains("inv=true"), "state: {state}");
+    assert!(state.contains("entries=0:255,255,255,255:0,0,0"), "state: {state}");
+
+    let reopened = load_tiff(&path).unwrap();
+    assert_eq!(reopened.slices, doc.slices);
+    assert!(reopened.current_lut_is_inverted());
+    assert_eq!(reopened.display_lut, doc.display_lut);
+}
+
+#[test]
+fn invert_lut_rejects_rgb_without_pixels_or_recording() {
+    let mut session = Session::new();
+    let doc = ImageDocument::new("rgb.tif", 1, 1, PixelPlane::ColorRgb(vec![0xff112233])).unwrap();
+    let id = session.insert_doc(doc);
+    let error = session.dispatch(Command::InvertLut).unwrap_err().to_string();
+    assert!(error.ends_with("RGB images do not use LUTs"), "error: {error}");
+    assert_eq!(session.get_image(id).unwrap().slices[0], PixelPlane::ColorRgb(vec![0xff112233]));
+    assert!(session.macro_recorder.is_empty());
 }
