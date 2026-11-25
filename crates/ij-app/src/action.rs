@@ -45,6 +45,19 @@ pub enum AppAction {
     BrightnessContrast,
     Threshold,
     InvertStack,
+    /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`).
+    ZProject,
+    /// `Image > Stacks > Add Slice` (`ij.plugin.StackEditor("add")`,
+    /// IJ_Props.txt 147). Alt inserts the blank slice before the current one.
+    AddSlice,
+    /// `Image > Stacks > Delete Slice` (`ij.plugin.StackEditor("delete")`,
+    /// IJ_Props.txt 148).
+    DeleteSlice,
+    /// `Image > Stacks > Images to Stack` (`ij.plugin.ImagesToStack`).
+    ImagesToStack,
+    /// `Image > Stacks > Stack to Images`
+    /// (`ij.plugin.StackEditor.convertStackToImages`).
+    StackToImages,
     Smooth,
     Sharpen,
     FindEdges,
@@ -84,6 +97,8 @@ pub enum AppAction {
     PlotProfile,
     SetMeasurements,
     AnalyzeParticles,
+    /// `Analyze > Summarize` (`Analyzer.summarize`, Analyzer.java 888-927).
+    Summarize,
     SetScale,
     ClearResults,
     InstalledPlugins,
@@ -217,7 +232,15 @@ const IMAGE_ADJUST: &[MenuNode] = &[
     ),
     item("Threshold...", None, AppAction::Threshold),
 ];
-const IMAGE_STACKS: &[MenuNode] = &[item("Invert Stack", None, AppAction::InvertStack)];
+const IMAGE_STACKS: &[MenuNode] = &[
+    // IJ_Props.txt 147-148: stacks01/stacks02 lead the Image/Stacks submenu.
+    item("Add Slice", None, AppAction::AddSlice),
+    item("Delete Slice", None, AppAction::DeleteSlice),
+    item("Invert Stack", None, AppAction::InvertStack),
+    item("Images to Stack", None, AppAction::ImagesToStack),
+    item("Stack to Images", None, AppAction::StackToImages),
+    item("Z Project...", None, AppAction::ZProject),
+];
 const IMAGE_TYPE: &[MenuNode] = &[
     item("8-bit", None, AppAction::ConvertTo8Bit),
     item("16-bit", None, AppAction::ConvertTo16Bit),
@@ -298,6 +321,8 @@ const ANALYZE_MENU: &[MenuNode] = &[
     item("Histogram", Some("H"), AppAction::Histogram),
     item("Clear Results", None, AppAction::ClearResults),
     item("Analyze Particles...", None, AppAction::AnalyzeParticles),
+    // Menus.java 212 places Summarize directly after Analyze Particles.
+    item("Summarize", None, AppAction::Summarize),
     item("Set Measurements...", None, AppAction::SetMeasurements),
     item("Set Scale...", None, AppAction::SetScale),
     item("Plot Profile", Some("K"), AppAction::PlotProfile),
@@ -501,9 +526,9 @@ impl ImageJApp {
             // ImageJ's Analyze menu enables it with no image open.
             NewImage | NewRamp | OpenTiff | Quit | InstalledPlugins | ToggleResults | About
             | SetMeasurements | RoiManager => Ok(()),
-            SaveResults | ClearResults => {
+            SaveResults | ClearResults | Summarize => {
                 if self.session.results.rows.is_empty() {
-                    Err("No results to save or clear".into())
+                    Err("No results to save, clear or summarize".into())
                 } else {
                     Ok(())
                 }
@@ -610,6 +635,18 @@ impl ImageJApp {
                         _ => Err("Binary conversion requires a grayscale image".into()),
                     },
                     RunPluginFilter if self.is_plugin_filter_running() => Err("A PlugInFilter is already executing".into()),
+                    // StackEditor routes a hyperstack or composite to the
+                    // C/Z/T dialog (StackEditor.java 31-34, 54-57), which
+                    // P4.4d2 owns. A C- or T-only stack would grow that axis
+                    // instead of Z, so it is disabled too.
+                    AddSlice | DeleteSlice if !doc.supports_stack_axis_edit() => {
+                        Err(ij_core::CoreError::UnsupportedStackAxisEdit {
+                            channels: doc.n_channels,
+                            slices: doc.n_slices,
+                            frames: doc.n_frames,
+                        }
+                        .to_string())
+                    }
                     _ => Ok(()),
                 }
             }
@@ -811,6 +848,24 @@ impl ImageJApp {
             InvertStack => {
                 let _ = self.invert_stack_active();
             }
+            ZProject => {
+                self.open_zproject_dialog();
+            }
+            AddSlice => {
+                // IJ.altKeyDown() inserts the blank slice before the current
+                // one (StackEditor.java 42).
+                let insert_before_current = ctx.input(|input| input.modifiers.alt);
+                let _ = self.add_slice_active(insert_before_current);
+            }
+            DeleteSlice => {
+                let _ = self.delete_slice_active();
+            }
+            ImagesToStack => {
+                self.open_images_to_stack_dialog();
+            }
+            StackToImages => {
+                self.run_stack_to_images(ctx);
+            }
             Smooth => {
                 let _ = self.smooth_active();
             }
@@ -928,6 +983,23 @@ impl ImageJApp {
             ClearResults => {
                 let _ = self.session.dispatch(Command::ClearResults);
                 self.status_message = "Results cleared".to_string();
+            }
+            Summarize => {
+                // Analyzer.summarize returns before rt.show when the table has
+                // fewer than two rows or already ends with a "Max" summary row
+                // (Analyzer.java 889-897), so only a real summary opens the
+                // Results window and reports a status.
+                match self.session.dispatch(Command::Summarize) {
+                    Ok(CommandOutcome::Summarized { appended: true }) => {
+                        self.show_results_window = true;
+                        self.status_message = "Summarized results".to_string();
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        self.status_message = format!("Summarize failed: {error}");
+                        self.dialogs.last_error = Some(format!("Summarize failed: {error}"));
+                    }
+                }
             }
             InstalledPlugins => {
                 let _ = self.open_plugins_browser();

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Host-side driver for the Docker desktop CI environment.
+# Runs on macOS (bash 3) and Linux. Keeps Docker output in per-run logs.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+export BUILDKIT_PROGRESS=plain COMPOSE_ANSI=never
+dc=(docker compose)
+in=(docker compose exec -T --user abc desktop)
+
+case ${1:-help} in
+  up|test|verify|smoke|check|evidence|open|screenshot|down)
+    mkdir -p desktop-evidence
+    out=$(mktemp -d "desktop-evidence/run.XXXXXXXX")
+    printf 'logs: %s\n' "$out" >&2
+    ;;
+esac
+
+quiet() {
+  local label=$1 rc file; shift
+  file="$out/$label.log"
+  printf 'RUN %s -> %s\n' "$label" "$file"
+  if "$@" >"$file" 2>&1; then printf 'OK %s\n' "$label"; else
+    rc=$?; printf 'FAIL %s (exit %s): %s\n' "$label" "$rc" "$file" >&2
+    LC_ALL=C awk '/^error|panicked at|^failures:|^VERIFY_FAIL|^#.*ERROR:/ {
+      print NR ": " substr($0, 1, 240)
+      if (++n == 3) exit
+    }' "$file" >&2
+    LC_ALL=C tail -c 3072 "$file" | tail -n 16 >&2
+    return "$rc"
+  fi
+}
+
+save_diagnostics() {
+  "${dc[@]}" logs --no-color --tail 200 desktop > "$out/docker-logs.txt" 2>&1 || :
+}
+
+cmd_up()      { quiet up "${dc[@]}" up --build --wait --wait-timeout 180; }
+
+cmd_verify() {
+  quiet verify "${in[@]}" ./tools/verify.sh
+  grep -Eq '^VERIFY_ALL_OK([[:space:]]|$)' "$out/verify.log" || { echo 'FAIL verify: VERIFY_ALL_OK missing' >&2; return 1; }
+  echo 'VERIFY_ALL_OK'
+}
+
+cmd_smoke() {
+  quiet smoke "${in[@]}" env "SMOKE_FAILURE_PNG=/tmp/${out##*/}-smoke.png" bash docker/desktop-smoke.sh || {
+    rc=$?
+    "${dc[@]}" cp "desktop:/tmp/${out##*/}-smoke.png" "$out/smoke-failure.png" >> "$out/smoke.log" 2>&1 || :
+    return "$rc"
+  }
+  grep -q '^DESKTOP_SMOKE_OK$' "$out/smoke.log" || { echo 'FAIL smoke: DESKTOP_SMOKE_OK missing' >&2; return 1; }
+  echo 'DESKTOP_SMOKE_OK'
+}
+
+cmd_test() {
+  local crate=${1:?usage: ci test CRATE TEST_TARGET}
+  local target=${2:?usage: ci test CRATE TEST_TARGET}
+  if (( $# == 2 )); then
+    quiet test "${in[@]}" cargo test --locked -p "$crate" --test "$target"
+    return
+  fi
+  [[ $# == 3 && -n $3 && $3 != -* ]] || { echo 'usage: ci test CRATE TARGET [EXACT_NAME]' >&2; return 2; }
+  quiet test "${in[@]}" cargo test --locked -p "$crate" --test "$target" -- "$3" --exact
+  grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$out/test.log" || {
+    echo "FAIL expected one passing test named $3 (see $out/test.log)" >&2
+    return 1
+  }
+  echo "TEST_OK $3"
+}
+
+cmd_evidence() {
+  quiet evidence "${dc[@]}" cp "desktop:/workspace/verification/evidence/latest" "$out/latest"
+  printf 'evidence: %s/latest\n' "$out"
+}
+
+cmd_open() {
+  quiet app-build "${in[@]}" cargo build --locked -p ij-app
+  quiet open "${dc[@]}" exec -dT --user abc desktop /workspace/target/debug/ij-app
+  echo 'app launched detached; use: ./docker/ci windows'
+}
+
+cmd_windows()   { "${in[@]}" bash docker/gui.sh windows; }
+cmd_key()       { "${in[@]}" bash docker/gui.sh key "${1:?usage: ci key ID KEY}" "${2:?usage: ci key ID KEY}"; }
+cmd_click()     { "${in[@]}" bash docker/gui.sh click "${1:?usage: ci click ID X Y}" "${2:?usage: ci click ID X Y}" "${3:?usage: ci click ID X Y}"; }
+
+cmd_screenshot() {
+  local png="$out/desktop.png"
+  if "${in[@]}" bash docker/gui.sh screenshot > "$png" 2>"$out/screenshot.log"; then :; else
+    echo "FAIL screenshot: $out/screenshot.log" >&2
+    return 1
+  fi
+  [[ -s $png ]] || { echo 'FAIL screenshot: empty image' >&2; return 1; }
+  head -c 4 "$png" | LC_ALL=C grep -q 'PNG' || { echo 'FAIL screenshot: not a PNG' >&2; return 1; }
+  printf 'screenshot: %s\n' "$png"
+}
+
+cmd_check() {
+  trap 'rc=$?; if ((rc != 0)); then save_diagnostics; fi; exit "$rc"' EXIT
+  if (( $# != 0 && $# != 3 )); then echo 'usage: ci check [CRATE TARGET EXACT_NAME]' >&2; return 2; fi
+  cmd_up
+  if (( $# )); then cmd_test "$@"; fi
+  cmd_verify
+  cmd_smoke
+  cmd_evidence
+}
+
+cmd_down() { quiet down "${dc[@]}" down; }
+
+case "${1:-help}" in
+  up)         shift; cmd_up "$@" ;;
+  test)       shift; cmd_test "$@" ;;
+  verify)     shift; cmd_verify "$@" ;;
+  smoke)      shift; cmd_smoke "$@" ;;
+  check)      shift; cmd_check "$@" ;;
+  evidence)   shift; cmd_evidence "$@" ;;
+  open)       shift; cmd_open "$@" ;;
+  windows)    shift; cmd_windows "$@" ;;
+  key)        shift; cmd_key "$@" ;;
+  click)      shift; cmd_click "$@" ;;
+  screenshot) shift; cmd_screenshot "$@" ;;
+  down)       shift; cmd_down "$@" ;;
+  help|--help|-h|'')
+    cat <<USAGE
+usage: ./docker/ci COMMAND [ARGS]
+
+  up                  build and start the Xfce desktop container, wait healthy
+  test CRATE TARGET [EXACT_NAME]   run an integration target or one exact case
+  verify              run ./tools/verify.sh (requires VERIFY_ALL_OK)
+  smoke               run docker/desktop-smoke.sh (requires DESKTOP_SMOKE_OK)
+  check [CRATE TARGET EXACT_NAME]  up + optional exact test + verify + smoke + evidence
+  evidence            copy verification/evidence/latest to a run dir
+  open                build and launch ij-app on the desktop (detached)
+  windows             list ij-app window IDs and titles
+  key ID KEY          send keys to an ij-app window (e.g. key 12345 ctrl+q)
+  click ID X Y        click a window-relative position in an ij-app window
+  screenshot          save a desktop PNG into the run dir
+  down                docker compose down
+  help                this text
+
+Environment: COMPOSE_PROJECT_NAME, DESKTOP_PORT (default 3001),
+COMPOSE_FILE (e.g. compose.yaml:docker/compose.dev.yaml).
+Logs: each run writes desktop-evidence/run.XXXXXXXX/*.log.
+USAGE
+    ;;
+  *) echo "unknown command: $1 (try: ./docker/ci help)" >&2; exit 2 ;;
+esac

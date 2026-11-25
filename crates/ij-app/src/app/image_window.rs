@@ -284,18 +284,24 @@ impl ImageJApp {
                 let is_selected = self.active_tool == tool;
                 let is_supp = tool.is_supported();
 
-                let text = format!(" {} ", tool.symbol());
-                let btn = egui::Button::new(text).min_size(Vec2::new(28.0, 24.0));
-
-                let resp = if is_supp {
-                    if is_selected {
-                        ui.add(btn.fill(Color32::from_rgb(180, 205, 240)))
-                    } else {
-                        ui.add(btn)
-                    }
-                } else {
-                    ui.add_enabled(false, btn)
-                };
+                let btn = egui::Button::opt_image_and_text(None, None)
+                    .min_size(Vec2::new(28.0, 24.0))
+                    .selected(is_selected);
+                let resp = ui.add_enabled(is_supp, btn);
+                resp.widget_info(|| {
+                    egui::WidgetInfo::selected(
+                        egui::WidgetType::Button, is_supp, is_selected, tool.name(),
+                    )
+                });
+                let ink = ui.style().interact_selectable(&resp, is_selected).fg_stroke.color;
+                crate::toolbar_icons::paint_tool_icon(
+                    ui.painter(),
+                    resp.rect,
+                    tool,
+                    ink,
+                    self.session.foreground_color,
+                    self.session.background_color,
+                );
 
                 if is_supp && resp.clicked() {
                     self.active_tool = tool;
@@ -1372,5 +1378,145 @@ pub fn draw_ellipse_stroke(
     for i in 0..pts.len() {
         let next = if i + 1 == pts.len() { 0 } else { i + 1 };
         painter.line_segment([pts[i], pts[next]], stroke);
+    }
+}
+
+#[cfg(test)]
+mod toolbar_tests {
+    use super::*;
+
+    fn contains_text(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Text(text) => !text.galley.job.text.is_empty(),
+            egui::Shape::Vec(shapes) => shapes.iter().any(contains_text),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn toolbar_icons_do_not_depend_on_font_glyphs() {
+        for dark in [false, true] {
+            for scale in [1.0, 2.0] {
+                let ctx = egui::Context::default();
+                ctx.set_visuals(if dark {
+                    egui::Visuals::dark()
+                } else {
+                    egui::Visuals::light()
+                });
+                ctx.set_pixels_per_point(scale);
+                let mut app = ImageJApp::new();
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(680.0, 95.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| app.render_toolbar_tools(ui));
+                    },
+                );
+                assert!(
+                    output.shapes.iter().all(|s| !contains_text(&s.shape)),
+                    "toolbar icons must be geometry, not font glyphs, dark={dark}, scale={scale}"
+                );
+                if std::env::var_os("IJ_TOOLBAR_PROOF_DIR").is_some() {
+                    ctx.tessellation_options_mut(|o| o.feathering = false);
+                }
+                let meshes = ctx.tessellate(output.shapes, output.pixels_per_point);
+                if let Ok(dir) = std::env::var("IJ_TOOLBAR_PROOF_DIR") {
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let mut svg = String::from(
+                        "<svg xmlns='http://www.w3.org/2000/svg' width='680' height='95' viewBox='0 0 680 95'>",
+                    );
+                    for mesh in &meshes {
+                        if let egui::epaint::Primitive::Mesh(mesh) = &mesh.primitive {
+                            for triangle in mesh.indices.chunks_exact(3) {
+                                let a = mesh.vertices[triangle[0] as usize];
+                                let b = mesh.vertices[triangle[1] as usize];
+                                let c = mesh.vertices[triangle[2] as usize];
+                                let [r, g, b_color, alpha] = a.color.to_srgba_unmultiplied();
+                                svg.push_str(&format!("<polygon points='{},{} {},{} {},{}' fill='rgb({r},{g},{b_color})' fill-opacity='{}'/>",
+                                    a.pos.x, a.pos.y, b.pos.x, b.pos.y, c.pos.x, c.pos.y, alpha as f32 / 255.0));
+                            }
+                        }
+                    }
+                    svg.push_str("</svg>");
+                    std::fs::write(
+                        format!(
+                            "{dir}/toolbar-{}-{scale}x.svg",
+                            if dark { "dark" } else { "light" }
+                        ),
+                        svg,
+                    )
+                    .unwrap();
+                }
+                assert!(meshes.iter().any(|p| matches!(&p.primitive,
+                    egui::epaint::Primitive::Mesh(mesh) if !mesh.indices.is_empty())));
+            }
+        }
+    }
+    #[test]
+    fn every_toolbar_button_selects_its_named_tool() {
+        fn frame(
+            ctx: &egui::Context,
+            app: &mut ImageJApp,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(680.0, 95.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| app.render_toolbar_tools(ui));
+                },
+            )
+        }
+        let ctx = egui::Context::default();
+        let mut app = ImageJApp::new();
+        // Establish a pointer position before entering a button. Egui treats a
+        // first-ever pointer sample as no movement, allowing an immediate tooltip.
+        frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(600.0, 60.0))],
+        );
+        let output = frame(&ctx, &mut app, vec![]);
+        let buttons: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::Shape::Rect(r) if r.rect.size() == egui::vec2(28.0, 24.0) => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(buttons.len(), Tool::ALL.len());
+        for (i, &tool) in Tool::ALL.iter().enumerate() {
+            let pos = buttons[i].center();
+            frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+            for pressed in [true, false] {
+                frame(
+                    &ctx,
+                    &mut app,
+                    vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                );
+            }
+            assert_eq!(app.active_tool, tool);
+            assert_eq!(
+                app.status_message,
+                format!("Selected tool: {}", tool.name())
+            );
+        }
     }
 }

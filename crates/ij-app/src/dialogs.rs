@@ -123,6 +123,68 @@ pub struct MathDialog {
     pub operation: ij_core::math::MathOperation,
 }
 
+/// Editable state of `Image > Stacks > Z Project...`
+/// (ZProjector.buildControlDialog, original_imagej/ij/plugin/ZProjector.java
+/// 293-301): "Start slice:", "Stop slice:" and the "Projection type" choice.
+/// Numeric fields retain the original text for GenericDialog smart recording;
+/// `source` pins the image the command ran on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ZProjectDialog {
+    pub open: bool,
+    pub source: Option<ImageId>,
+    pub start: String,
+    pub stop: String,
+    /// Index into `ij_core::zproject::Z_PROJECT_METHODS`.
+    pub method_index: usize,
+}
+
+/// Editable state of `Image > Stacks > Images to Stack`
+/// (ImagesToStack.convertImagesToStack, original_imagej/ij/plugin/
+/// ImagesToStack.java 76-116). The "Method:" choice and the "Bicubic
+/// interpolation" checkbox only exist when the images differ in size
+/// (ImagesToStack.java 78-90).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImagesToStackDialog {
+    pub open: bool,
+    /// `sizesDiffer` (ImagesToStack.java 65).
+    pub sizes_differ: bool,
+    /// Number of included 2D images, shown in the size message.
+    pub count: usize,
+    pub min_width: u32,
+    pub min_height: u32,
+    pub max_width: u32,
+    pub max_height: u32,
+    /// Index into `ij_core::IMAGES_TO_STACK_METHODS`.
+    pub method_index: usize,
+    pub name: String,
+    pub title_filter: String,
+    pub fill: String,
+    pub bicubic: bool,
+    pub titles_as_labels: bool,
+    pub keep: bool,
+}
+
+impl Default for ImagesToStackDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            sizes_differ: false,
+            count: 0,
+            min_width: 0,
+            min_height: 0,
+            max_width: 0,
+            max_height: 0,
+            method_index: 0,
+            name: "Stack".to_string(),
+            title_filter: String::new(),
+            fill: String::new(),
+            bicubic: false,
+            titles_as_labels: true,
+            keep: false,
+        }
+    }
+}
+
 /// The dialog choice labels in ImageCalculator's order
 /// (ImageCalculator.java 21).
 pub const CALCULATOR_OPERATORS: [ij_core::math::CalculatorOperation; 13] = [
@@ -230,6 +292,24 @@ pub struct DialogState {
     pub new_image_defaults: NewImageDefaults,
     pub math: Option<MathDialog>,
     pub math_defaults: MathDefaults,
+    pub zproject: ZProjectDialog,
+    /// ZProjector persists the chosen method via `Prefs.set(METHOD_KEY, ...)`
+    /// (ZProjector.java 26-27, 173); modeled per app run.
+    pub zproject_method: usize,
+    /// Pending `IJ.showMessageWithCancel` inverting-LUT warning holding the
+    /// image the command ran on (ZProjector.java 149-153).
+    pub zproject_lut_pending: Option<ImageId>,
+    pub images_to_stack: ImagesToStackDialog,
+    /// ImagesToStack's static fields (ImagesToStack.java 22-28): the method,
+    /// bicubic, keep and titles-as-labels choices persist across runs outside
+    /// a macro.
+    pub images_to_stack_method: usize,
+    pub images_to_stack_bicubic: bool,
+    pub images_to_stack_keep: bool,
+    pub images_to_stack_titles_as_labels: bool,
+    /// Pending `IJ.showMessageWithCancel` for a stack with more than 30 slices
+    /// (StackEditor.java 252-260).
+    pub stack_to_images_pending: Option<ImageId>,
     pub calculator: Option<ImageCalculatorDialog>,
     pub calculator_last: ImageCalculatorLast,
     /// Duplicator's `staticDuplicateStack`: the checkbox starts checked again
@@ -279,6 +359,15 @@ impl DialogState {
             new_image_defaults: NewImageDefaults::default(),
             math: None,
             math_defaults: MathDefaults::default(),
+            zproject: ZProjectDialog::default(),
+            zproject_method: 0,
+            zproject_lut_pending: None,
+            images_to_stack: ImagesToStackDialog::default(),
+            images_to_stack_method: 0,
+            images_to_stack_bicubic: false,
+            images_to_stack_keep: false,
+            images_to_stack_titles_as_labels: true,
+            stack_to_images_pending: None,
             calculator: None,
             calculator_last: ImageCalculatorLast::default(),
             duplicate_stack_default: false,

@@ -453,7 +453,7 @@ fn copy_to_canvas<T: Copy>(
     }
 }
 
-fn resize_plane(
+pub(crate) fn resize_plane(
     plane: &PixelPlane,
     width: usize,
     height: usize,
@@ -481,6 +481,8 @@ fn resize_plane(
             downsize_samples(
                 &source, width, height, bounds, dst_width, dst_height, method,
             )
+        } else if uses_resize_linearly(width, height, method) {
+            resize_linearly_samples(&source, width, height, dst_width, dst_height)
         } else {
             resize_samples(
                 &source, width, height, bounds, dst_width, dst_height, method,
@@ -620,18 +622,85 @@ fn downsize_samples(
     }
     let values: Vec<f64> = values.into_iter().map(f64::from).collect();
     if w != dst_width || h != dst_height {
-        resize_samples(
-            &values,
-            w,
-            h,
-            (0, 0, w as u32, h as u32),
-            dst_width,
-            dst_height,
-            method,
-        )
+        // `FloatProcessor.downsize` finishes with `ip2.resize(dstWidth,
+        // dstHeight)` (FloatProcessor.java 966-967), which dispatches to
+        // resizeLinearly for a one-pixel intermediate.
+        if uses_resize_linearly(w, h, method) {
+            resize_linearly_samples(&values, w, h, dst_width, dst_height)
+        } else {
+            resize_samples(
+                &values,
+                w,
+                h,
+                (0, 0, w as u32, h as u32),
+                dst_width,
+                dst_height,
+                method,
+            )
+        }
     } else {
         values
     }
+}
+
+/// `(width==1||height==1) && interpolationMethod!=NONE` (ByteProcessor.java
+/// 992-993, ShortProcessor.java 909-910, FloatProcessor.java 899-900,
+/// ColorProcessor.java 977): the guard that selects `resizeLinearly`.
+fn uses_resize_linearly(width: usize, height: usize, method: Interpolation) -> bool {
+    (width == 1 || height == 1) && method != Interpolation::None
+}
+
+/// `ImageProcessor.resizeLinearly` (ImageProcessor.java 2346-2382).
+///
+/// Java rotates a one-column source so its long axis is horizontal
+/// (`rotateLeft`, 2350-2355), interpolates row 0 with
+/// `scale = (width1-1)/(width2-1)` (2360-2372), replicates that row over every
+/// output line (2373-2374) and rotates back (2379-2380). The interpolation
+/// method is ignored: this path is always linear. The ROI is ignored too,
+/// because `getRow(0, 0, ...)` reads the full first row.
+fn resize_linearly_samples(
+    source: &[f64],
+    width: usize,
+    height: usize,
+    dst_width: usize,
+    dst_height: usize,
+) -> Vec<f64> {
+    // `boolean rotate = width==1` (2349) swaps the destination dimensions.
+    let rotate = width == 1;
+    let (width1, width2) = if rotate {
+        (height, dst_height)
+    } else {
+        (width, dst_width)
+    };
+    // A one-pixel destination divides by zero. Java's `(int)(x*scale)` then
+    // yields 0 while `fraction` becomes NaN, so the single sample is NaN and
+    // `convertToByte`/`convertToShort` turn it into 0.
+    let scale = (width1 as f64 - 1.0) / (width2 as f64 - 1.0);
+    let mut row = vec![0.0f64; width2];
+    for (x, slot) in row.iter_mut().enumerate() {
+        let position = x as f64 * scale;
+        // `(int)` truncates toward zero, and Java maps NaN to 0.
+        let x1 = position as i64;
+        let mut x2 = x1 + 1;
+        if x2 == width1 as i64 {
+            x2 = width1 as i64 - 1;
+        }
+        let fraction = position - x1 as f64;
+        let left = source[x1 as usize];
+        let right = source[x2 as usize];
+        // `data2[x] = (float)((1.0-fraction)*data1[x1] + fraction*data1[x2])`
+        // (2371): the arithmetic is double, the stored sample is float.
+        *slot = f64::from(((1.0 - fraction) * left + fraction * right) as f32);
+    }
+    let mut out = vec![0.0f64; dst_width * dst_height];
+    for y in 0..dst_height {
+        for x in 0..dst_width {
+            // After the optional `rotateRight` the sample at (x, y) is
+            // `row[y]` for a rotated source and `row[x]` otherwise.
+            out[y * dst_width + x] = if rotate { row[y] } else { row[x] };
+        }
+    }
+    out
 }
 
 fn downsize_1d(

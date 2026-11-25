@@ -1,0 +1,4 @@
+services:
+  desktop:
+    volumes:
+      - ./crates:/workspace/crates:ro

@@ -41,6 +41,8 @@ mod new_image_dialog;
 mod plugin_ops;
 mod plugins_ui;
 mod shortcuts;
+mod stack_convert_dialog;
+mod zproject_dialog;
 pub use self::adjust_dialogs::{
     PLOT_PROFILE_Y_LABEL, PlotProfileWindowState, SET_MEASUREMENTS_FIRST_GROUP,
     SET_MEASUREMENTS_GROUP_COLUMNS, SET_MEASUREMENTS_GROUP_ROWS, SET_MEASUREMENTS_OPTIONS,
@@ -56,6 +58,7 @@ pub use self::plugin_ops::{
     PluginCatalogCacheLoad, PluginCatalogCacheState, PluginMenuEntry,
     default_plugin_catalog_cache_path, load_plugin_catalog_cache, save_plugin_catalog_cache,
 };
+pub use self::stack_convert_dialog::images_to_stack_size_message;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
@@ -1469,6 +1472,45 @@ impl ImageJApp {
             Err(e) => {
                 self.status_message = format!("Invert Stack failed: {e}");
                 self.dialogs.last_error = Some(format!("Invert Stack failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// `Image > Stacks > Add Slice` (StackEditor.java 30-49).
+    /// `insert_before_current` is `IJ.altKeyDown()`.
+    pub fn add_slice_active(&mut self, insert_before_current: bool) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Add Slice") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::AddSlice {
+            insert_before_current,
+        }) {
+            Ok(_) => {
+                self.status_message = "Add Slice".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Add Slice failed: {e}");
+                self.dialogs.last_error = Some(format!("Add Slice failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// `Image > Stacks > Delete Slice` (StackEditor.java 51-71).
+    pub fn delete_slice_active(&mut self) -> Result<(), SessionError> {
+        if let Some(err) = self.reject_while_closing("Delete Slice") {
+            return Err(err);
+        }
+        match self.session.dispatch(Command::DeleteSlice) {
+            Ok(_) => {
+                self.status_message = "Delete Slice".to_string();
+                Ok(())
+            }
+            Err(e) => {
+                self.status_message = format!("Delete Slice failed: {e}");
+                self.dialogs.last_error = Some(format!("Delete Slice failed: {e}"));
                 Err(e)
             }
         }

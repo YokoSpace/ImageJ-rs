@@ -1,8 +1,11 @@
 use egui::{Context, RawInput, ViewportCommand, ViewportId};
 use ij_app::app::{CloseTarget, ImageJApp};
+#[cfg(target_os = "macos")]
 use ij_app::macos_bridge::{
-    self, NS_TERMINATE_CANCEL, NS_TERMINATE_NOW, is_quit_authorized, poll_native_quit_requested,
-    request_native_quit, reset_bridge_state, set_dirty_state, set_quit_authorized,
+    NS_TERMINATE_CANCEL, NS_TERMINATE_NOW, poll_native_quit_requested, set_quit_authorized,
+};
+use ij_app::macos_bridge::{
+    self, is_quit_authorized, request_native_quit, reset_bridge_state, set_dirty_state,
 };
 use std::sync::Mutex;
 

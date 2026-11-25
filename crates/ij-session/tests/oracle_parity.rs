@@ -1,9 +1,10 @@
 use ij_bridge::JavaOracleBridge;
 use ij_core::{
     default_duplicate_title, display_histogram, format_ij_num, CoreError, DisplayHistogram,
-    DisplayRange, ImageDocument, LineRoi, Lut256, MeasurementConfig, MeasurementFlags,
+    DisplayRange, ImageDocument, LineMeasurement, LineRoi, Lut256, MeasurementConfig,
+    MeasurementFlags,
     MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
-    ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions,
+    ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions, RESULT_HEADINGS,
 };
 use ij_io::{load_image, load_tiff, save_jpeg, save_png, save_tiff};
 use ij_session::{Command, CommandOutcome, Session};
@@ -17029,10 +17030,10 @@ fn parity_point_and_multipoint_results_match_java() {
                     ),
                     &format!("p37a_{tag}_{index}_{}", config.flags),
                 );
-                let one_row = ResultsTable {
-                    rows: vec![session.results.rows[index].clone()],
+                let one_row = ResultsTable::from_rows(
+                    vec![session.results.rows[index].clone()],
                     config,
-                };
+                );
                 assert_eq!(one_row.to_tsv().trim(), expected.trim(), "{tag} point {index}: {options}");
             }
         }
@@ -21158,4 +21159,4966 @@ fn parity_size_depth_scaling_matches_java() {
         let PixelPlane::Gray8(actual)=&doc.slices[s-1] else {panic!("8-bit")};
         assert_eq!(actual,&expected);
     }
+}
+
+// ===================================================================
+// P4.4a — Image > Stacks > Z Project... (original_imagej/ij/plugin/ZProjector.java)
+// ===================================================================
+
+use ij_core::{ZProjectionMethod, ZProjectionOptions};
+
+fn zproject_options(
+    method: ZProjectionMethod,
+    start_slice: f64,
+    stop_slice: f64,
+) -> ZProjectionOptions {
+    ZProjectionOptions {
+        method,
+        start_slice,
+        stop_slice,
+    }
+}
+
+fn dispatch_zproject(session: &mut Session, options: ZProjectionOptions) -> ij_session::ImageId {
+    match session.dispatch(Command::ZProject { options }) {
+        Ok(CommandOutcome::ImageOpened(id)) => id,
+        other => panic!("ZProject must open a projection image, got {other:?}"),
+    }
+}
+
+/// All six ZProjector methods in dialog order (ZProjector.java 24-25): test
+/// tag, GenericDialog choice label, Rust enum.
+const ZP_ALL_METHODS: [(&str, &str, ZProjectionMethod); 6] = [
+    ("avg", "Average Intensity", ZProjectionMethod::Average),
+    ("max", "Max Intensity", ZProjectionMethod::Max),
+    ("min", "Min Intensity", ZProjectionMethod::Min),
+    ("sum", "Sum Slices", ZProjectionMethod::Sum),
+    ("sd", "Standard Deviation", ZProjectionMethod::StandardDeviation),
+    ("med", "Median", ZProjectionMethod::Median),
+];
+
+/// Runs `run("Z Project...", "projection=[<label>]")` for each method on the
+/// opened input image, prints TITLE/BITDEPTH/MINMAX for every output window
+/// and saves each projection TIFF into `dir` for plane comparison.
+fn zproject_oracle_methods(
+    bridge: &JavaOracleBridge,
+    source: &ImageDocument,
+    dir: &std::path::Path,
+    methods: &[(&str, &str, ZProjectionMethod)],
+) -> ij_bridge::OracleRunOutput {
+    let mut body = String::new();
+    for (tag, label, _) in methods {
+        body.push_str(&format!(
+            "selectWindow(\"input.tif\");\n\
+             run(\"Z Project...\", \"projection=[{label}]\");\n\
+             print(\"{tag}_TITLE=\"+getTitle());\n\
+             print(\"{tag}_BITDEPTH=\"+bitDepth());\n\
+             getMinAndMax(zpmin,zpmax); print(\"{tag}_MINMAX=\"+zpmin+\",\"+zpmax);\n\
+             print(\"{tag}_SEL=\"+selectionType());\n\
+             saveAs(\"Tiff\", \"{}\");\n",
+            dir.join(format!("{tag}.tif")).display()
+        ));
+    }
+    bridge.run_macro_on_image(source, &body).unwrap()
+}
+
+fn parse_minmax(field: &str) -> (f64, f64) {
+    let (min, max) = field.split_once(',').unwrap();
+    (min.parse().unwrap(), max.parse().unwrap())
+}
+
+fn zproject_field<'a>(stdout: &'a str, tag: &str, key: &str) -> &'a str {
+    oracle_line(stdout, &format!("{tag}_{key}=")).trim_start_matches(&format!("{tag}_{key}="))
+}
+
+fn assert_display_range(doc: &ImageDocument, minmax: (f64, f64), context: &str) {
+    if minmax.0.is_nan() {
+        assert!(
+            doc.display_range.min.is_nan() && doc.display_range.max.is_nan(),
+            "{context}: expected NaN display range, got {:?}",
+            doc.display_range
+        );
+    } else {
+        assert_eq!(
+            (doc.display_range.min, doc.display_range.max),
+            minmax,
+            "{context}: display range"
+        );
+    }
+}
+
+fn zproject_expected_bitdepth(plane: &PixelPlane) -> u8 {
+    match plane {
+        PixelPlane::Gray8(_) | PixelPlane::Color256 { .. } => 8,
+        PixelPlane::Gray16(_) => 16,
+        PixelPlane::Gray32(_) => 32,
+        PixelPlane::ColorRgb(_) => 24,
+    }
+}
+
+/// Dispatches `Command::ZProject` on a fresh session and returns the session
+/// plus the new projection id.
+fn zproject_session(
+    source: &ImageDocument,
+    options: ZProjectionOptions,
+) -> (Session, ij_session::ImageId) {
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    let id = dispatch_zproject(&mut session, options);
+    (session, id)
+}
+
+#[test]
+fn parity_zproject_all_methods_8bit() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // ZProjector.java 318-357: slices are visited in order; use per-slice
+    // offsets so every method is distinguishable.
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8(
+                    (0..12).map(|i| s * 10 + i).collect::<Vec<u8>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    let stack_size = source.stack_size() as f64;
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) =
+            zproject_session(&source, zproject_options(method, 1.0, stack_size));
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{label}: title"
+        );
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "BITDEPTH").parse::<u8>().unwrap(),
+            zproject_expected_bitdepth(proj.plane()),
+            "{label}: bit depth"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            label,
+        );
+        // ZProjector never copies the selection onto the projection.
+        assert_eq!(zproject_field(&java.stdout, tag, "SEL"), "-1");
+        assert!(proj.roi.is_none(), "{label}: projection must have no ROI");
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_all_methods_16bit() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u16)
+            .map(|s| {
+                PixelPlane::Gray16(
+                    (0..12).map(|i| s * 1000 + i as u16).collect::<Vec<u16>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    let stack_size = source.stack_size() as f64;
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) =
+            zproject_session(&source, zproject_options(method, 1.0, stack_size));
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{label}: title"
+        );
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "BITDEPTH").parse::<u8>().unwrap(),
+            zproject_expected_bitdepth(proj.plane()),
+            "{label}: bit depth"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            label,
+        );
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_all_methods_32bit_with_nan_and_infinity() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // (1,1) carries NaN on slice 2; (2,0) is -inf/+inf on slices 1/3 to pin
+    // down each RayFunction's non-finite rules (ZProjector.java 714-870).
+    let mut slices: Vec<Vec<f32>> = (1..=3u8)
+        .map(|s| (0..12).map(|i| s as f32 * 10.5 + i as f32).collect())
+        .collect();
+    slices[1][1 + 4] = f32::NAN;
+    slices[0][2] = f32::NEG_INFINITY;
+    slices[2][2] = f32::INFINITY;
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        slices.into_iter().map(PixelPlane::Gray32).collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    let stack_size = source.stack_size() as f64;
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) =
+            zproject_session(&source, zproject_options(method, 1.0, stack_size));
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{label}: title"
+        );
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "BITDEPTH").parse::<u8>().unwrap(),
+            zproject_expected_bitdepth(proj.plane()),
+            "{label}: bit depth"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            label,
+        );
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_slice_range_and_invalid_fields() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=5u8)
+            .map(|s| {
+                PixelPlane::Gray8(
+                    (0..12).map(|i| s * 20 + i).collect::<Vec<u8>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    // (options text, dispatch start/stop): mirrors probes run against the
+    // oracle — out-of-range numbers are ignored by
+    // ZProjector.setStartSlice/setStopSlice (ZProjector.java 110-120).
+    for (tag, options_text, start, stop) in [
+        ("r", "start=2 stop=4 ", 2.0_f64, 4.0_f64),
+        ("f", "start=2.7 stop=99 ", 2.7, 99.0),
+        ("o", "start=0 stop=99 ", 0.0, 99.0),
+        ("n", "start=-2 stop=3 ", -2.0, 3.0),
+        ("s", "start=3 stop=3 ", 3.0, 3.0),
+    ] {
+        let java = bridge
+            .run_macro_on_image(
+                &source,
+                &format!(
+                    "run(\"Z Project...\", \"{options_text}projection=[Average Intensity]\");\n\
+                     print(\"{tag}_TITLE=\"+getTitle());\n\
+                     print(\"{tag}_BITDEPTH=\"+bitDepth());\n\
+                     getMinAndMax(zpmin,zpmax); print(\"{tag}_MINMAX=\"+zpmin+\",\"+zpmax);\n\
+                     saveAs(\"Tiff\", \"{}\");\n",
+                    dir.path().join(format!("{tag}.tif")).display()
+                ),
+            )
+            .unwrap();
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) = zproject_session(
+            &source,
+            zproject_options(ZProjectionMethod::Average, start, stop),
+        );
+        let proj = session.get_image(id).unwrap();
+        assert_eq!(
+            zproject_field(&java.stdout, tag, "TITLE"),
+            proj.title,
+            "{options_text}: title"
+        );
+        assert_display_range(
+            proj,
+            parse_minmax(zproject_field(&java.stdout, tag, "MINMAX")),
+            options_text,
+        );
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{options_text}: pixels"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_empty_slice_range_matches_java_degenerate_outputs() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>())
+            })
+            .collect(),
+    )
+    .unwrap();
+    // ZProjector.java 318-324: a start>stop range projects zero slices; each
+    // RayFunction emits its initializer/divide-by-zero value.
+    let methods = &ZP_ALL_METHODS[..5];
+    let mut body = String::new();
+    for (tag, label, _) in methods {
+        body.push_str(&format!(
+            "selectWindow(\"input.tif\");\n\
+             run(\"Z Project...\", \"start=3 stop=2 projection=[{label}]\");\n\
+             saveAs(\"Tiff\", \"{}\");\n",
+            dir.path().join(format!("{tag}.tif")).display()
+        ));
+    }
+    bridge.run_macro_on_image(&source, &body).unwrap();
+    for (tag, label, method) in methods {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) = zproject_session(
+            &source,
+            zproject_options(*method, 3.0, 2.0),
+        );
+        let proj = session.get_image(id).unwrap();
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: empty range pixels"),
+        );
+    }
+
+    // ZProjector.java 625: median on an empty range indexes slices[0] and
+    // dies with ArrayIndexOutOfBoundsException. ImageJ logs the plugin
+    // exception and the macro continues without a new image; the Rust
+    // command must fail instead of producing a bogus image.
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            "run(\"Z Project...\", \"start=3 stop=2 projection=Median\");\n\
+             print(\"AFTER=\"+getTitle());\n",
+        )
+        .unwrap();
+    assert!(
+        java.stdout.contains("ArrayIndexOutOfBoundsException"),
+        "Java median empty range must throw; stdout={}",
+        java.stdout
+    );
+    assert_eq!(
+        oracle_line(&java.stdout, "AFTER=").trim_start_matches("AFTER="),
+        "input.tif",
+        "no projection image is created after the Java exception"
+    );
+    assert!(dispatch_zproject_error(
+        &source,
+        zproject_options(ZProjectionMethod::Median, 3.0, 2.0)
+    ));
+
+    // 32-bit average on an empty range produces an all-NaN projection
+    // (ZProjector.java 676-678: 0.0/0).
+    let source32 = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![
+            PixelPlane::Gray32(vec![1.0; 12]),
+            PixelPlane::Gray32(vec![2.0; 12]),
+            PixelPlane::Gray32(vec![3.0; 12]),
+        ],
+    )
+    .unwrap();
+    let java = bridge
+        .run_macro_on_image(
+            &source32,
+            &format!(
+                "run(\"Z Project...\", \"start=3 stop=2 projection=[Average Intensity]\");\n\
+                 getMinAndMax(zpmin,zpmax); print(\"E_MINMAX=\"+zpmin+\",\"+zpmax);\n\
+                 saveAs(\"Tiff\", \"{}\");\n",
+                dir.path().join("empty32.tif").display()
+            ),
+        )
+        .unwrap();
+    let oracle = load_tiff(dir.path().join("empty32.tif")).unwrap();
+    let (session, id) = zproject_session(
+        &source32,
+        zproject_options(ZProjectionMethod::Average, 3.0, 2.0),
+    );
+    let proj = session.get_image(id).unwrap();
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "32-bit empty avg");
+    assert_display_range(
+        proj,
+        parse_minmax(zproject_field(&java.stdout, "E", "MINMAX")),
+        "32-bit empty avg",
+    );
+}
+
+fn dispatch_zproject_error(source: &ImageDocument, options: ZProjectionOptions) -> bool {
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    match session.dispatch(Command::ZProject { options }) {
+        Err(_) => {
+            // A failed projection must not create or alter images.
+            let after: Vec<String> = session
+                .image_ids()
+                .iter()
+                .map(|id| session.get_image(*id).unwrap().title.clone())
+                .collect();
+            assert_eq!(after, ["input.tif".to_string()]);
+            assert_eq!(
+                session.get_image(source_id).unwrap().slices,
+                source.slices,
+                "failed ZProject must leave the source untouched"
+            );
+            true
+        }
+        Ok(outcome) => panic!("expected ZProject error, got {outcome:?}"),
+    }
+}
+
+#[test]
+fn parity_zproject_single_slice_is_stack_required_error() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new("input.tif", 4, 3, PixelPlane::Gray8(vec![7; 12])).unwrap();
+    // ZProjector.java 144-147: IJ.error("Z Project", "Stack required").
+    let aborted = bridge
+        .run_macro_on_image(&source, "run(\"Z Project...\", \"projection=[Max Intensity]\");")
+        .unwrap_err();
+    let message = format!("{aborted:?}");
+    assert!(message.contains("Stack required"), "{message}");
+    assert!(dispatch_zproject_error(
+        &source,
+        zproject_options(ZProjectionMethod::Max, 1.0, 1.0)
+    ));
+}
+
+#[test]
+fn parity_zproject_preserves_source_state_and_ignores_roi() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>())
+            })
+            .collect(),
+    )
+    .unwrap();
+    // 0.5 µm pixels: projection copies Calibration (ZProjector.java 393-395).
+    source.calibration.pixel_width = 0.5;
+    source.calibration.pixel_height = 0.5;
+    source.calibration.unit = "µm".into();
+    source.set_rect_roi(0, 0, 2, 2).unwrap();
+    source.set_slice(2).unwrap();
+
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            &format!(
+                "run(\"Z Project...\", \"projection=[Max Intensity]\");\n\
+                 print(\"OUT_SEL=\"+selectionType());\n\
+                 getVoxelSize(pw,ph,pd,unit); print(\"OUT_CAL=\"+pw+\",\"+unit);\n\
+                 saveAs(\"Tiff\", \"{}\");\n\
+                 selectWindow(\"input.tif\");\n\
+                 print(\"SRC_PIX=\"+getPixel(0,0));\n\
+                 print(\"SRC_SLICE=\"+getSliceNumber());\n\
+                 print(\"SRC_SEL=\"+selectionType());\n",
+                dir.path().join("proj.tif").display()
+            ),
+        )
+        .unwrap();
+
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    let proj_id = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Max, 1.0, 3.0),
+    );
+
+    let oracle = load_tiff(dir.path().join("proj.tif")).unwrap();
+    let proj = session.get_image(proj_id).unwrap();
+    // The Java projection covers the full frame regardless of the source ROI.
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "projection pixels");
+    assert_eq!(zproject_field(&java.stdout, "OUT", "SEL"), "-1");
+    assert!(proj.roi.is_none());
+    assert_eq!(
+        zproject_field(&java.stdout, "OUT", "CAL"),
+        format!("{},{}", proj.calibration.pixel_width, proj.calibration.unit),
+        "projection calibration"
+    );
+    assert_eq!(session.active_image_id(), Some(proj_id), "projection becomes active");
+
+    // Source image state is untouched by the projection. The TIFF reload
+    // resets Java to slice 1, so the Java-side evidence is the unchanged
+    // slice-1 pixel value and ROI; the Rust side is compared to the
+    // pre-dispatch document.
+    let src = session.get_image(source_id).unwrap();
+    assert_eq!(src.slices, source.slices, "source pixels unchanged");
+    assert_eq!(src.current_slice, source.current_slice, "current slice kept");
+    assert_eq!(src.roi, source.roi, "source ROI kept");
+    assert_eq!(zproject_field(&java.stdout, "SRC", "PIX"), "10");
+    assert_eq!(zproject_field(&java.stdout, "SRC", "SLICE"), "1");
+    assert!(zproject_field(&java.stdout, "SRC", "SEL").parse::<i8>().unwrap() >= 0);
+}
+
+#[test]
+fn parity_zproject_source_snapshot_and_dirty_state_survive() {
+    let mut source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![
+            PixelPlane::Gray8(vec![10; 12]),
+            PixelPlane::Gray8(vec![20; 12]),
+            PixelPlane::Gray8(vec![30; 12]),
+        ],
+    )
+    .unwrap();
+    source.snapshot = Some(source.slices.clone());
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    session.set_dirty(source_id, false);
+    let proj_id = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Sum, 1.0, 3.0),
+    );
+    let src = session.get_image(source_id).unwrap();
+    assert_eq!(src.snapshot, source.snapshot, "undo snapshot preserved");
+    assert!(!session.is_dirty(source_id), "projection must not dirty source");
+    assert!(session.is_dirty(proj_id), "new projection is unsaved");
+}
+
+#[test]
+fn parity_zproject_composite_sized_stack_uses_plain_java_path() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // channels==stackSize makes ZProjector treat the image as a plain stack
+    // (simpleComposite, ZProjector.java 217-220).
+    let java = bridge
+        .eval_macro(&format!(
+            "newImage(\"cstk\",\"8-bit black\",4,3,3);\n\
+             for(s=1;s<=3;s++){{setSlice(s);for(y=0;y<3;y++)for(x=0;x<4;x++)setPixel(x,y,s*10+x+y*4);}}\n\
+             Stack.setDimensions(3,1,1);\n\
+             run(\"Z Project...\", \"projection=[Average Intensity]\");\n\
+             print(\"C_TITLE=\"+getTitle());\n\
+             saveAs(\"Tiff\", \"{}\");\n",
+            dir.path().join("comp.tif").display()
+        ))
+        .unwrap();
+    let oracle = load_tiff(dir.path().join("comp.tif")).unwrap();
+    let source = ImageDocument::new_hyperstack(
+        "cstk",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| {
+                PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>())
+            })
+            .collect(),
+        3,
+        1,
+        1,
+    )
+    .unwrap();
+    let (session, id) = zproject_session(
+        &source,
+        zproject_options(ZProjectionMethod::Average, 1.0, 3.0),
+    );
+    let proj = session.get_image(id).unwrap();
+    assert_eq!(oracle_line(&java.stdout, "C_TITLE=").trim_start_matches("C_TITLE="), proj.title);
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "composite path");
+}
+
+#[test]
+fn zproject_rejects_hyperstack_and_rgb_inputs() {
+    let hyperstack = ImageDocument::new_hyperstack(
+        "input.tif",
+        4,
+        3,
+        vec![PixelPlane::Gray8(vec![1; 12]); 4],
+        2,
+        2,
+        1,
+    )
+    .unwrap();
+    assert!(dispatch_zproject_error(
+        &hyperstack,
+        zproject_options(ZProjectionMethod::Average, 1.0, 4.0)
+    ));
+    let rgb = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![PixelPlane::ColorRgb(vec![0x102030; 12]); 3],
+    )
+    .unwrap();
+    assert!(dispatch_zproject_error(
+        &rgb,
+        zproject_options(ZProjectionMethod::Average, 1.0, 3.0)
+    ));
+}
+
+#[test]
+fn parity_zproject_macro_recording_and_roundtrip() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![
+            PixelPlane::Gray8(vec![10; 12]),
+            PixelPlane::Gray8(vec![20; 12]),
+            PixelPlane::Gray8(vec![30; 12]),
+            PixelPlane::Gray8(vec![40; 12]),
+            PixelPlane::Gray8(vec![50; 12]),
+        ],
+    )
+    .unwrap();
+
+    // Smart recording suppresses fields that still hold their default text
+    // (ZProjector.java 164-172, GenericDialog.java 1203-1205); the choice is
+    // always written (ZProjector.java 172-173).
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Max, 1.0, 5.0),
+    );
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Z Project...\", \"projection=[Max Intensity]\");")
+    );
+
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Sum, 2.0, 4.0),
+    );
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Z Project...\", \"start=2 stop=4 projection=[Sum Slices]\");")
+    );
+
+    // The recorded option string must be accepted by the Java dialog parser:
+    // feed both literals back through the oracle.
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            "run(\"Z Project...\", \"start=2 stop=4 projection=[Sum Slices]\");\n\
+             print(\"RT_PIX=\"+getPixel(0,0));\n",
+        )
+        .unwrap();
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    let id = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Sum, 2.0, 4.0),
+    );
+    let PixelPlane::Gray32(pixels) = session.get_image(id).unwrap().plane() else {
+        panic!("Sum Slices must produce 32-bit output");
+    };
+    assert_eq!(
+        zproject_field(&java.stdout, "RT", "PIX").parse::<f32>().unwrap(),
+        pixels[0]
+    );
+}
+
+#[test]
+fn parity_zproject_even_slice_count_median() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // Four slices exercise the even-count branch (ZProjector.java 647-650):
+    // (a[middle-1]+a[middle])/2f in float arithmetic.
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=4u16)
+            .map(|s| {
+                PixelPlane::Gray16(
+                    (0..12).map(|i| s * 1000 + i as u16 * 7).collect::<Vec<u16>>(),
+                )
+            })
+            .collect(),
+    )
+    .unwrap();
+    let java = zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS[5..]);
+    let oracle = load_tiff(dir.path().join("med.tif")).unwrap();
+    let (session, id) = zproject_session(
+        &source,
+        zproject_options(ZProjectionMethod::Median, 1.0, 4.0),
+    );
+    let proj = session.get_image(id).unwrap();
+    assert_eq!(
+        zproject_field(&java.stdout, "med", "BITDEPTH").parse::<u8>().unwrap(),
+        zproject_expected_bitdepth(proj.plane())
+    );
+    assert_display_range(
+        proj,
+        parse_minmax(zproject_field(&java.stdout, "med", "MINMAX")),
+        "median even",
+    );
+    assert_plane_matches_oracle_nan_aware(proj.plane(), oracle.plane(), "median even pixels");
+}
+
+#[test]
+fn parity_zproject_constant_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        vec![PixelPlane::Gray8(vec![100; 12]); 3],
+    )
+    .unwrap();
+    zproject_oracle_methods(&bridge, &source, dir.path(), &ZP_ALL_METHODS);
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let oracle = load_tiff(dir.path().join(format!("{tag}.tif"))).unwrap();
+        let (session, id) = zproject_session(
+            &source,
+            zproject_options(method, 1.0, 3.0),
+        );
+        let proj = session.get_image(id).unwrap();
+        assert_plane_matches_oracle_nan_aware(
+            proj.plane(),
+            oracle.plane(),
+            &format!("{label}: constant stack"),
+        );
+    }
+}
+
+#[test]
+fn parity_zproject_indexed_lut_survives_byte_outputs() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut lut = ij_core::Lut256::default();
+    lut.g.fill(0);
+    lut.b.fill(0);
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        [10, 20, 30]
+            .iter()
+            .map(|&v| PixelPlane::Color256 {
+                pixels: vec![v; 12],
+                lut: Box::new(lut.clone()),
+            })
+            .collect(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (tag, label, method) in ZP_ALL_METHODS {
+        let path = dir.path().join(format!("{tag}-rgb.tif"));
+        bridge.run_macro_on_image(&source, &format!(
+            "run(\"Z Project...\", \"projection=[{label}]\"); run(\"RGB Color\"); saveAs(\"Tiff\", \"{}\");",path.display())).unwrap();
+        let oracle = load_tiff(&path).unwrap();
+        let (session, id) = zproject_session(&source, zproject_options(method, 1., 3.));
+        let mut projected = session.get_image(id).unwrap().clone();
+        if matches!(
+            method,
+            ZProjectionMethod::Average
+                | ZProjectionMethod::Max
+                | ZProjectionMethod::Min
+                | ZProjectionMethod::Median
+        ) {
+            assert!(
+                matches!(projected.plane(),PixelPlane::Color256 {lut: actual,..} if **actual == lut),
+                "{label}: missing source LUT"
+            );
+        } else {
+            assert!(matches!(projected.plane(), PixelPlane::Gray32(_)));
+        }
+        projected.convert_to_rgb();
+        assert_plane_matches_oracle_nan_aware(projected.plane(), oracle.plane(), label);
+    }
+}
+
+#[test]
+fn zproject_invalid_stack_layout_returns_error_without_mutation() {
+    let source =
+        ImageDocument::new_stack("invalid", 4, 3, vec![PixelPlane::Gray8(vec![10; 12]); 3])
+            .unwrap();
+    let mut invalid = vec![];
+    let mut doc = source.clone();
+    doc.slices.clear();
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.slices[1] = PixelPlane::Gray8(vec![1; 5]);
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.slices[1] = PixelPlane::Gray16(vec![700; 12]);
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.width = 0;
+    invalid.push(doc);
+    let mut doc = source.clone();
+    doc.width = u32::MAX;
+    invalid.push(doc);
+    for doc in invalid {
+        let before = doc.clone();
+        for (_, _, method) in ZP_ALL_METHODS {
+            assert!(
+                ij_core::zproject::z_project(&doc, &zproject_options(method, 1., 3.), "out")
+                    .is_err()
+            );
+            assert_eq!(doc, before);
+        }
+    }
+}
+
+#[test]
+fn parity_zproject_dialog_fields_match_real_generic_dialog() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        [10, 20, 30]
+            .iter()
+            .map(|&v| PixelPlane::Gray8(vec![v; 12]))
+            .collect(),
+    )
+    .unwrap();
+    for (start, stop) in [
+        ("1", "3"),
+        ("1.0", "3.00"),
+        ("abc", "3"),
+        ("0x2", "3"),
+        ("0xz", "3"),
+        ("2d", "3"),
+        (" 2 ", "3"),
+        ("", "3"),
+        ("NaN", "3"),
+        ("Infinity", "3"),
+        (" 0x1p1", "3"),
+        ("0X1.8p1", "3"),
+        ("+0x1.ffffffffffffffffp0", "3"),
+        ("-0x1p-2000", "3"),
+    ] {
+        let result=bridge.run_macro_on_image(&source,&format!(
+            "print(\"FIELDS=\"+call(\"tools.oracle.UiProbe.zProjectNumbers\",\"{start}\",\"{stop}\",\"3\"));")).unwrap();
+        let line = oracle_line(&result.stdout, "FIELDS=")
+            .strip_prefix("FIELDS=")
+            .unwrap();
+        let (values, recorded) = line.split_once('|').unwrap();
+        let (first, last) = values.split_once(',').unwrap();
+        let (expected, id) = zproject_session(
+            &source,
+            zproject_options(
+                ZProjectionMethod::Average,
+                first.parse().unwrap(),
+                last.parse().unwrap(),
+            ),
+        );
+        let mut actual = Session::new();
+        actual.insert_doc(source.clone());
+        let CommandOutcome::ImageOpened(output) = actual
+            .dispatch(Command::ZProjectFromDialog {
+                method: ZProjectionMethod::Average,
+                start: start.into(),
+                stop: stop.into(),
+            })
+            .unwrap()
+        else {
+            panic!("projection output")
+        };
+        assert_eq!(
+            actual.get_image(output).unwrap().plane(),
+            expected.get_image(id).unwrap().plane(),
+            "field {start:?}"
+        );
+        let prefix = if recorded.is_empty() {
+            String::new()
+        } else {
+            format!("{recorded} ")
+        };
+        assert_eq!(
+            actual.macro_recorder.last().unwrap(),
+            &format!("run(\"Z Project...\", \"{prefix}projection=[Average Intensity]\");"),
+            "field {start:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4.4b: Image > Stacks > Add Slice / Delete Slice for plain Z-stacks
+// (original_imagej/ij/plugin/StackEditor.java 30-71).
+// ---------------------------------------------------------------------------
+
+/// A `depth`-slice 8-bit ramp stack matching `newImage('t','8-bit ramp',w,h,d)`.
+fn ramp8_stack(title: &str, width: u32, height: u32, depth: u32) -> ImageDocument {
+    let base = ImageDocument::new_ramp_8bit(title, width, height).unwrap();
+    let plane = base.slices[0].clone();
+    ImageDocument::new_stack(title, width, height, vec![plane; depth as usize]).unwrap()
+}
+
+/// Parses the `S<n>=<pixels>|<label>` lines emitted by the P4.4b probes.
+fn slice_planes(stdout: &str) -> Vec<(Vec<f64>, String)> {
+    let mut out = Vec::new();
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix('S') else {
+            continue;
+        };
+        let Some((index, rest)) = rest.split_once('=') else {
+            continue;
+        };
+        if index.parse::<u32>().is_err() {
+            continue;
+        }
+        let (pixels, label) = rest.split_once('|').unwrap();
+        let pixels = pixels
+            .split(',')
+            .filter(|value| !value.is_empty())
+            .map(|value| value.parse::<f64>().unwrap())
+            .collect();
+        out.push((pixels, label.to_string()));
+    }
+    out
+}
+
+fn assert_slice_planes(doc: &ImageDocument, stdout: &str) {
+    let expected = slice_planes(stdout);
+    assert_eq!(expected.len(), doc.stack_size(), "slice count");
+    for (index, (pixels, label)) in expected.iter().enumerate() {
+        let plane = &doc.slices[index];
+        let actual: Vec<f64> = (0..plane.len()).map(|i| plane.sample_f64(i)).collect();
+        assert_eq!(&actual, pixels, "slice {} pixels", index + 1);
+        assert_eq!(
+            doc.slice_labels[index].as_deref().unwrap_or(""),
+            label,
+            "slice {} label",
+            index + 1
+        );
+    }
+}
+
+#[test]
+fn parity_add_slice_inserts_blank_after_current_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,3);
+for (i=1;i<=3;i++){setSlice(i); setPixel(0,0,i*10); setMetadata("L"+i);}
+setSlice(2);
+run('Add Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ramp8_stack("t", 4, 3, 3);
+    for i in 1..=3u32 {
+        doc.set_slice(i as i32).unwrap();
+        if let PixelPlane::Gray8(pixels) = &mut doc.slices[(i - 1) as usize] {
+            pixels[0] = (i * 10) as u8;
+        }
+        doc.slice_labels[(i - 1) as usize] = Some(format!("L{i}"));
+    }
+    doc.set_slice(2).unwrap();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+    assert_eq!(doc.get_dimensions(), [4, 3, 1, 4, 1]);
+    assert_eq!(doc.title, "t");
+    assert!(session.is_dirty(id));
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Add Slice\");")
+    );
+}
+
+#[test]
+fn parity_add_slice_with_alt_inserts_before_current_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,3);
+for (i=1;i<=3;i++){setSlice(i); setPixel(0,0,i*10); setMetadata("L"+i);}
+setSlice(2);
+setKeyDown("alt");
+run('Add Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ramp8_stack("t", 4, 3, 3);
+    for i in 1..=3u32 {
+        doc.set_slice(i as i32).unwrap();
+        if let PixelPlane::Gray8(pixels) = &mut doc.slices[(i - 1) as usize] {
+            pixels[0] = (i * 10) as u8;
+        }
+        doc.slice_labels[(i - 1) as usize] = Some(format!("L{i}"));
+    }
+    doc.set_slice(2).unwrap();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: true,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+    // Alt is not part of the recorded statement (Recorder.java 675-676 only
+    // records setKeyDown("alt") for Open Next and Plot Profile).
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Add Slice\");")
+    );
+}
+
+#[test]
+fn parity_add_slice_on_single_image_creates_a_two_slice_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,1);
+setPixel(0,0,7);
+run('Add Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ImageDocument::new_ramp_8bit("t", 4, 3).unwrap();
+    if let PixelPlane::Gray8(pixels) = &mut doc.slices[0] {
+        pixels[0] = 7;
+    }
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+    // A one-slice image becomes a plain (1, 2, 1) Z-stack.
+    assert_eq!(doc.get_dimensions(), [4, 3, 1, 2, 1]);
+}
+
+#[test]
+fn parity_delete_slice_removes_current_slice_and_moves_back() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','8-bit ramp',4,3,3);
+for (i=1;i<=3;i++){setSlice(i); setPixel(0,0,i*10); setMetadata("L"+i);}
+setSlice(2);
+run('Delete Slice');
+print("N="+nSlices+" CUR="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|"+getMetadata("label"));}
+setSlice(1);
+run('Delete Slice');
+print("N2="+nSlices+" CUR2="+getSliceNumber());
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("T"+i+"="+v+"|"+getMetadata("label"));}"#,
+        )
+        .unwrap();
+
+    let mut doc = ramp8_stack("t", 4, 3, 3);
+    for i in 1..=3u32 {
+        doc.set_slice(i as i32).unwrap();
+        if let PixelPlane::Gray8(pixels) = &mut doc.slices[(i - 1) as usize] {
+            pixels[0] = (i * 10) as u8;
+        }
+        doc.slice_labels[(i - 1) as usize] = Some(format!("L{i}"));
+    }
+    doc.set_slice(2).unwrap();
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session.dispatch(Command::DeleteSlice).unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N="),
+        format!("N={} CUR={}", doc.stack_size(), doc.current_slice)
+    );
+    assert_slice_planes(doc, &oracle.stdout);
+
+    session.dispatch(Command::DeleteSlice).unwrap();
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        oracle_line(&oracle.stdout, "N2="),
+        format!("N2={} CUR2={}", doc.stack_size(), doc.current_slice)
+    );
+    let expected: Vec<(Vec<f64>, String)> = oracle
+        .stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix('T'))
+        .filter_map(|rest| rest.split_once('='))
+        .filter(|(index, _)| index.parse::<u32>().is_ok())
+        .map(|(_, rest)| {
+            let (pixels, label) = rest.split_once('|').unwrap();
+            (
+                pixels
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.parse::<f64>().unwrap())
+                    .collect::<Vec<f64>>(),
+                label.to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(expected.len(), doc.stack_size());
+    for (index, (pixels, label)) in expected.iter().enumerate() {
+        let plane = &doc.slices[index];
+        let actual: Vec<f64> = (0..plane.len()).map(|i| plane.sample_f64(i)).collect();
+        assert_eq!(&actual, pixels, "slice {} pixels", index + 1);
+        assert_eq!(
+            doc.slice_labels[index].as_deref().unwrap_or(""),
+            label,
+            "slice {} label",
+            index + 1
+        );
+    }
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Delete Slice\");")
+    );
+}
+
+#[test]
+fn parity_delete_slice_on_single_image_reports_requires_a_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let error = bridge
+        .eval_macro("newImage('t','8-bit ramp',4,3,1); run('Delete Slice');")
+        .unwrap_err();
+    let ij_bridge::BridgeError::MacroAborted { message, .. } = error else {
+        panic!("expected BridgeError::MacroAborted, got {error:?}");
+    };
+    assert!(
+        message.contains("\"Delete Slice\" requires a stack"),
+        "unexpected Java error: {message}"
+    );
+
+    let mut session = Session::new();
+    let id = session.insert_doc(ImageDocument::new_ramp_8bit("t", 4, 3).unwrap());
+    let before = session.get_image(id).unwrap().clone();
+    let error = session.dispatch(Command::DeleteSlice).unwrap_err();
+    assert!(
+        error.to_string().contains("\"Delete Slice\" requires a stack"),
+        "unexpected Rust error: {error}"
+    );
+    assert_eq!(session.get_image(id).unwrap(), &before, "state preserved");
+    assert!(!session.is_dirty(id));
+    assert!(session.macro_recorder.is_empty());
+}
+
+#[test]
+fn parity_add_and_delete_slice_preserve_display_range_and_calibration() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage('t','16-bit ramp',3,2,2);
+run("Set Scale...", "distance=2 known=1 pixel=1 unit=um");
+setMinAndMax(100,2000);
+setSlice(1);
+run('Add Slice');
+getMinAndMax(mn,mx); getVoxelSize(pw,ph,pd,unit);
+print("A="+nSlices+","+getSliceNumber()+","+mn+","+mx+","+pw+","+ph+","+unit);
+for (i=1;i<=nSlices;i++){setSlice(i); v=""; for(y=0;y<getHeight();y++)for(x=0;x<getWidth();x++)v=v+getPixel(x,y)+","; print("S"+i+"="+v+"|");}
+setSlice(2);
+run('Delete Slice');
+getMinAndMax(mn,mx); getVoxelSize(pw,ph,pd,unit);
+print("B="+nSlices+","+getSliceNumber()+","+mn+","+mx+","+pw+","+ph+","+unit);"#,
+        )
+        .unwrap();
+
+    let base = ImageDocument::new_ramp_16bit("t", 3, 2).unwrap();
+    let plane = base.slices[0].clone();
+    let mut doc = ImageDocument::new_stack("t", 3, 2, vec![plane.clone(), plane]).unwrap();
+    doc.calibration.pixel_width = 0.5;
+    doc.calibration.pixel_height = 0.5;
+    // Calibration.setUnit canonicalizes "um" to the micro sign
+    // (Calibration.java 128-136).
+    doc.calibration.set_unit("um");
+    doc.display_range = DisplayRange {
+        min: 100.0,
+        max: 2000.0,
+    };
+
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap();
+
+    let doc = session.get_image(id).unwrap();
+    let expected = oracle_line(&oracle.stdout, "A=").trim_start_matches("A=");
+    let fields: Vec<&str> = expected.split(',').collect();
+    assert_eq!(fields[0].parse::<usize>().unwrap(), doc.stack_size());
+    assert_eq!(fields[1].parse::<u32>().unwrap(), doc.current_slice);
+    assert_eq!(fields[2].parse::<f64>().unwrap(), doc.display_range.min);
+    assert_eq!(fields[3].parse::<f64>().unwrap(), doc.display_range.max);
+    assert_eq!(fields[4].parse::<f64>().unwrap(), doc.calibration.pixel_width);
+    assert_eq!(fields[5].parse::<f64>().unwrap(), doc.calibration.pixel_height);
+    assert_eq!(fields[6], doc.calibration.unit);
+    assert_slice_planes(doc, &oracle.stdout);
+
+    session.dispatch(Command::DeleteSlice).unwrap();
+    let doc = session.get_image(id).unwrap();
+    let expected = oracle_line(&oracle.stdout, "B=").trim_start_matches("B=");
+    let fields: Vec<&str> = expected.split(',').collect();
+    assert_eq!(fields[0].parse::<usize>().unwrap(), doc.stack_size());
+    assert_eq!(fields[1].parse::<u32>().unwrap(), doc.current_slice);
+    assert_eq!(fields[2].parse::<f64>().unwrap(), doc.display_range.min);
+    assert_eq!(fields[3].parse::<f64>().unwrap(), doc.display_range.max);
+    assert_eq!(fields[4].parse::<f64>().unwrap(), doc.calibration.pixel_width);
+    assert_eq!(fields[6], doc.calibration.unit);
+}
+
+/// Every pixel type keeps its own blank-slice rule: `createProcessor` returns
+/// an all-zero plane of the same type and colour model
+/// (ByteProcessor.java 136-143, ColorProcessor.java 98-102,
+/// ShortProcessor.java 183-188, FloatProcessor.java 236-241).
+#[test]
+fn parity_add_slice_blank_pixels_for_every_pixel_type() {
+    let stdout = run_java_harness(
+        "AddSlicePixelTypes",
+        r#"
+import ij.*;
+import ij.process.*;
+
+public class AddSlicePixelTypes {
+    static void dump(String tag, ImagePlus imp) {
+        System.out.println(tag+" N="+imp.getStackSize()+" CUR="+imp.getCurrentSlice()
+            +" DIMS="+imp.getNChannels()+","+imp.getNSlices()+","+imp.getNFrames()
+            +" MINMAX="+imp.getProcessor().getMin()+","+imp.getProcessor().getMax());
+        for (int i=1;i<=imp.getStackSize();i++) {
+            ImageProcessor ip = imp.getStack().getProcessor(i);
+            StringBuilder px=new StringBuilder();
+            for (int k=0;k<ip.getPixelCount();k++) px.append(ip.getPixelValue(k%ip.getWidth(), k/ip.getWidth())).append(",");
+            System.out.println(tag+" S"+i+"="+px+"|");
+            StringBuilder raw=new StringBuilder();
+            for (int k=0;k<ip.getPixelCount();k++) raw.append(ip.getPixel(k%ip.getWidth(), k/ip.getWidth())).append(",");
+            System.out.println(tag+" R"+i+"="+raw+"|");
+        }
+    }
+    public static void main(String[] a) {
+        ImageStack s8 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            byte[] p = new byte[6];
+            for (int k=0;k<6;k++) p[k]=(byte)(i*10+k);
+            s8.addSlice(null, new ByteProcessor(3,2,p));
+        }
+        ImagePlus i8 = new ImagePlus("t8", s8);
+        i8.setSlice(1);
+        IJ.run(i8, "Add Slice", "");
+        dump("G8", i8);
+
+        ImageStack s16 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            short[] p = new short[6];
+            for (int k=0;k<6;k++) p[k]=(short)(i*1000+k);
+            s16.addSlice(null, new ShortProcessor(3,2,p,null));
+        }
+        ImagePlus i16 = new ImagePlus("t16", s16);
+        i16.getProcessor().setMinAndMax(100, 2000);
+        i16.setSlice(1);
+        IJ.run(i16, "Add Slice", "");
+        dump("G16", i16);
+
+        ImageStack s32 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            float[] p = new float[6];
+            for (int k=0;k<6;k++) p[k]=(float)(i*1.5+k);
+            s32.addSlice(null, new FloatProcessor(3,2,p));
+        }
+        ImagePlus i32 = new ImagePlus("t32", s32);
+        i32.setSlice(1);
+        IJ.run(i32, "Add Slice", "");
+        dump("G32", i32);
+
+        ImageStack srgb = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            int[] p = new int[6];
+            for (int k=0;k<6;k++) p[k]=0x010203*i + k;
+            srgb.addSlice(null, new ColorProcessor(3,2,p));
+        }
+        ImagePlus irgb = new ImagePlus("trgb", srgb);
+        irgb.setSlice(1);
+        IJ.run(irgb, "Add Slice", "");
+        dump("RGB", irgb);
+
+        byte[] r=new byte[256], g=new byte[256], b=new byte[256];
+        for (int i=0;i<256;i++){r[i]=(byte)i; g[i]=(byte)(255-i); b[i]=(byte)(i/2);}
+        java.awt.image.IndexColorModel icm = new java.awt.image.IndexColorModel(8,256,r,g,b);
+        ImageStack s256 = new ImageStack(3,2);
+        for (int i=1;i<=2;i++) {
+            byte[] p = new byte[6];
+            for (int k=0;k<6;k++) p[k]=(byte)(i*10+k);
+            s256.addSlice(null, new ByteProcessor(3,2,p,icm));
+        }
+        ImagePlus i256 = new ImagePlus("t256", s256);
+        i256.setSlice(1);
+        IJ.run(i256, "Add Slice", "");
+        dump("C256", i256);
+        System.out.println("C256 CM="+(i256.getProcessor().getColorModel() instanceof java.awt.image.IndexColorModel));
+    }
+}
+"#,
+    );
+
+    let lut = Lut256 {
+        r: (0..=255u8).collect(),
+        g: (0..=255u8).rev().collect(),
+        b: (0..=255u8).map(|value| value / 2).collect(),
+    };
+    let cases: Vec<(&str, ImageDocument)> = vec![
+        (
+            "G8",
+            ImageDocument::new_stack(
+                "t8",
+                3,
+                2,
+                vec![
+                    PixelPlane::Gray8(vec![10, 11, 12, 13, 14, 15]),
+                    PixelPlane::Gray8(vec![20, 21, 22, 23, 24, 25]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "G16",
+            ImageDocument::new_stack(
+                "t16",
+                3,
+                2,
+                vec![
+                    PixelPlane::Gray16(vec![1000, 1001, 1002, 1003, 1004, 1005]),
+                    PixelPlane::Gray16(vec![2000, 2001, 2002, 2003, 2004, 2005]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "G32",
+            ImageDocument::new_stack(
+                "t32",
+                3,
+                2,
+                vec![
+                    PixelPlane::Gray32(vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]),
+                    PixelPlane::Gray32(vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "RGB",
+            ImageDocument::new_stack(
+                "trgb",
+                3,
+                2,
+                vec![
+                    PixelPlane::ColorRgb(vec![0x010203, 0x010204, 0x010205, 0x010206, 0x010207, 0x010208]),
+                    PixelPlane::ColorRgb(vec![0x020406, 0x020407, 0x020408, 0x020409, 0x02040a, 0x02040b]),
+                ],
+            )
+            .unwrap(),
+        ),
+        (
+            "C256",
+            ImageDocument::new_stack(
+                "t256",
+                3,
+                2,
+                vec![
+                    PixelPlane::Color256 {
+                        pixels: vec![10, 11, 12, 13, 14, 15],
+                        lut: Box::new(lut.clone()),
+                    },
+                    PixelPlane::Color256 {
+                        pixels: vec![20, 21, 22, 23, 24, 25],
+                        lut: Box::new(lut.clone()),
+                    },
+                ],
+            )
+            .unwrap(),
+        ),
+    ];
+
+    for (tag, mut doc) in cases {
+        if tag == "G16" {
+            doc.display_range = DisplayRange {
+                min: 100.0,
+                max: 2000.0,
+            };
+        }
+        let mut session = Session::new();
+        let id = session.insert_doc(doc);
+        session
+            .dispatch(Command::AddSlice {
+                insert_before_current: false,
+            })
+            .unwrap();
+        let doc = session.get_image(id).unwrap();
+        let header = oracle_line(&stdout, &format!("{tag} N="))
+            .trim_start_matches(&format!("{tag} "))
+            .to_string();
+        let field = |name: &str| -> String {
+            header
+                .split(' ')
+                .find_map(|part| part.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{tag} header is missing {name}: {header}"))
+                .to_string()
+        };
+        assert_eq!(field("N").parse::<usize>().unwrap(), doc.stack_size(), "{tag} N");
+        assert_eq!(
+            field("CUR").parse::<u32>().unwrap(),
+            doc.current_slice,
+            "{tag} CUR"
+        );
+        assert_eq!(
+            field("DIMS"),
+            format!("{},{},{}", doc.n_channels, doc.n_slices, doc.n_frames),
+            "{tag} DIMS"
+        );
+        let minmax: Vec<f64> = field("MINMAX")
+            .split(',')
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(minmax, [doc.display_range.min, doc.display_range.max], "{tag} MINMAX");
+        let expected: Vec<(Vec<f64>, String)> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(&format!("{tag} S")))
+            .filter_map(|rest| rest.split_once('='))
+            .filter(|(index, _)| index.parse::<u32>().is_ok())
+            .map(|(_, rest)| {
+                let (pixels, label) = rest.split_once('|').unwrap();
+                (
+                    pixels
+                        .split(',')
+                        .filter(|value| !value.is_empty())
+                        .map(|value| value.parse::<f64>().unwrap())
+                        .collect::<Vec<f64>>(),
+                    label.to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(expected.len(), doc.stack_size(), "{tag} slice count");
+        for (index, (pixels, _)) in expected.iter().enumerate() {
+            let plane = &doc.slices[index];
+            if tag == "RGB" {
+                // ColorProcessor.getPixelValue averages the channels in single
+                // precision, so compare the packed RGB ints instead.
+                let raw = oracle_line(&stdout, &format!("{tag} R{}=", index + 1));
+                let raw: Vec<u32> = raw
+                    .trim_start_matches(&format!("{tag} R{}=", index + 1))
+                    .split('|')
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.parse().unwrap())
+                    .collect();
+                let PixelPlane::ColorRgb(actual) = plane else {
+                    panic!("{tag} slice {} must stay RGB", index + 1);
+                };
+                assert_eq!(actual, &raw, "{tag} slice {} pixels", index + 1);
+            } else {
+                let actual: Vec<f64> = (0..plane.len()).map(|i| plane.sample_f64(i)).collect();
+                assert_eq!(&actual, pixels, "{tag} slice {} pixels", index + 1);
+            }
+        }
+        if tag == "C256" {
+            assert!(
+                stdout.contains("C256 CM=true"),
+                "Java keeps the IndexColorModel on the new slice"
+            );
+            let PixelPlane::Color256 { lut: new_lut, .. } = &doc.slices[1] else {
+                panic!("C256 slice 2 must stay indexed");
+            };
+            assert_eq!(**new_lut, lut, "C256 slice 2 keeps the palette");
+        }
+    }
+}
+
+/// A hyperstack or a C/T-only stack takes ImageJ's C/Z/T dialog path
+/// (StackEditor.java 31-34, 54-57), which P4.4d2 owns. P4.4b must reject it
+/// instead of flattening the axis.
+#[test]
+fn add_and_delete_slice_reject_hyperstack_and_ct_stacks() {
+    let mut session = Session::new();
+    let planes: Vec<PixelPlane> = (0..4)
+        .map(|i| PixelPlane::Gray8(vec![i as u8; 6]))
+        .collect();
+    let mut doc = ImageDocument::new_stack("hyper", 3, 2, planes).unwrap();
+    doc.set_dimensions(2, 2, 1).unwrap();
+    let id = session.insert_doc(doc);
+    let before = session.get_image(id).unwrap().clone();
+
+    for command in [
+        Command::AddSlice {
+            insert_before_current: false,
+        },
+        Command::DeleteSlice,
+    ] {
+        let error = session.dispatch(command).unwrap_err();
+        assert!(
+            error.to_string().contains("hyperstack"),
+            "unexpected Rust error: {error}"
+        );
+        assert_eq!(session.get_image(id).unwrap(), &before, "state preserved");
+    }
+    assert!(!session.is_dirty(id));
+    assert!(session.macro_recorder.is_empty());
+
+    // A channel-only stack (C=N, Z=1, T=1) is not an ImageJ hyperstack, but
+    // editing it would grow the channel axis, so it is rejected too.
+    let mut session = Session::new();
+    let planes: Vec<PixelPlane> = (0..3)
+        .map(|i| PixelPlane::Gray8(vec![i as u8; 6]))
+        .collect();
+    let mut doc = ImageDocument::new_stack("channels", 3, 2, planes).unwrap();
+    doc.set_dimensions(3, 1, 1).unwrap();
+    let id = session.insert_doc(doc);
+    let before = session.get_image(id).unwrap().clone();
+    let error = session
+        .dispatch(Command::AddSlice {
+            insert_before_current: false,
+        })
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("hyperstack"),
+        "unexpected Rust error: {error}"
+    );
+    assert_eq!(session.get_image(id).unwrap(), &before, "state preserved");
+}
+
+#[test]
+fn parity_slice_edit_clears_threshold_and_preserves_roi() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for depth in [8, 16, 32] {
+        for count in [1, 2, 3] {
+            for delete in [false, true] {
+                if delete && count == 1 {
+                    continue;
+                }
+                let plane = match depth {
+                    8 => PixelPlane::Gray8(vec![50; 12]),
+                    16 => PixelPlane::Gray16(vec![500; 12]),
+                    _ => PixelPlane::Gray32(vec![50.; 12]),
+                };
+                let mut source =
+                    ImageDocument::new_stack("input.tif", 4, 3, vec![plane; count]).unwrap();
+                source.set_slice(count as i32).unwrap();
+                source.set_rect_roi(1, 0, 2, 2).unwrap();
+                source.threshold = Some(ThresholdLevels {
+                    lower: 10.,
+                    upper: 100.,
+                });
+                let name = if delete { "Delete Slice" } else { "Add Slice" };
+                let java=bridge.run_macro_on_image(&source,&format!(
+                    "setSlice({count}); makeRectangle(1,0,2,2); setThreshold(10,100); run(\"{name}\"); getThreshold(lo,hi); print(\"THR=\"+lo+\",\"+hi); getSelectionBounds(x,y,w,h); print(\"ROI=\"+x+\",\"+y+\",\"+w+\",\"+h);")).unwrap();
+                let values: Vec<f64> = oracle_line(&java.stdout, "THR=")
+                    .trim_start_matches("THR=")
+                    .split(',')
+                    .map(|s| s.parse().unwrap())
+                    .collect();
+                assert_eq!(values, vec![-1., -1.]);
+                assert_eq!(oracle_line(&java.stdout, "ROI="), "ROI=1,0,2,2");
+                let roi = source.roi.clone();
+                let mut session = Session::new();
+                let id = session.insert_doc(source);
+                session
+                    .dispatch(if delete {
+                        Command::DeleteSlice
+                    } else {
+                        Command::AddSlice {
+                            insert_before_current: false,
+                        }
+                    })
+                    .unwrap();
+                let doc = session.get_image(id).unwrap();
+                assert_eq!(doc.threshold, None, "{depth}-bit {name}, {count} slices");
+                assert_eq!(doc.roi, roi);
+            }
+        }
+    }
+}
+
+#[test]
+fn parity_slice_edit_rgb_resets_display_range() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for delete in [false, true] {
+        let name = if delete { "Delete Slice" } else { "Add Slice" };
+        let mut source = ImageDocument::new_stack(
+            "input.tif",
+            4,
+            3,
+            vec![PixelPlane::ColorRgb(vec![0xff102030; 12]); 3],
+        )
+        .unwrap();
+        let java=bridge.run_macro_on_image(&source,&format!("setMinAndMax(10,200); run(\"{name}\"); getMinAndMax(lo,hi); print(\"RANGE=\"+lo+\",\"+hi);")).unwrap();
+        let values: Vec<f64> = oracle_line(&java.stdout, "RANGE=")
+            .trim_start_matches("RANGE=")
+            .split(',')
+            .map(|s| s.parse().unwrap())
+            .collect();
+        assert_eq!(values, vec![0., 255.]);
+        source.display_range = DisplayRange {
+            min: 10.,
+            max: 200.,
+        };
+        let mut session = Session::new();
+        let id = session.insert_doc(source);
+        session
+            .dispatch(if delete {
+                Command::DeleteSlice
+            } else {
+                Command::AddSlice {
+                    insert_before_current: false,
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            session.get_image(id).unwrap().display_range,
+            DisplayRange {
+                min: values[0],
+                max: values[1]
+            }
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// P4.9b: Analyze > Summarize (Analyzer.java 888-927; ResultsTable.java
+// 291-300, 542-545, 556-594, 644-733, 807-839, 1019-1033, 1360-1394).
+// ---------------------------------------------------------------------------
+
+/// Fills the system Results table with `setResult`, the only headless way to
+/// build a multi-row table: a repeated `run("Measure")` resets the counter
+/// because `IJ.isResultsWindow()` is false (Analyzer.java 283-284).
+fn set_result_macro(rows: &[Vec<(&str, f64)>]) -> String {
+    let mut text = String::from("newImage('t','8-bit ramp',16,16,1);");
+    for (row_index, cells) in rows.iter().enumerate() {
+        for (heading, value) in cells {
+            let literal = if value.is_nan() {
+                "0/0".to_string()
+            } else {
+                format!("{value}")
+            };
+            text.push_str(&format!(" setResult('{heading}',{row_index},{literal});"));
+        }
+    }
+    text
+}
+
+/// Rust equivalent of a `setResult` table: each row lists the default
+/// headings it writes and `config` selects exactly those columns.
+fn set_result_table(rows: &[Vec<(&str, f64)>], config: MeasurementConfig) -> ResultsTable {
+    let mut table = ResultsTable::new();
+    table.config = config;
+    for cells in rows {
+        let mut row = MeasurementSummary::default();
+        for (heading, value) in cells {
+            match *heading {
+                "Area" => row.area = *value,
+                "Mean" => row.mean = *value,
+                "StdDev" => row.std_dev = *value,
+                "Min" => row.min = *value,
+                "Max" => row.max = *value,
+                "Median" => row.median = *value,
+                other => panic!("unsupported setResult heading {other}"),
+            }
+        }
+        table.push(row);
+    }
+    table
+}
+
+#[test]
+fn parity_summarize_empty_and_single_row_match_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // Analyzer.java 889 reads rt.getLabel(rt.size()-1) before the n<2 guard,
+    // so an empty table throws "Row out of range" (ResultsTable.java 542-545).
+    let empty = bridge
+        .eval_macro("newImage('t','8-bit ramp',16,16,1); run('Summarize'); print('N='+nResults);")
+        .unwrap();
+    // ImageJ prints the uncaught exception to stdout and keeps running.
+    assert!(
+        empty.stdout.contains("Row out of range")
+            && empty.stdout.contains("Analyzer.summarize(Analyzer.java:889)"),
+        "oracle must reject an empty table:\n{}",
+        empty.stdout
+    );
+    assert_eq!(oracle_line(&empty.stdout, "N="), "N=0");
+
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new_ramp_8bit("t", 16, 16).unwrap());
+    assert!(
+        session.dispatch(Command::Summarize).is_err(),
+        "an empty Results table must fail like Analyzer.java 889"
+    );
+    assert!(session.results.rows.is_empty());
+    assert!(session.macro_recorder.is_empty());
+
+    // One row: Analyzer.java 892-893 returns before touching the table.
+    let rows = vec![vec![("Area", 10.0), ("Mean", 2.0)]];
+    let expected = oracle_saved_results_tsv(
+        &format!("{} run('Summarize');", set_result_macro(&rows)),
+        "summarize_single",
+    );
+    let config = table_config("area mean decimal=3");
+    let mut table = set_result_table(&rows, config);
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new_ramp_8bit("t", 16, 16).unwrap());
+    session.dispatch(Command::Measure).unwrap();
+    let before = session.results.to_tsv();
+    session.dispatch(Command::Summarize).unwrap();
+    assert_eq!(session.results.to_tsv(), before, "one row is a no-op");
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Summarize\");")
+    );
+}
+
+#[test]
+fn parity_summarize_two_rows_matches_java_oracle() {
+    let cases: Vec<(&str, Vec<Vec<(&str, f64)>>, &str)> = vec![
+        (
+            "integer sd keeps AUTO_FORMAT",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+                vec![("Area", 30.0), ("Mean", 6.0), ("Min", 3.0), ("Max", 9.0)],
+            ],
+            "area mean min decimal=3",
+        ),
+        (
+            "fractional sd fixes the column at decimal=2",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+            ],
+            "area mean min decimal=2",
+        ),
+        (
+            "decimal=5",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+            ],
+            "area mean min decimal=5",
+        ),
+        (
+            "scientific notation",
+            vec![
+                vec![("Area", 10.0), ("Mean", 2.0), ("Min", 1.0), ("Max", 3.0)],
+                vec![("Area", 20.0), ("Mean", 4.0), ("Min", 2.0), ("Max", 6.0)],
+            ],
+            "area mean min scientific decimal=3",
+        ),
+        (
+            "mean standard median",
+            vec![
+                vec![("Mean", 2.0), ("StdDev", 1.0), ("Median", 2.0)],
+                vec![("Mean", 4.0), ("StdDev", 3.0), ("Median", 5.0)],
+            ],
+            "mean standard median decimal=3",
+        ),
+    ];
+    for (index, (name, rows, options)) in cases.into_iter().enumerate() {
+        let expected = oracle_saved_results_tsv(
+            &format!(
+                "{} run('Set Measurements...', '{options}'); run('Summarize');",
+                set_result_macro(&rows)
+            ),
+            &format!("summarize_two_{index}"),
+        );
+        let mut table = set_result_table(&rows, table_config(options));
+        table.summarize().unwrap();
+        assert_eq!(table.to_tsv().trim_end_matches('\n'), expected, "{name}");
+    }
+}
+
+#[test]
+fn parity_summarize_nan_cells_match_java_oracle() {
+    // NaN comparisons are false, so min/max keep the non-NaN bounds while sum
+    // and sum2 turn the Mean/SD cells into NaN (Analyzer.java 907-925).
+    let rows = vec![
+        vec![("Area", 10.0), ("Mean", 2.0)],
+        vec![("Area", f64::NAN), ("Mean", 4.0)],
+    ];
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{} run('Set Measurements...', 'area mean decimal=3'); run('Summarize');",
+            set_result_macro(&rows)
+        ),
+        "summarize_nan",
+    );
+    let mut table = set_result_table(&rows, table_config("area mean decimal=3"));
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_repeated_and_after_new_row_match_java_oracle() {
+    let rows = vec![
+        vec![("Area", 10.0), ("Mean", 2.0)],
+        vec![("Area", 20.0), ("Mean", 4.0)],
+    ];
+    let setup = format!(
+        "{} run('Set Measurements...', 'area mean decimal=3');",
+        set_result_macro(&rows)
+    );
+    let config = table_config("area mean decimal=3");
+
+    // Analyzer.java 889: the second call sees the "Max" label and returns.
+    let repeated = oracle_saved_results_tsv(
+        &format!("{setup} run('Summarize'); run('Summarize');"),
+        "summarize_repeated",
+    );
+    let mut table = set_result_table(&rows, config);
+    table.summarize().unwrap();
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), repeated);
+
+    // A row added after the summary makes the last label null again, so the
+    // next call summarizes all seven rows, summary rows included.
+    let after = oracle_saved_results_tsv(
+        &format!(
+            "{setup} run('Summarize'); setResult('Area',6,5); setResult('Mean',6,1); \
+             run('Summarize');"
+        ),
+        "summarize_after_row",
+    );
+    let mut table = set_result_table(&rows, config);
+    table.summarize().unwrap();
+    table.push(MeasurementSummary {
+        area: 5.0,
+        mean: 1.0,
+        ..Default::default()
+    });
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), after);
+}
+
+#[test]
+fn parity_summarize_clear_then_measure_matches_java_oracle() {
+    let rows = vec![
+        vec![("Area", 10.0), ("Mean", 2.0)],
+        vec![("Area", 20.0), ("Mean", 4.0)],
+    ];
+    // Clear Results resets the table, including the row labels, so the next
+    // measurement has no Label column (ResultsTable.java 1019-1033).
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{} run('Set Measurements...', 'area mean min decimal=3'); run('Summarize'); \
+             run('Clear Results'); makeRectangle(2,3,8,6); run('Measure');",
+            set_result_macro(&rows)
+        ),
+        "summarize_clear",
+    );
+    let config = table_config("area mean min decimal=3");
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags,
+            precision: config.precision,
+        })
+        .unwrap();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    session.dispatch(Command::ClearResults).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_after_analyze_particles_matches_java_oracle() {
+    let (doc, setup, _blobs) = particle_table_doc();
+    let options = "area mean min decimal=3";
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{setup} setThreshold(200,255); run('Set Measurements...', '{options}'); \
+             run('Analyze Particles...', 'size=0-Infinity display clear'); run('Summarize');"
+        ),
+        "summarize_particles",
+    );
+    let config = table_config(options);
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags,
+            precision: config.precision,
+        })
+        .unwrap();
+    session.insert_doc(doc);
+    session
+        .dispatch(Command::AnalyzeParticles {
+            options: ParticleAnalysisOptions {
+                black_background: true,
+                ..Default::default()
+            },
+            clear_results: true,
+            add_to_manager: false,
+            summarize: false,
+        })
+        .unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    assert_eq!(session.results.to_tsv().trim_end_matches('\n'), expected);
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Summarize\");")
+    );
+
+    // Save As > Results writes the same labeled table (ResultsTable.java
+    // 1360-1394).
+    let path = std::env::temp_dir().join(format!(
+        "p4_9b_summarize_save_{}.tsv",
+        std::process::id()
+    ));
+    session
+        .dispatch(Command::SaveResultsTsv { path: path.clone() })
+        .unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(path);
+    assert_eq!(saved.trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_missing_cells_count_as_zero_match_java_oracle() {
+    // A table with an Area row and a Length row: ResultsTable.getValue returns
+    // the zero an unwritten cell holds, so summarize includes it
+    // (ResultsTable.java 470-480, 907-915).
+    let expected = oracle_saved_results_tsv(
+        "newImage('t','8-bit ramp',16,16,1); setResult('Area',0,10); \
+         setResult('Length',1,5); run('Summarize');",
+        "summarize_missing",
+    );
+    let mut table = ResultsTable::new();
+    table.config = MeasurementConfig {
+        flags: MeasurementFlags::AREA,
+        precision: 3,
+    };
+    table.push(MeasurementSummary {
+        area: 10.0,
+        ..Default::default()
+    });
+    table.push(MeasurementSummary {
+        line: Some(LineMeasurement {
+            length: 5.0,
+            angle: 0.0,
+            show_angle: false,
+        }),
+        ..Default::default()
+    });
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_summarize_fixes_columns_beyond_the_first_24_rows_match_java_oracle() {
+    // setValue has no counter<25 guard, so a summary row past index 24 still
+    // fixes its column's decimal places (ResultsTable.java 556-594), while the
+    // integer measurement rows alone would keep AUTO_FORMAT.
+    let rows: Vec<Vec<(&str, f64)>> = (0..30)
+        .map(|index| {
+            vec![
+                ("Area", (index + 1) as f64),
+                ("Mean", index as f64 * 0.5),
+            ]
+        })
+        .collect();
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{} run('Set Measurements...', 'area mean decimal=3'); run('Summarize');",
+            set_result_macro(&rows)
+        ),
+        "summarize_beyond_24",
+    );
+    let mut table = set_result_table(&rows, table_config("area mean decimal=3"));
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv().trim_end_matches('\n'), expected);
+}
+
+// ---------------------------------------------------------------------------
+// P4.9b lifecycle corrections: the real Analyzer/ResultsTable sequence.
+//
+// Headless `run("Measure")` cannot accumulate rows because
+// `Analyzer.displayResults` deletes the rows it cannot show when no Results
+// window exists (Analyzer.java 845-865). `UiProbe.resultsLifecycle` installs a
+// real TextPanel as `IJ.textPanel` and drives `Analyzer.saveResults`,
+// `summarize`, `clearSummary`, `setOptions` and `ResultsTable.update`
+// directly, so the window-present branches run.
+// ---------------------------------------------------------------------------
+
+/// One step of the Results lifecycle, shared by the Java probe script and the
+/// Rust session so both sides run the same sequence.
+#[derive(Clone, Copy, Debug)]
+enum ResultsStep {
+    Measure,
+    MeasurePoint(i32, i32),
+    MeasureAngle([i32; 6]),
+    MeasureLine([i32; 4]),
+    Summarize,
+    SetMeasurements(u32, u8),
+}
+
+impl ResultsStep {
+    fn probe_op(self) -> String {
+        match self {
+            Self::Measure => "measure".to_string(),
+            Self::MeasurePoint(x, y) => format!("measurePoint:{x},{y}"),
+            Self::MeasureAngle(p) => format!(
+                "measureAngle:{},{},{},{},{},{}",
+                p[0], p[1], p[2], p[3], p[4], p[5]
+            ),
+            Self::MeasureLine(p) => format!("measureLine:{},{},{},{}", p[0], p[1], p[2], p[3]),
+            Self::Summarize => "summarize".to_string(),
+            Self::SetMeasurements(flags, precision) => format!("set:{flags}:{precision}"),
+        }
+    }
+}
+
+/// Runs the probe script in the Java oracle and returns
+/// `size=<n>;labels=<0|1>` plus the saved table.
+fn oracle_results_lifecycle(steps: &[ResultsStep], tag: &str) -> (String, String) {
+    oracle_results_lifecycle_image(steps, tag, "newImage('t','8-bit ramp',16,16,1);")
+}
+
+fn oracle_results_lifecycle_image(steps: &[ResultsStep], tag: &str, image_macro: &str) -> (String, String) {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let path = std::env::temp_dir().join(format!("p4_9b_life_{}_{tag}.tsv", std::process::id()));
+    let path_text = path.to_str().unwrap();
+    let script: Vec<String> = steps.iter().map(|step| step.probe_op()).collect();
+    let output = bridge
+        .eval_macro(&format!(
+            "{image_macro} makeRectangle(2,3,8,6); \
+             print('STATUS='+call('tools.oracle.UiProbe.resultsLifecycle','{}')); \
+             saveAs('Results','{path_text}'); print('TSV_BEGIN'); \
+             print(File.openAsString('{path_text}'));",
+            script.join(";")
+        ))
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = output.stdout.replace("\r\n", "\n");
+    let status = oracle_line(&stdout, "STATUS=")
+        .trim_start_matches("STATUS=")
+        .split(";resultsWindow=")
+        .next()
+        .unwrap()
+        .to_string();
+    let (_, tsv) = stdout
+        .split_once("TSV_BEGIN\n")
+        .unwrap_or_else(|| panic!("oracle did not print the saved table:\n{stdout}"));
+    (status, tsv.trim_end_matches('\n').to_string())
+}
+
+/// Runs the same steps through `Session::dispatch` and returns the same
+/// `size=<n>;labels=<0|1>` status plus the table.
+fn rust_results_lifecycle(steps: &[ResultsStep]) -> (String, String) {
+    rust_results_lifecycle_image(steps, ImageDocument::new_ramp_8bit("t", 16, 16).unwrap())
+}
+
+fn rust_results_lifecycle_image(steps: &[ResultsStep], mut doc: ImageDocument) -> (String, String) {
+    let mut session = Session::new();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    for step in steps {
+        match *step {
+            ResultsStep::Measure => {
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::MeasurePoint(x, y) => {
+                session
+                    .dispatch(Command::MakePointRoi {
+                        points: vec![(x, y)],
+                    })
+                    .unwrap();
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::MeasureAngle(p) => {
+                session
+                    .dispatch(Command::MakeAngleRoi {
+                        points: [(p[0], p[1]), (p[2], p[3]), (p[4], p[5])],
+                    })
+                    .unwrap();
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::MeasureLine(p) => {
+                session
+                    .dispatch(Command::MakeLineRoi {
+                        x1: p[0],
+                        y1: p[1],
+                        x2: p[2],
+                        y2: p[3],
+                    })
+                    .unwrap();
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::Summarize => {
+                session.dispatch(Command::Summarize).unwrap();
+            }
+            ResultsStep::SetMeasurements(flags, precision) => {
+                session
+                    .dispatch(Command::SetMeasurements { flags, precision })
+                    .unwrap();
+            }
+        }
+    }
+    let tsv = session.results.to_tsv().trim_end_matches('\n').to_string();
+    let status = format!(
+        "size={};labels={}",
+        session.results.rows.len(),
+        u8::from(tsv.starts_with(" \tLabel\t"))
+    );
+    (status, tsv)
+}
+
+/// Asserts that Rust and Java agree on both the table and its label state.
+fn assert_results_lifecycle(steps: &[ResultsStep], tag: &str) {
+    let (java_status, java_tsv) = oracle_results_lifecycle(steps, tag);
+    let (rust_status, rust_tsv) = rust_results_lifecycle(steps);
+    assert_eq!(rust_status, java_status, "{tag}: table size and label state");
+    assert_eq!(rust_tsv, java_tsv, "{tag}: saved table");
+}
+
+#[test]
+fn parity_summarize_measure_after_summary_keeps_rows_match_java_oracle() {
+    // Analyzer.saveResults calls clearSummary before appending
+    // (Analyzer.java 544-548), and clearSummary deletes exactly four rows when
+    // the last label is "Max" (Analyzer.java 726-732). Two input rows survive
+    // and the new measurement is appended: three rows, not one.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::Measure,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f1_measure");
+    assert_eq!(java_status, "size=3;labels=1");
+    assert_results_lifecycle(&steps, "f1_measure");
+}
+
+#[test]
+fn parity_summarize_measure_point_angle_and_line_clear_summary_match_java_oracle() {
+    // measurePoint/measureAngle/measureLength all reach saveResults, so the
+    // trailing summary rows are cleared for every ROI kind
+    // (Analyzer.java 379-525).
+    let cases: [(&str, [ResultsStep; 4]); 3] = [
+        (
+            "point",
+            [
+                ResultsStep::MeasurePoint(3, 4),
+                ResultsStep::MeasurePoint(5, 6),
+                ResultsStep::Summarize,
+                ResultsStep::MeasurePoint(7, 8),
+            ],
+        ),
+        (
+            "angle",
+            [
+                ResultsStep::MeasureAngle([2, 2, 6, 6, 10, 2]),
+                ResultsStep::MeasureAngle([3, 3, 7, 7, 11, 3]),
+                ResultsStep::Summarize,
+                ResultsStep::MeasureAngle([4, 4, 8, 8, 12, 4]),
+            ],
+        ),
+        (
+            "line",
+            [
+                ResultsStep::MeasureLine([2, 2, 10, 10]),
+                ResultsStep::MeasureLine([3, 3, 11, 11]),
+                ResultsStep::Summarize,
+                ResultsStep::MeasureLine([4, 4, 12, 12]),
+            ],
+        ),
+    ];
+    for (tag, steps) in cases {
+        let (java_status, _) = oracle_results_lifecycle(&steps, &format!("f1_{tag}"));
+        assert_eq!(java_status, "size=3;labels=1", "{tag}");
+        assert_results_lifecycle(&steps, &format!("f1_{tag}"));
+    }
+}
+
+#[test]
+fn parity_summarize_particles_after_summary_clear_it_match_java_oracle() {
+    // ParticleAnalyzer.saveResults delegates to Analyzer.saveResults
+    // (ParticleAnalyzer.java 967-968), so a particle run after Summarize
+    // deletes the four summary rows before appending its own.
+    let (doc, setup, _blobs) = particle_table_doc();
+    let options = "area mean min decimal=3";
+    let expected = oracle_saved_results_tsv(
+        &format!(
+            "{setup} setThreshold(200,255); run('Set Measurements...', '{options}'); \
+             run('Analyze Particles...', 'size=0-Infinity display clear'); run('Summarize'); \
+             run('Analyze Particles...', 'size=0-Infinity display');"
+        ),
+        "summarize_particles_after",
+    );
+    let config = table_config(options);
+    let mut session = Session::new();
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: config.flags,
+            precision: config.precision,
+        })
+        .unwrap();
+    session.insert_doc(doc);
+    let particles = Command::AnalyzeParticles {
+        options: ParticleAnalysisOptions {
+            black_background: true,
+            ..Default::default()
+        },
+        clear_results: true,
+        add_to_manager: false,
+        summarize: false,
+    };
+    session.dispatch(particles).unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    session
+        .dispatch(Command::AnalyzeParticles {
+            options: ParticleAnalysisOptions {
+                black_background: true,
+                ..Default::default()
+            },
+            clear_results: false,
+            add_to_manager: false,
+            summarize: false,
+        })
+        .unwrap();
+    assert_eq!(session.results.rows.len(), 6);
+    assert_eq!(session.results.to_tsv().trim_end_matches('\n'), expected);
+}
+
+#[test]
+fn parity_set_measurements_same_flags_disables_labels_match_java_oracle() {
+    // Analyzer.setOptions disables row labels whenever Display label is off,
+    // even when no measurement option changed (Analyzer.java 253-254). The
+    // summary rows stay because clearSummary is only reached on a change.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f2_same");
+    assert_eq!(java_status, "size=6;labels=0");
+    assert!(!java_tsv.starts_with(" \tLabel\t"), "{java_tsv}");
+    assert_results_lifecycle(&steps, "f2_same");
+}
+
+#[test]
+fn parity_set_measurements_same_flags_then_measure_keeps_summary_match_java_oracle() {
+    // With rowLabels null, getLabel returns null (ResultsTable.java 542-548),
+    // so the next saveResults cannot recognise the trailing "Max" row and the
+    // summary rows survive the new measurement.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 3),
+        ResultsStep::Measure,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f2_same_measure");
+    assert_eq!(java_status, "size=7;labels=0");
+    assert_results_lifecycle(&steps, "f2_same_measure");
+}
+
+#[test]
+fn parity_set_measurements_same_flags_then_summarize_restacks_match_java_oracle() {
+    // The same null label defeats the summarize guard (Analyzer.java 889), so
+    // a second Summarize recomputes over all six rows and appends four more.
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 3),
+        ResultsStep::Summarize,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f2_same_summarize");
+    assert_eq!(java_status, "size=10;labels=1");
+    assert_results_lifecycle(&steps, "f2_same_summarize");
+}
+
+#[test]
+fn parity_set_measurements_labels_on_keeps_labels_match_java_oracle() {
+    // With Display label on, rt2 built by update() has row labels, so
+    // ResultsTable.update keeps them (ResultsTable.java 1165-1170).
+    let steps = [
+        ResultsStep::SetMeasurements(1043, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(1043, 3),
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&steps, "f2_labels_on");
+    assert_eq!(java_status, "size=6;labels=1");
+    assert_results_lifecycle(&steps, "f2_labels_on");
+
+    let cleared = [
+        ResultsStep::SetMeasurements(1043, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(1043, 3),
+        ResultsStep::Measure,
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&cleared, "f2_labels_on_measure");
+    assert_eq!(java_status, "size=3;labels=1");
+    assert_results_lifecycle(&cleared, "f2_labels_on_measure");
+}
+
+#[test]
+fn parity_set_measurements_removed_flags_drop_columns_match_java_oracle() {
+    // Analyzer.saveResults writes measurement cells through the int addValue
+    // overload, which never sets keep[] (ResultsTable.java 190-218, 245, 263),
+    // so update() drops the Mean/Min/Max columns when the new option set omits
+    // them (ResultsTable.java 1150-1163).
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(1, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f3_removed");
+    assert_eq!(java_status, "size=2;labels=0");
+    assert_eq!(java_tsv.lines().next().unwrap(), " \tArea\t");
+    assert_results_lifecycle(&steps, "f3_removed");
+}
+
+#[test]
+fn parity_set_measurements_new_flags_allocate_zero_columns_match_java_oracle() {
+    // update() allocates a newly selected column with zeros for the rows that
+    // already exist (ResultsTable.java 1155-1161); it never re-derives them
+    // from the stored statistics.
+    let steps = [
+        ResultsStep::SetMeasurements(1, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f3_new");
+    assert_eq!(java_status, "size=2;labels=0");
+    assert_eq!(
+        java_tsv,
+        " \tArea\tMean\tMin\tMax\n1\t48\t0\t0\t0\n2\t48\t0\t0\t0"
+    );
+    assert_results_lifecycle(&steps, "f3_new");
+
+    let measured = [
+        ResultsStep::SetMeasurements(1, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19, 3),
+        ResultsStep::Measure,
+    ];
+    assert_results_lifecycle(&measured, "f3_new_measure");
+}
+
+#[test]
+fn parity_set_measurements_precision_and_scientific_keep_summary_match_java_oracle() {
+    // A precision-only change and a scientific-notation change both skip the
+    // clearSummary/update branch (Analyzer.java 243-249 excludes
+    // SCIENTIFIC_NOTATION), so the summary rows survive while the labels are
+    // still disabled.
+    let precision = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(19, 5),
+    ];
+    let (java_status, _) = oracle_results_lifecycle(&precision, "f3_precision");
+    assert_eq!(java_status, "size=6;labels=0");
+    assert_results_lifecycle(&precision, "f3_precision");
+
+    let scientific = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(2_097_171, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&scientific, "f3_scientific");
+    assert_eq!(java_status, "size=6;labels=0");
+    assert!(java_tsv.contains("4.800E1"), "{java_tsv}");
+    assert_results_lifecycle(&scientific, "f3_scientific");
+}
+
+#[test]
+fn parity_nan_empty_cells_use_the_allocation_time_option_match_java_oracle() {
+    // rt.setNaNEmptyCells is only refreshed by an Analyzer constructor
+    // (Analyzer.java 57-64, 81-90), so update() fills a new column with NaN
+    // only when the option was already on before the dialog ran.
+    let steps = [
+        ResultsStep::SetMeasurements(8_388_609, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(8_388_627, 3),
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f10_nan");
+    assert_eq!(java_status, "size=2;labels=0");
+    assert_eq!(
+        java_tsv,
+        " \tArea\tMean\tMin\tMax\n1\t48\tNaN\tNaN\tNaN\n2\t48\tNaN\tNaN\tNaN"
+    );
+    assert_results_lifecycle(&steps, "f10_nan");
+
+    // The same sequence with the option off allocates zeros instead.
+    let zeros = [
+        ResultsStep::SetMeasurements(1, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19, 3),
+    ];
+    assert_results_lifecycle(&zeros, "f10_zeros");
+}
+
+#[test]
+fn parity_summarize_nan_empty_cells_aggregate_like_java_oracle() {
+    // NaN cells make sum/sum2 NaN, so Mean and SD become NaN, while the
+    // min/max comparisons stay false and keep the Double.MAX_VALUE bounds
+    // (Analyzer.java 907-925).
+    let steps = [
+        ResultsStep::SetMeasurements(8_388_609, 3),
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(8_388_627, 3),
+        ResultsStep::Summarize,
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f10_nan_summary");
+    assert_eq!(java_status, "size=6;labels=1");
+    assert!(java_tsv.contains("\n5\tMin\t48\t1.798E308"), "{java_tsv}");
+    assert_results_lifecycle(&steps, "f10_nan_summary");
+}
+
+#[test]
+fn parity_summarize_clear_summary_deletes_exactly_four_rows_match_java_oracle() {
+    // Analyzer.clearSummary (Analyzer.java 726-732) is the only place that
+    // removes summary rows; it needs size>=4 and a trailing "Max" label.
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let path = std::env::temp_dir().join(format!("p4_9b_clear_{}.tsv", std::process::id()));
+    let path_text = path.to_str().unwrap();
+    let output = bridge
+        .eval_macro(&format!(
+            "newImage('t','8-bit ramp',16,16,1); makeRectangle(2,3,8,6); \
+             print('STATUS='+call('tools.oracle.UiProbe.resultsLifecycle',\
+             'measure;measure;summarize;clearSummary')); \
+             saveAs('Results','{path_text}'); print('TSV_BEGIN'); \
+             print(File.openAsString('{path_text}'));"
+        ))
+        .unwrap();
+    let _ = std::fs::remove_file(&path);
+    let stdout = output.stdout.replace("\r\n", "\n");
+    assert_eq!(
+        oracle_line(&stdout, "STATUS=")
+            .trim_start_matches("STATUS=")
+            .split(";resultsWindow=")
+            .next()
+            .unwrap(),
+        "size=2;labels=1"
+    );
+    let (_, java_tsv) = stdout.split_once("TSV_BEGIN\n").unwrap();
+
+    let mut session = Session::new();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    session.dispatch(Command::Summarize).unwrap();
+    session.results.clear_summary();
+    assert_eq!(session.results.rows.len(), 2);
+    assert_eq!(
+        session.results.to_tsv().trim_end_matches('\n'),
+        java_tsv.trim_end_matches('\n')
+    );
+}
+
+#[test]
+fn parity_summarize_save_after_config_change_matches_java_oracle() {
+    // Save As > Results writes whatever the table holds after the lifecycle
+    // (ResultsTable.java 1360-1394).
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+        ResultsStep::SetMeasurements(147, 3),
+        ResultsStep::Measure,
+        ResultsStep::Summarize,
+    ];
+    let (java_status, java_tsv) = oracle_results_lifecycle(&steps, "f3_save");
+    assert_eq!(java_status, "size=7;labels=1");
+    assert_results_lifecycle(&steps, "f3_save");
+
+    let mut session = Session::new();
+    let mut doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+    doc.set_rect_roi(2, 3, 8, 6).unwrap();
+    session.insert_doc(doc);
+    for step in steps {
+        match step {
+            ResultsStep::Measure => {
+                session.dispatch(Command::Measure).unwrap();
+            }
+            ResultsStep::Summarize => {
+                session.dispatch(Command::Summarize).unwrap();
+            }
+            ResultsStep::SetMeasurements(flags, precision) => {
+                session
+                    .dispatch(Command::SetMeasurements { flags, precision })
+                    .unwrap();
+            }
+            other => panic!("unexpected step {other:?}"),
+        }
+    }
+    let path = std::env::temp_dir().join(format!("p4_9b_save_{}.tsv", std::process::id()));
+    session
+        .dispatch(Command::SaveResultsTsv { path: path.clone() })
+        .unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_file(path);
+    assert_eq!(saved.trim_end_matches('\n'), java_tsv);
+}
+
+#[test]
+fn summarize_table_to_tsv_basic_falls_back_to_the_full_renderer() {
+    // to_tsv_basic is the Vertical Slice 1 evidence renderer: it prints the
+    // Area/Mean/Min/Max columns only. A summary table has no such shape, so
+    // the documented contract is a full-renderer fallback instead of printing
+    // summary statistics as fake zeros.
+    let mut table = ResultsTable::new();
+    table.push(MeasurementSummary {
+        area: 10.0,
+        mean: 2.0,
+        min: 1.0,
+        max: 3.0,
+        ..Default::default()
+    });
+    table.push(MeasurementSummary {
+        area: 20.0,
+        mean: 4.0,
+        min: 2.0,
+        max: 6.0,
+        ..Default::default()
+    });
+    assert_eq!(
+        table.to_tsv_basic(),
+        table.to_tsv(),
+        "ordinary slice-1 tables keep the basic shape"
+    );
+    table.summarize().unwrap();
+    assert_eq!(table.to_tsv_basic(), table.to_tsv());
+    assert!(table.to_tsv_basic().starts_with(" \tLabel\tArea\tMean\tMin\tMax\n"));
+}
+
+#[test]
+fn summary_row_cells_are_indexed_by_the_public_heading_order() {
+    // SummaryRow.cells is indexed by ResultsTable's default headings; the
+    // order must be public so plugin consumers can read a cell safely.
+    let mut table = ResultsTable::new();
+    table.push(MeasurementSummary {
+        area: 10.0,
+        mean: 2.0,
+        min: 1.0,
+        max: 3.0,
+        ..Default::default()
+    });
+    table.push(MeasurementSummary {
+        area: 20.0,
+        mean: 4.0,
+        min: 2.0,
+        max: 6.0,
+        ..Default::default()
+    });
+    table.summarize().unwrap();
+    let mean = table
+        .rows
+        .iter()
+        .find_map(|row| row.summary.as_ref().filter(|summary| summary.label == "Mean"))
+        .expect("Mean summary row");
+    assert_eq!(mean.cell("Area"), Some(15.0));
+    assert_eq!(mean.cell("Mean"), Some(3.0));
+    assert_eq!(mean.cell("Perim."), None, "column absent from the table");
+    assert_eq!(RESULT_HEADINGS[0], "Area");
+    assert_eq!(RESULT_HEADINGS.len(), mean.cells.len());
+}
+
+
+#[test]
+fn parity_set_measurements_removed_then_readded_column_matches_java_oracle() {
+    for (tag, flags) in [("readd_zero", 19), ("readd_fractional", 23), ("readd_nan", 19 | 8_388_608)] {
+        let mut steps = vec![
+            ResultsStep::SetMeasurements(flags, 3),
+            ResultsStep::Measure,
+            ResultsStep::Measure,
+            ResultsStep::SetMeasurements((flags & 8_388_608) | 1, 3),
+            ResultsStep::SetMeasurements(flags, 3),
+        ];
+        assert_results_lifecycle(&steps, tag);
+        steps.push(ResultsStep::Summarize);
+        assert_results_lifecycle(&steps, &format!("{tag}_summary"));
+        steps.push(ResultsStep::Measure);
+        assert_results_lifecycle(&steps, &format!("{tag}_measure"));
+    }
+}
+
+#[test]
+fn parity_set_measurements_limit_and_stack_position_allocate_columns() {
+    let steps = [
+        ResultsStep::Measure,
+        ResultsStep::Measure,
+        ResultsStep::SetMeasurements(19 | 256 | 1_048_576, 3),
+    ];
+    assert_results_lifecycle(&steps, "limit_position_2d");
+    for (tag, kind, c, z, t) in [
+        ("stack", "8-bit ramp", 1, 2, 1),
+        ("hyperstack", "8-bit ramp", 2, 2, 2),
+        ("rgb", "RGB black", 1, 1, 1),
+    ] {
+        let slices = c * z * t;
+        let mut doc = if kind == "RGB black" {
+            ImageDocument::new("t", 16, 16, PixelPlane::ColorRgb(vec![0xff000000; 256])).unwrap()
+        } else {
+            let plane = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap().plane().clone();
+            ImageDocument::new_stack("t", 16, 16, vec![plane; slices as usize]).unwrap()
+        };
+        doc.set_dimensions(c, z, t).unwrap();
+        let dimensions = if slices > 1 { format!("Stack.setDimensions({c},{z},{t});") } else { String::new() };
+        let image_macro = format!("newImage('t','{kind}',16,16,{slices}); {dimensions}");
+        let java = oracle_results_lifecycle_image(&steps, tag, &image_macro);
+        let rust = rust_results_lifecycle_image(&steps, doc);
+        assert_eq!(rust, java, "{tag}: updated columns and values");
+    }
+}
+// P4.4c — Image > Stacks > Images to Stack / Stack to Images
+// ==========================================================
+//
+// Java references: original_imagej/ij/plugin/ImagesToStack.java (findMinMaxSize
+// 246-296, convert 118-244, convertImagesToStack 36-116) and
+// original_imagej/ij/plugin/StackEditor.java (convertStackToImages 240-310,
+// getTitle 312-315, getShortTitle 319-328).
+//
+// `newImage` fills 8-bit/RGB images with white and 16/32-bit images with black
+// (NewImage.java 305, 354), so every fixture below spells out the pixels the
+// macro leaves untouched.
+
+use ij_core::stack_convert::{ImagesToStackMethod, ImagesToStackOptions};
+
+fn images_to_stack_options(name: &str) -> ImagesToStackOptions {
+    ImagesToStackOptions {
+        name: name.into(),
+        ..Default::default()
+    }
+}
+
+fn stack_convert_field<'a>(stdout: &'a str, key: &str) -> &'a str {
+    let prefix = format!("{key}=");
+    oracle_line(stdout, &prefix).trim_start_matches(&prefix)
+}
+
+fn stack_convert_size(stdout: &str, key: &str) -> Vec<u32> {
+    stack_convert_field(stdout, key)
+        .split(',')
+        .map(|value| value.parse().unwrap())
+        .collect()
+}
+
+fn stack_convert_calibration(stdout: &str, key: &str) -> (f64, f64, f64, String) {
+    let fields: Vec<&str> = stack_convert_field(stdout, key).splitn(4, ',').collect();
+    assert_eq!(fields.len(), 4, "{key} calibration");
+    // getVoxelSize reports Calibration.getUnits, whose pixel unit is plural.
+    let unit = if fields[3] == "pixels" {
+        "pixel".to_string()
+    } else {
+        fields[3].to_string()
+    };
+    (
+        fields[0].parse().unwrap(),
+        fields[1].parse().unwrap(),
+        fields[2].parse().unwrap(),
+        unit,
+    )
+}
+
+fn assert_stack_convert_calibration(
+    doc: &ImageDocument,
+    expected: (f64, f64, f64, String),
+    context: &str,
+) {
+    assert_eq!(
+        (
+            doc.calibration.pixel_width,
+            doc.calibration.pixel_height,
+            doc.calibration.pixel_depth,
+            doc.calibration.unit.clone()
+        ),
+        expected,
+        "{context}: calibration"
+    );
+}
+
+/// Byte pixels of an 8-bit plane. `Color256` and `Gray8` are the same
+/// `ByteProcessor` in Java; only the LUT differs.
+fn stack_convert_bytes(plane: &PixelPlane) -> Option<&[u8]> {
+    match plane {
+        PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => Some(pixels),
+        _ => None,
+    }
+}
+
+fn assert_stack_convert_planes(rust: &ImageDocument, java: &ImageDocument, context: &str) {
+    assert_eq!(rust.slices.len(), java.slices.len(), "{context}: slice count");
+    for (index, (a, b)) in rust.slices.iter().zip(java.slices.iter()).enumerate() {
+        match (stack_convert_bytes(a), stack_convert_bytes(b)) {
+            (Some(a), Some(b)) => assert_eq!(a, b, "{context}: slice {} pixels", index + 1),
+            _ => assert_plane_matches_oracle_nan_aware(
+                a,
+                b,
+                &format!("{context}: slice {} pixels", index + 1),
+            ),
+        }
+    }
+}
+
+/// Runs `run("Images to Stack", "<options>")` after `setup` created the input
+/// images in window order, then dumps the output stack and saves it as TIFF.
+fn images_to_stack_oracle(
+    bridge: &JavaOracleBridge,
+    setup: &str,
+    options: &str,
+    out_path: &std::path::Path,
+) -> ij_bridge::OracleRunOutput {
+    let macro_code = format!(
+        "{setup}\n\
+         print(\"BEFORE=\"+nImages);\n\
+         run(\"Images to Stack\", \"{options}\");\n\
+         print(\"AFTER=\"+nImages);\n\
+         print(\"TITLE=\"+getTitle());\n\
+         print(\"SIZE=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices+\",\"+bitDepth());\n\
+         getMinAndMax(mn,mx); print(\"MINMAX=\"+mn+\",\"+mx);\n\
+         getVoxelSize(pw,ph,pd,unit); print(\"CAL=\"+pw+\",\"+ph+\",\"+pd+\",\"+unit);\n\
+         for (i=1;i<=nSlices;i++) {{ setSlice(i); print(\"LABEL\"+i+\"=\"+getMetadata(\"Label\")); }}\n\
+         saveAs(\"Tiff\", \"{out}\");\n",
+        out = out_path.display()
+    );
+    bridge.eval_macro(&macro_code).unwrap()
+}
+
+fn images_to_stack_session(
+    inputs: &[ImageDocument],
+    options: ImagesToStackOptions,
+) -> (Session, ij_session::ImageId) {
+    let mut session = Session::new();
+    for doc in inputs {
+        session.insert_doc(doc.clone());
+    }
+    match session.dispatch(Command::ImagesToStack { options }) {
+        Ok(CommandOutcome::ImageOpened(id)) => (session, id),
+        other => panic!("Images to Stack must open a stack, got {other:?}"),
+    }
+}
+
+fn assert_images_to_stack_matches(
+    oracle: &ij_bridge::OracleRunOutput,
+    java_tiff: &std::path::Path,
+    session: &Session,
+    id: ij_session::ImageId,
+    context: &str,
+) {
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        stack_convert_field(&oracle.stdout, "TITLE"),
+        doc.title,
+        "{context}: title"
+    );
+    assert_eq!(
+        stack_convert_size(&oracle.stdout, "SIZE"),
+        [
+            doc.width,
+            doc.height,
+            doc.slices.len() as u32,
+            u32::from(zproject_expected_bitdepth(doc.plane()))
+        ],
+        "{context}: size"
+    );
+    assert_display_range(
+        doc,
+        parse_minmax(stack_convert_field(&oracle.stdout, "MINMAX")),
+        context,
+    );
+    assert_stack_convert_calibration(
+        doc,
+        stack_convert_calibration(&oracle.stdout, "CAL"),
+        context,
+    );
+    for (index, label) in doc.slice_labels.iter().enumerate() {
+        assert_eq!(
+            stack_convert_field(&oracle.stdout, &format!("LABEL{}", index + 1)),
+            label.as_deref().unwrap_or(""),
+            "{context}: slice {} label",
+            index + 1
+        );
+    }
+    let java = load_tiff(java_tiff).unwrap();
+    assert_stack_convert_planes(doc, &java, context);
+}
+
+fn gray8_doc(title: &str, width: u32, height: u32, base: u8) -> ImageDocument {
+    ImageDocument::new(
+        title,
+        width,
+        height,
+        PixelPlane::Gray8(
+            (0..width * height)
+                .map(|i| base.wrapping_add(i as u8))
+                .collect(),
+        ),
+    )
+    .unwrap()
+}
+
+/// A document with the display range `ij.gui.NewImage` installs: 0..255 for
+/// 8-bit/RGB, 0..65535 for 16-bit and 0..1 for 32-bit
+/// (NewImage.java 305, 354).
+fn new_image_doc(title: &str, width: u32, height: u32, plane: PixelPlane) -> ImageDocument {
+    let mut doc = ImageDocument::new(title, width, height, plane).unwrap();
+    doc.display_range = match doc.plane() {
+        PixelPlane::Gray16(_) => DisplayRange {
+            min: 0.0,
+            max: 65535.0,
+        },
+        PixelPlane::Gray32(_) => DisplayRange { min: 0.0, max: 1.0 },
+        _ => DisplayRange {
+            min: 0.0,
+            max: 255.0,
+        },
+    };
+    doc
+}
+
+#[test]
+fn parity_images_to_stack_gray8_default_options() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    let setup = "newImage(\"a\", \"8-bit\", 4, 3, 1);\n\
+                 for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,10+x+y*4);\n\
+                 newImage(\"b\", \"8-bit\", 4, 3, 1);\n\
+                 for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,30+x+y*4);\n\
+                 newImage(\"c\", \"8-bit\", 4, 3, 1);\n\
+                 for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,50+x+y*4);";
+    let oracle = images_to_stack_oracle(&bridge, setup, "name=Stack use", &out);
+    // ImagesToStack.java 36-116: three 2D images become one stack and the
+    // sources are closed because "Keep source images" is off.
+    assert_eq!(stack_convert_field(&oracle.stdout, "BEFORE"), "3");
+    assert_eq!(stack_convert_field(&oracle.stdout, "AFTER"), "1");
+
+    let inputs = [
+        gray8_doc("a", 4, 3, 10),
+        gray8_doc("b", 4, 3, 30),
+        gray8_doc("c", 4, 3, 50),
+    ];
+    let (session, id) = images_to_stack_session(&inputs, images_to_stack_options("Stack"));
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "default options");
+    // The output is the only remaining window and it is active.
+    assert_eq!(session.image_ids(), vec![id]);
+    assert_eq!(session.active_image_id(), Some(id));
+    assert_eq!(
+        session.get_image(id).unwrap().slice_labels,
+        vec![
+            Some("a".to_string()),
+            Some("b".to_string()),
+            Some("c".to_string())
+        ]
+    );
+}
+
+#[test]
+fn parity_images_to_stack_keep_sources_and_no_labels() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    let setup = "newImage(\"a\", \"8-bit\", 3, 2, 1); setPixel(0,0,5);\n\
+                 newImage(\"b\", \"8-bit\", 3, 2, 1); setPixel(0,0,6);";
+    // No "use" option: titlesAsLabels is false, so the labels fall back to the
+    // Slice_Label property, which these images do not have
+    // (ImagesToStack.java 137-146).
+    let oracle = images_to_stack_oracle(&bridge, setup, "name=Keep keep", &out);
+    assert_eq!(stack_convert_field(&oracle.stdout, "AFTER"), "3");
+    assert_eq!(stack_convert_field(&oracle.stdout, "LABEL1"), "");
+    assert_eq!(stack_convert_field(&oracle.stdout, "LABEL2"), "");
+
+    let inputs = [
+        ImageDocument::new("a", 3, 2, PixelPlane::Gray8(vec![5, 255, 255, 255, 255, 255])).unwrap(),
+        ImageDocument::new("b", 3, 2, PixelPlane::Gray8(vec![6, 255, 255, 255, 255, 255])).unwrap(),
+    ];
+    let mut options = images_to_stack_options("Keep");
+    options.keep = true;
+    options.titles_as_labels = false;
+    let (session, id) = images_to_stack_session(&inputs, options);
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "keep sources");
+    assert_eq!(session.image_ids().len(), 3, "sources stay open");
+    assert_eq!(session.get_image(id).unwrap().slice_labels, vec![None, None]);
+}
+
+#[test]
+fn parity_images_to_stack_mixed_types() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // 8-bit + 16-bit: findMinMaxSize raises stackType to 16
+    // (ImagesToStack.java 258-268) and convertToShort(false) keeps the byte
+    // values unchanged (TypeConverter.java 159-166).
+    let out16 = dir.path().join("out16.tif");
+    let setup16 = "newImage(\"a\", \"8-bit\", 2, 2, 1); setPixel(0,0,10); setPixel(1,0,200);\n\
+                   newImage(\"b\", \"16-bit\", 2, 2, 1); setPixel(0,0,1000); setPixel(1,0,4000);";
+    let oracle16 = images_to_stack_oracle(&bridge, setup16, "name=S16 use", &out16);
+    let inputs16 = [
+        ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![10, 200, 255, 255])).unwrap(),
+        new_image_doc("b", 2, 2, PixelPlane::Gray16(vec![1000, 4000, 0, 0])),
+    ];
+    let (session16, id16) = images_to_stack_session(&inputs16, images_to_stack_options("S16"));
+    assert_images_to_stack_matches(&oracle16, &out16, &session16, id16, "8+16-bit");
+    assert!(matches!(
+        session16.get_image(id16).unwrap().plane(),
+        PixelPlane::Gray16(_)
+    ));
+
+    // 8-bit + 32-bit: stackType 32, convertToFloat keeps the byte values
+    // (TypeConverter.java 216-231).
+    let out32 = dir.path().join("out32.tif");
+    let setup32 = "newImage(\"a\", \"8-bit\", 2, 2, 1); setPixel(0,0,10); setPixel(1,0,200);\n\
+                   newImage(\"b\", \"32-bit\", 2, 2, 1); setPixel(0,0,1.5); setPixel(1,0,-2.25);";
+    let oracle32 = images_to_stack_oracle(&bridge, setup32, "name=S32 use", &out32);
+    let inputs32 = [
+        ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![10, 200, 255, 255])).unwrap(),
+        new_image_doc("b", 2, 2, PixelPlane::Gray32(vec![1.5, -2.25, 0.0, 0.0])),
+    ];
+    let (session32, id32) = images_to_stack_session(&inputs32, images_to_stack_options("S32"));
+    assert_images_to_stack_matches(&oracle32, &out32, &session32, id32, "8+32-bit");
+    assert!(matches!(
+        session32.get_image(id32).unwrap().plane(),
+        PixelPlane::Gray32(_)
+    ));
+}
+
+#[test]
+fn parity_images_to_stack_rgb_input() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    // A 24-bit image raises stackType to rgb (ImagesToStack.java 262-264), so
+    // the 8-bit image is converted through its LUT (TypeConverter.java 248-255).
+    // The macro's setPixel(x,y,value) writes the packed RGB int
+    // (Functions.java 947-966).
+    let setup = "newImage(\"a\", \"8-bit\", 2, 2, 1); setPixel(0,0,10); setPixel(1,0,200);\n\
+                 newImage(\"b\", \"RGB black\", 2, 2, 1);\n\
+                 setPixel(0,0,0xff0000); setPixel(1,0,0x0080ff);";
+    let oracle = images_to_stack_oracle(&bridge, setup, "name=SRGB use", &out);
+    let inputs = [
+        ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![10, 200, 255, 255])).unwrap(),
+        ImageDocument::new(
+            "b",
+            2,
+            2,
+            PixelPlane::ColorRgb(vec![0xffff_0000, 0xff00_80ff, 0xff00_0000, 0xff00_0000]),
+        )
+        .unwrap(),
+    ];
+    let (session, id) = images_to_stack_session(&inputs, images_to_stack_options("SRGB"));
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "rgb input");
+    assert!(matches!(
+        session.get_image(id).unwrap().plane(),
+        PixelPlane::ColorRgb(_)
+    ));
+}
+
+#[test]
+fn parity_images_to_stack_different_sizes_copy_methods() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let setup = "newImage(\"a\", \"8-bit\", 2, 2, 1);\n\
+                 setPixel(0,0,1); setPixel(1,0,2); setPixel(0,1,3); setPixel(1,1,4);\n\
+                 newImage(\"b\", \"8-bit\", 4, 3, 1); setPixel(0,0,9);";
+    let inputs = [
+        ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![1, 2, 3, 4])).unwrap(),
+        ImageDocument::new(
+            "b",
+            4,
+            3,
+            PixelPlane::Gray8(vec![9, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]),
+        )
+        .unwrap(),
+    ];
+
+    for (tag, method, label) in [
+        ("CC", ImagesToStackMethod::CopyCenter, "Copy (center)"),
+        ("TL", ImagesToStackMethod::CopyTopLeft, "Copy (top-left)"),
+    ] {
+        let out = dir.path().join(format!("{tag}.tif"));
+        let oracle = images_to_stack_oracle(
+            &bridge,
+            setup,
+            &format!("name={tag} use method=[{label}]"),
+            &out,
+        );
+        let mut options = images_to_stack_options(tag);
+        options.method = method;
+        let (session, id) = images_to_stack_session(&inputs, options);
+        assert_images_to_stack_matches(&oracle, &out, &session, id, label);
+    }
+}
+
+#[test]
+fn parity_images_to_stack_different_sizes_scale_methods() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let setup = "newImage(\"a\", \"8-bit\", 2, 2, 1);\n\
+                 setPixel(0,0,1); setPixel(1,0,2); setPixel(0,1,3); setPixel(1,1,4);\n\
+                 newImage(\"b\", \"8-bit\", 4, 3, 1); setPixel(0,0,9);";
+    let inputs = [
+        ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![1, 2, 3, 4])).unwrap(),
+        ImageDocument::new(
+            "b",
+            4,
+            3,
+            PixelPlane::Gray8(vec![9, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]),
+        )
+        .unwrap(),
+    ];
+
+    for (tag, method, label, bicubic) in [
+        (
+            "SS",
+            ImagesToStackMethod::ScaleSmallest,
+            "Scale (smallest)",
+            false,
+        ),
+        (
+            "SL",
+            ImagesToStackMethod::ScaleLargest,
+            "Scale (largest)",
+            false,
+        ),
+        (
+            "SLB",
+            ImagesToStackMethod::ScaleLargest,
+            "Scale (largest)",
+            true,
+        ),
+    ] {
+        let out = dir.path().join(format!("{tag}.tif"));
+        let bicubic_option = if bicubic { " bicubic" } else { "" };
+        let oracle = images_to_stack_oracle(
+            &bridge,
+            setup,
+            &format!("name={tag} use method=[{label}]{bicubic_option}"),
+            &out,
+        );
+        let mut options = images_to_stack_options(tag);
+        options.method = method;
+        options.bicubic = bicubic;
+        let (session, id) = images_to_stack_session(&inputs, options);
+        assert_images_to_stack_matches(&oracle, &out, &session, id, label);
+    }
+}
+
+#[test]
+fn parity_images_to_stack_fill_color() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let setup = "newImage(\"a\", \"8-bit\", 2, 2, 1); setPixel(0,0,1); setPixel(1,0,2);\n\
+                 newImage(\"b\", \"8-bit\", 4, 3, 1); setPixel(0,0,9);";
+    let inputs = [
+        ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![1, 2, 255, 255])).unwrap(),
+        ImageDocument::new(
+            "b",
+            4,
+            3,
+            PixelPlane::Gray8(vec![9, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255]),
+        )
+        .unwrap(),
+    ];
+    // Colors.decode("red") is (255,0,0); ByteProcessor.setColor stores
+    // getBestIndex, the nearest default-LUT entry (ImageProcessor.java 248-292).
+    let out = dir.path().join("fill8.tif");
+    let oracle = images_to_stack_oracle(
+        &bridge,
+        setup,
+        "name=FILL use method=[Copy (center)] fill=red",
+        &out,
+    );
+    let mut options = images_to_stack_options("FILL");
+    options.fill = "red".into();
+    let (session, id) = images_to_stack_session(&inputs, options);
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "8-bit fill red");
+
+    // 16-bit fill: a fresh ShortProcessor has a 0/0 range, so setColor stores
+    // the LUT index itself and installs a 0..255 range
+    // (ShortProcessor.java 987-999).
+    let setup16 = "newImage(\"a\", \"16-bit\", 2, 2, 1); setPixel(0,0,1000);\n\
+                   newImage(\"b\", \"16-bit\", 4, 3, 1); setPixel(0,0,9);";
+    let inputs16 = [
+        new_image_doc("a", 2, 2, PixelPlane::Gray16(vec![1000, 0, 0, 0])),
+        new_image_doc(
+            "b",
+            4,
+            3,
+            PixelPlane::Gray16(vec![9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        ),
+    ];
+    let out16 = dir.path().join("fill16.tif");
+    let oracle16 = images_to_stack_oracle(
+        &bridge,
+        setup16,
+        "name=FILL16 use method=[Copy (center)] fill=white",
+        &out16,
+    );
+    let mut options16 = images_to_stack_options("FILL16");
+    options16.fill = "white".into();
+    let (session16, id16) = images_to_stack_session(&inputs16, options16);
+    assert_images_to_stack_matches(&oracle16, &out16, &session16, id16, "16-bit fill white");
+}
+
+#[test]
+fn parity_images_to_stack_calibration() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // findMinMaxSize keeps images[0]'s calibration only when every included
+    // image has an equal calibration (ImagesToStack.java 283-285).
+    let same = "newImage(\"a\", \"8-bit\", 2, 2, 1); setVoxelSize(0.5, 0.25, 1, \"um\");\n\
+                newImage(\"b\", \"8-bit\", 2, 2, 1); setVoxelSize(0.5, 0.25, 1, \"um\");";
+    let out_same = dir.path().join("cal_same.tif");
+    let oracle_same = images_to_stack_oracle(&bridge, same, "name=CAL use", &out_same);
+    let mut first = ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap();
+    first.calibration.pixel_width = 0.5;
+    first.calibration.pixel_height = 0.25;
+    first.calibration.unit = "\u{00b5}m".into();
+    let mut second = ImageDocument::new("b", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap();
+    second.calibration = first.calibration.clone();
+    let (session_same, id_same) =
+        images_to_stack_session(&[first.clone(), second], images_to_stack_options("CAL"));
+    assert_images_to_stack_matches(
+        &oracle_same,
+        &out_same,
+        &session_same,
+        id_same,
+        "same calibration",
+    );
+
+    let different = "newImage(\"a\", \"8-bit\", 2, 2, 1); setVoxelSize(0.5, 0.25, 1, \"um\");\n\
+                     newImage(\"b\", \"8-bit\", 2, 2, 1); setVoxelSize(0.25, 0.25, 1, \"um\");";
+    let out_diff = dir.path().join("cal_diff.tif");
+    let oracle_diff = images_to_stack_oracle(&bridge, different, "name=CAL2 use", &out_diff);
+    let mut other = ImageDocument::new("b", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap();
+    other.calibration.pixel_width = 0.25;
+    other.calibration.pixel_height = 0.25;
+    other.calibration.unit = "\u{00b5}m".into();
+    let (session_diff, id_diff) =
+        images_to_stack_session(&[first, other], images_to_stack_options("CAL2"));
+    assert_images_to_stack_matches(
+        &oracle_diff,
+        &out_diff,
+        &session_diff,
+        id_diff,
+        "different calibration",
+    );
+    assert_eq!(
+        session_diff.get_image(id_diff).unwrap().calibration,
+        ij_core::Calibration::default(),
+        "a calibration mismatch resets the stack to pixel units"
+    );
+}
+
+#[test]
+fn parity_images_to_stack_title_filter() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    // "Title contains:" excludes non-matching images before findMinMaxSize
+    // (ImagesToStack.java 92-100, 298-300); excluded windows stay open.
+    let setup = "newImage(\"a1\", \"8-bit\", 2, 2, 1); setPixel(0,0,1);\n\
+                 newImage(\"b1\", \"8-bit\", 2, 2, 1); setPixel(0,0,2);\n\
+                 newImage(\"a2\", \"8-bit\", 2, 2, 1); setPixel(0,0,3);";
+    let oracle = images_to_stack_oracle(&bridge, setup, "name=F use title=a", &out);
+    assert_eq!(stack_convert_field(&oracle.stdout, "AFTER"), "2");
+    let inputs = [
+        ImageDocument::new("a1", 2, 2, PixelPlane::Gray8(vec![1, 255, 255, 255])).unwrap(),
+        ImageDocument::new("b1", 2, 2, PixelPlane::Gray8(vec![2, 255, 255, 255])).unwrap(),
+        ImageDocument::new("a2", 2, 2, PixelPlane::Gray8(vec![3, 255, 255, 255])).unwrap(),
+    ];
+    let mut options = images_to_stack_options("F");
+    options.title_filter = "a".into();
+    let (session, id) = images_to_stack_session(&inputs, options);
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "title filter");
+    assert_eq!(session.image_ids().len(), 2, "the excluded image stays open");
+}
+
+#[test]
+fn parity_images_to_stack_duplicate_source_titles() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    // Two files with the same name open with the same title in batch mode, so
+    // both slices get that title as their label (ImagesToStack.java 137-146).
+    let first = dir.path().join("dup.tif");
+    let second_dir = dir.path().join("second");
+    std::fs::create_dir_all(&second_dir).unwrap();
+    let second = second_dir.join("dup.tif");
+    save_tiff(&first, &gray8_doc("dup.tif", 2, 2, 1)).unwrap();
+    save_tiff(&second, &gray8_doc("dup.tif", 2, 2, 2)).unwrap();
+    let oracle = bridge
+        .eval_macro(&format!(
+            "open(\"{a}\"); open(\"{b}\");\n\
+             run(\"Images to Stack\", \"name=DUP use\");\n\
+             print(\"TITLE=\"+getTitle());\n\
+             print(\"SIZE=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices+\",\"+bitDepth());\n\
+             getMinAndMax(mn,mx); print(\"MINMAX=\"+mn+\",\"+mx);\n\
+             getVoxelSize(pw,ph,pd,unit); print(\"CAL=\"+pw+\",\"+ph+\",\"+pd+\",\"+unit);\n\
+             for (i=1;i<=nSlices;i++) {{ setSlice(i); print(\"LABEL\"+i+\"=\"+getMetadata(\"Label\")); }}\n\
+             saveAs(\"Tiff\", \"{out}\");",
+            a = first.display(),
+            b = second.display(),
+            out = out.display()
+        ))
+        .unwrap();
+    let inputs = [gray8_doc("dup.tif", 2, 2, 1), gray8_doc("dup.tif", 2, 2, 2)];
+    let (session, id) = images_to_stack_session(&inputs, images_to_stack_options("DUP"));
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "duplicate titles");
+    assert_eq!(
+        session.get_image(id).unwrap().slice_labels,
+        vec![Some("dup.tif".to_string()), Some("dup.tif".to_string())]
+    );
+}
+
+#[test]
+fn parity_images_to_stack_errors() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle_error = |body: &str| match bridge.eval_macro(body) {
+        Err(ij_bridge::BridgeError::MacroAborted { message, .. }) => message,
+        other => panic!("expected a macro abort, got {other:?}"),
+    };
+
+    // Fewer than two 2D images (ImagesToStack.java 52-63).
+    let message =
+        oracle_error("newImage(\"a\", \"8-bit\", 2, 2, 1); run(\"Images to Stack\", \"name=X\");");
+    assert!(
+        message.contains("At least two open 2D images required."),
+        "{message}"
+    );
+    let mut session = Session::new();
+    session.insert_doc(gray8_doc("a", 2, 2, 1));
+    let error = session
+        .dispatch(Command::ImagesToStack {
+            options: images_to_stack_options("X"),
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("At least two open 2D images required."),
+        "{error}"
+    );
+
+    // A macro without options cannot show the size dialog, so differing sizes
+    // are an error (ImagesToStack.java 66-74).
+    let message = oracle_error(
+        "newImage(\"a\", \"8-bit\", 2, 2, 1); newImage(\"b\", \"8-bit\", 3, 2, 1);\n\
+         run(\"Images to Stack\");",
+    );
+    assert!(
+        message.contains("Images are not all the same size"),
+        "{message}"
+    );
+    let mut session = Session::new();
+    session.insert_doc(gray8_doc("a", 2, 2, 1));
+    session.insert_doc(gray8_doc("b", 3, 2, 1));
+    let error = session
+        .dispatch(Command::ImagesToStackMacro)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("Images are not all the same size"),
+        "{error}"
+    );
+    // The failed command leaves both source images untouched.
+    assert_eq!(session.image_ids().len(), 2);
+
+    // A filter that matches nothing (ImagesToStack.java 96-100).
+    let message = oracle_error(
+        "newImage(\"a\", \"8-bit\", 2, 2, 1); newImage(\"b\", \"8-bit\", 2, 2, 1);\n\
+         run(\"Images to Stack\", \"name=X title=zzz\");",
+    );
+    assert!(
+        message.contains("None of the images have a title containing \"zzz\""),
+        "{message}"
+    );
+    let mut session = Session::new();
+    session.insert_doc(gray8_doc("a", 2, 2, 1));
+    session.insert_doc(gray8_doc("b", 2, 2, 1));
+    let mut options = images_to_stack_options("X");
+    options.title_filter = "zzz".into();
+    let error = session
+        .dispatch(Command::ImagesToStack { options })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("None of the images have a title containing \"zzz\""),
+        "{error}"
+    );
+    // The failed command leaves both source images untouched.
+    assert_eq!(session.image_ids().len(), 2);
+}
+
+#[test]
+fn parity_images_to_stack_inverted_lut_harness() {
+    // The macro language cannot build an inverted LUT stack and a TIFF save
+    // drops grayscale LUTs, so the LUT rules are observed through the
+    // ImagePlus API (ImagesToStack.java 148-152, 205-207).
+    let stdout = run_java_harness(
+        "ImagesToStackLutHarness",
+        r#"
+import ij.*;
+import ij.process.*;
+import ij.plugin.*;
+import java.awt.image.*;
+
+public class ImagesToStackLutHarness {
+    static IndexColorModel inverted() {
+        byte[] r = new byte[256], g = new byte[256], b = new byte[256];
+        for (int i=0;i<256;i++) { r[i]=(byte)(255-i); g[i]=(byte)(255-i); b[i]=(byte)(255-i); }
+        return new IndexColorModel(8, 256, r, g, b);
+    }
+    static IndexColorModel color() {
+        byte[] r = new byte[256], g = new byte[256], b = new byte[256];
+        for (int i=0;i<256;i++) { r[i]=(byte)((i%2==0)?0:255); g[i]=0; b[i]=0; }
+        return new IndexColorModel(8, 256, r, g, b);
+    }
+    static ImagePlus img(String title, byte[] px, IndexColorModel cm) {
+        return new ImagePlus(title, new ByteProcessor(2,2,px,cm));
+    }
+    static void dump(String tag, ImagePlus imp) {
+        System.out.println(tag+"_TITLE="+imp.getTitle());
+        System.out.println(tag+"_BD="+imp.getBitDepth());
+        System.out.println(tag+"_INV="+imp.getProcessor().isInvertedLut());
+        System.out.println(tag+"_MINMAX="+imp.getProcessor().getMin()+","+imp.getProcessor().getMax());
+        StringBuilder sb = new StringBuilder();
+        for (int s=1;s<=imp.getStackSize();s++) {
+            ImageProcessor ip = imp.getStack().getProcessor(s);
+            sb.append("SL"+s+"=");
+            for (int i=0;i<4;i++) sb.append(ip.getPixel(i%2,i/2)).append("/").append(ip.getPixelValue(i%2,i/2)).append(",");
+            sb.append(";");
+        }
+        System.out.println(tag+"_PIX="+sb);
+    }
+    public static void main(String[] args) {
+        ImagePlus a = img("a", new byte[]{0,1,2,(byte)255}, inverted());
+        ImagePlus b = img("b", new byte[]{10,11,12,(byte)200}, inverted());
+        dump("ALL", ImagesToStack.run(new ImagePlus[]{a,b}));
+        ImagePlus c = img("c", new byte[]{0,1,2,(byte)255}, inverted());
+        ImagePlus d = img("d", new byte[]{10,11,12,(byte)200}, null);
+        dump("MIX", ImagesToStack.run(new ImagePlus[]{c,d}));
+        ImagePlus e = img("e", new byte[]{0,1,2,(byte)255}, null);
+        ImagePlus f = img("f", new byte[]{10,11,12,(byte)200}, inverted());
+        dump("MIX2", ImagesToStack.run(new ImagePlus[]{e,f}));
+        ImagePlus g = img("g", new byte[]{0,1,2,(byte)255}, color());
+        g.setTypeToColor256();
+        System.out.println("G_TYPE="+g.getType());
+        ImagePlus h = img("h", new byte[]{7,0,0,0}, null);
+        dump("C256", ImagesToStack.run(new ImagePlus[]{g,h}));
+    }
+}
+"#,
+    );
+    let inverted_lut = ij_core::Lut256 {
+        r: (0..=255u8).map(|i| 255 - i).collect(),
+        g: (0..=255u8).map(|i| 255 - i).collect(),
+        b: (0..=255u8).map(|i| 255 - i).collect(),
+    };
+    let color_lut = ij_core::Lut256 {
+        r: (0..=255u8)
+            .map(|i| if i % 2 == 0 { 0 } else { 255 })
+            .collect(),
+        g: vec![0; 256],
+        b: vec![0; 256],
+    };
+    let inverted_doc = |title: &str, pixels: Vec<u8>| {
+        ImageDocument::new(
+            title,
+            2,
+            2,
+            PixelPlane::Color256 {
+                pixels,
+                lut: Box::new(inverted_lut.clone()),
+            },
+        )
+        .unwrap()
+    };
+
+    // All inputs inverted: no pixel inversion and the stack keeps the LUT
+    // (ImagesToStack.java 148-152, 205-207).
+    assert_eq!(stack_convert_field(&stdout, "ALL_BD"), "8");
+    assert_eq!(stack_convert_field(&stdout, "ALL_INV"), "true");
+    let (session, id) = images_to_stack_session(
+        &[
+            inverted_doc("a", vec![0, 1, 2, 255]),
+            inverted_doc("b", vec![10, 11, 12, 200]),
+        ],
+        images_to_stack_options("Stack"),
+    );
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(doc.slices.len(), 2);
+    let PixelPlane::Color256 { pixels, lut } = &doc.slices[0] else {
+        panic!("all-inverted output keeps the LUT: {:?}", doc.slices[0]);
+    };
+    assert_eq!(pixels, &vec![0, 1, 2, 255]);
+    assert_eq!(lut.as_ref(), &inverted_lut);
+    assert_eq!(
+        stack_convert_field(&stdout, "ALL_PIX"),
+        "SL1=0/0.0,1/1.0,2/2.0,255/255.0,;SL2=10/10.0,11/11.0,12/12.0,200/200.0,;"
+    );
+
+    // Mixed LUTs invert the inverted slices' pixels and drop the LUT
+    // (ImagesToStack.java 148-152, 205-207).
+    assert_eq!(stack_convert_field(&stdout, "MIX_INV"), "false");
+    let (session, id) = images_to_stack_session(
+        &[
+            inverted_doc("c", vec![0, 1, 2, 255]),
+            gray8_doc("d", 2, 2, 10),
+        ],
+        images_to_stack_options("Stack"),
+    );
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        doc.slices[0],
+        PixelPlane::Gray8(vec![255, 254, 253, 0]),
+        "the inverted slice's pixels are inverted"
+    );
+    assert_eq!(doc.slices[1], PixelPlane::Gray8(vec![10, 11, 12, 13]));
+    assert_eq!(
+        stack_convert_field(&stdout, "MIX_PIX"),
+        "SL1=255/255.0,254/254.0,253/253.0,0/0.0,;SL2=10/10.0,11/11.0,12/12.0,200/200.0,;"
+    );
+
+    // A COLOR_256 input raises stackType to rgb and is converted through its
+    // LUT (ImagesToStack.java 262-264, TypeConverter.java 248-255).
+    assert_eq!(stack_convert_field(&stdout, "G_TYPE"), "3");
+    assert_eq!(stack_convert_field(&stdout, "C256_BD"), "24");
+    let (session, id) = images_to_stack_session(
+        &[
+            ImageDocument::new(
+                "g",
+                2,
+                2,
+                PixelPlane::Color256 {
+                    pixels: vec![0, 1, 2, 255],
+                    lut: Box::new(color_lut),
+                },
+            )
+            .unwrap(),
+            ImageDocument::new("h", 2, 2, PixelPlane::Gray8(vec![7, 0, 0, 0])).unwrap(),
+        ],
+        images_to_stack_options("Stack"),
+    );
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        doc.slices[0],
+        PixelPlane::ColorRgb(vec![0xff00_0000, 0xffff_0000, 0xff00_0000, 0xffff_0000])
+    );
+    assert_eq!(
+        doc.slices[1],
+        PixelPlane::ColorRgb(vec![0xff07_0707, 0xff00_0000, 0xff00_0000, 0xff00_0000])
+    );
+}
+
+/// Runs `run("Stack to Images")` after `setup` created the source stack, then
+/// dumps every resulting window and saves each as TIFF.
+fn stack_to_images_oracle(
+    bridge: &JavaOracleBridge,
+    setup: &str,
+    dir: &std::path::Path,
+) -> ij_bridge::OracleRunOutput {
+    let macro_code = format!(
+        "{setup}\n\
+         print(\"BEFORE=\"+nImages);\n\
+         run(\"Stack to Images\");\n\
+         print(\"AFTER=\"+nImages);\n\
+         for (i=1;i<=nImages;i++) {{ selectImage(i);\n\
+           print(\"T\"+i+\"=\"+getTitle());\n\
+           print(\"S\"+i+\"=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices+\",\"+bitDepth());\n\
+           getMinAndMax(mn,mx); print(\"M\"+i+\"=\"+mn+\",\"+mx);\n\
+           getVoxelSize(pw,ph,pd,unit); print(\"C\"+i+\"=\"+pw+\",\"+ph+\",\"+pd+\",\"+unit);\n\
+           saveAs(\"Tiff\", \"{dir}/img\"+i+\".tif\"); }}\n",
+        dir = dir.display()
+    );
+    bridge.eval_macro(&macro_code).unwrap()
+}
+
+fn stack_to_images_session(
+    source: &ImageDocument,
+) -> (Session, ij_session::ImageId, Vec<ij_session::ImageId>) {
+    let mut session = Session::new();
+    let source_id = session.insert_doc(source.clone());
+    match session.dispatch(Command::StackToImages) {
+        Ok(CommandOutcome::ImagesOpened(ids)) => (session, source_id, ids),
+        other => panic!("Stack to Images must open images, got {other:?}"),
+    }
+}
+
+fn assert_stack_to_images_matches(
+    oracle: &ij_bridge::OracleRunOutput,
+    dir: &std::path::Path,
+    session: &Session,
+    ids: &[ij_session::ImageId],
+    context: &str,
+) {
+    assert_eq!(
+        stack_convert_field(&oracle.stdout, "AFTER")
+            .parse::<usize>()
+            .unwrap(),
+        ids.len(),
+        "{context}: window count"
+    );
+    for (index, id) in ids.iter().enumerate() {
+        let doc = session.get_image(*id).unwrap();
+        let n = index + 1;
+        assert_eq!(
+            stack_convert_field(&oracle.stdout, &format!("T{n}")),
+            doc.title,
+            "{context}: image {n} title"
+        );
+        assert_eq!(
+            stack_convert_size(&oracle.stdout, &format!("S{n}")),
+            [
+                doc.width,
+                doc.height,
+                1,
+                u32::from(zproject_expected_bitdepth(doc.plane()))
+            ],
+            "{context}: image {n} size"
+        );
+        assert_display_range(
+            doc,
+            parse_minmax(stack_convert_field(&oracle.stdout, &format!("M{n}"))),
+            &format!("{context}: image {n}"),
+        );
+        assert_stack_convert_calibration(
+            doc,
+            stack_convert_calibration(&oracle.stdout, &format!("C{n}")),
+            &format!("{context}: image {n}"),
+        );
+        let java = load_tiff(dir.join(format!("img{n}.tif"))).unwrap();
+        assert_stack_convert_planes(doc, &java, &format!("{context}: image {n}"));
+    }
+}
+
+#[test]
+fn parity_stack_to_images_titles_labels_calibration() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // convertStackToImages copies the stack calibration to every image, uses
+    // the short slice label as the title and closes the source
+    // (StackEditor.java 263-310).
+    let setup = "newImage(\"My Stack.tif\", \"8-bit\", 2, 2, 3);\n\
+                 for (i=1;i<=3;i++) { setSlice(i); setPixel(0,0,i*10); setMetadata(\"Label\", \"lbl\"+i); }\n\
+                 setVoxelSize(0.5, 0.25, 1, \"um\");\n\
+                 setMinAndMax(10, 30);";
+    let oracle = stack_to_images_oracle(&bridge, setup, dir.path());
+    assert_eq!(stack_convert_field(&oracle.stdout, "BEFORE"), "1");
+    assert_eq!(stack_convert_field(&oracle.stdout, "AFTER"), "3");
+
+    let mut source = ImageDocument::new_stack(
+        "My Stack.tif",
+        2,
+        2,
+        (1..=3u8)
+            .map(|s| {
+                let mut pixels = vec![255u8; 4];
+                pixels[0] = s * 10;
+                PixelPlane::Gray8(pixels)
+            })
+            .collect(),
+    )
+    .unwrap();
+    source.slice_labels = vec![
+        Some("lbl1".into()),
+        Some("lbl2".into()),
+        Some("lbl3".into()),
+    ];
+    source.calibration.pixel_width = 0.5;
+    source.calibration.pixel_height = 0.25;
+    source.calibration.unit = "\u{00b5}m".into();
+    source.display_range = DisplayRange {
+        min: 10.0,
+        max: 30.0,
+    };
+    let (session, source_id, ids) = stack_to_images_session(&source);
+    assert_stack_to_images_matches(&oracle, dir.path(), &session, &ids, "labels");
+    assert_eq!(
+        ids.iter()
+            .map(|id| session.get_image(*id).unwrap().title.clone())
+            .collect::<Vec<_>>(),
+        vec!["lbl1", "lbl2", "lbl3"]
+    );
+    assert!(
+        session.get_image(source_id).is_none(),
+        "the source stack is closed"
+    );
+    assert_eq!(session.active_image_id(), ids.last().copied());
+}
+
+#[test]
+fn parity_stack_to_images_label_rules() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // getShortSliceLabel drops the extension, truncates at a newline and caps
+    // at 60 characters; a label containing "/", "\" or ":" is rejected and the
+    // generated title is used instead (StackEditor.java 269-272, 312-328;
+    // ImageStack.java 282-295).
+    //
+    // The newline label also sets the "Info" property (StackEditor.java
+    // 276-278), which the TIFF writer cannot round-trip, so this test compares
+    // titles and sizes only.
+    let setup = "newImage(\"S2\", \"8-bit\", 2, 2, 5);\n\
+                 setSlice(1); setMetadata(\"Label\", \"a/b\");\n\
+                 setSlice(2); setMetadata(\"Label\", \"name.tif\");\n\
+                 setSlice(3); setMetadata(\"Label\", \"line1\\nline2\");\n\
+                 setSlice(4); setMetadata(\"Label\", \"0123456789012345678901234567890123456789012345678901234567890123456789\");\n\
+                 setSlice(5); setMetadata(\"Label\", \"\");";
+    let oracle = bridge
+        .eval_macro(&format!(
+            "{setup}\n\
+             run(\"Stack to Images\");\n\
+             print(\"AFTER=\"+nImages);\n\
+             for (i=1;i<=nImages;i++) {{ selectImage(i);\n\
+               print(\"T\"+i+\"=\"+getTitle());\n\
+               print(\"S\"+i+\"=\"+getWidth()+\",\"+getHeight()+\",\"+nSlices+\",\"+bitDepth()); }}"
+        ))
+        .unwrap();
+    let mut source = ImageDocument::new_stack(
+        "S2",
+        2,
+        2,
+        (0..5).map(|_| PixelPlane::Gray8(vec![255; 4])).collect(),
+    )
+    .unwrap();
+    source.slice_labels = vec![
+        Some("a/b".into()),
+        Some("name.tif".into()),
+        Some("line1\nline2".into()),
+        Some("0123456789012345678901234567890123456789012345678901234567890123456789".into()),
+        None,
+    ];
+    let (session, _, ids) = stack_to_images_session(&source);
+    assert_eq!(
+        stack_convert_field(&oracle.stdout, "AFTER")
+            .parse::<usize>()
+            .unwrap(),
+        ids.len()
+    );
+    for (index, id) in ids.iter().enumerate() {
+        let doc = session.get_image(*id).unwrap();
+        let n = index + 1;
+        assert_eq!(
+            stack_convert_field(&oracle.stdout, &format!("T{n}")),
+            doc.title,
+            "image {n} title"
+        );
+        assert_eq!(
+            stack_convert_size(&oracle.stdout, &format!("S{n}")),
+            [doc.width, doc.height, 1, 8],
+            "image {n} size"
+        );
+    }
+    assert_eq!(
+        ids.iter()
+            .map(|id| session.get_image(*id).unwrap().title.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "S2-0001",
+            "name",
+            "line1",
+            "012345678901234567890123456789012345678901234567890123456789",
+            "S2-0005",
+        ]
+    );
+}
+
+#[test]
+fn parity_stack_to_images_types() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    // 16-bit stack: every image keeps the stack's display range
+    // (ImageStack.java 308-336).
+    let setup16 = "newImage(\"s16\", \"16-bit\", 2, 2, 2);\n\
+                   for (i=1;i<=2;i++) { setSlice(i); setPixel(0,0,i*1000); }\n\
+                   setMinAndMax(500, 2000);";
+    let oracle16 = stack_to_images_oracle(&bridge, setup16, dir.path());
+    let mut source16 = ImageDocument::new_stack(
+        "s16",
+        2,
+        2,
+        (1..=2u16)
+            .map(|s| {
+                let mut pixels = vec![0u16; 4];
+                pixels[0] = s * 1000;
+                PixelPlane::Gray16(pixels)
+            })
+            .collect(),
+    )
+    .unwrap();
+    source16.display_range = DisplayRange {
+        min: 500.0,
+        max: 2000.0,
+    };
+    let (session16, _, ids16) = stack_to_images_session(&source16);
+    assert_stack_to_images_matches(&oracle16, dir.path(), &session16, &ids16, "16-bit stack");
+
+    // 32-bit stack with NaN and negative values.
+    let setup32 = "newImage(\"s32\", \"32-bit\", 2, 2, 2);\n\
+                   setSlice(1); setPixel(0,0,1.5); setPixel(1,0,-2.25);\n\
+                   setSlice(2); setPixel(0,0,0/0); setPixel(1,0,400.5);\n\
+                   setMinAndMax(-2.25, 400.5);";
+    let oracle32 = stack_to_images_oracle(&bridge, setup32, dir.path());
+    let mut source32 = ImageDocument::new_stack(
+        "s32",
+        2,
+        2,
+        vec![
+            PixelPlane::Gray32(vec![1.5, -2.25, 0.0, 0.0]),
+            PixelPlane::Gray32(vec![f32::NAN, 400.5, 0.0, 0.0]),
+        ],
+    )
+    .unwrap();
+    source32.display_range = DisplayRange {
+        min: -2.25,
+        max: 400.5,
+    };
+    let (session32, _, ids32) = stack_to_images_session(&source32);
+    assert_stack_to_images_matches(&oracle32, dir.path(), &session32, &ids32, "32-bit stack");
+
+    // RGB stack.
+    let setup_rgb = "newImage(\"srgb\", \"RGB black\", 2, 2, 2);\n\
+                     setSlice(1); setPixel(0,0,0xff0000); setPixel(1,0,0x0080ff);\n\
+                     setSlice(2); setPixel(0,0,0x010203); setPixel(1,0,0xfafbfc);";
+    let oracle_rgb = stack_to_images_oracle(&bridge, setup_rgb, dir.path());
+    let source_rgb = ImageDocument::new_stack(
+        "srgb",
+        2,
+        2,
+        vec![
+            PixelPlane::ColorRgb(vec![0xffff_0000, 0xff00_80ff, 0xff00_0000, 0xff00_0000]),
+            PixelPlane::ColorRgb(vec![0xff01_0203, 0xfffa_fbfc, 0xff00_0000, 0xff00_0000]),
+        ],
+    )
+    .unwrap();
+    let (session_rgb, _, ids_rgb) = stack_to_images_session(&source_rgb);
+    assert_stack_to_images_matches(&oracle_rgb, dir.path(), &session_rgb, &ids_rgb, "RGB stack");
+}
+
+#[test]
+fn parity_stack_to_images_color256_stack() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // A palette stack keeps its LUT on every output image
+    // (ImageStack.java 308-336, StackEditor.java 273-281).
+    let lut = ij_core::Lut256 {
+        r: (0..=255u8)
+            .map(|i| if i % 2 == 0 { 0 } else { 255 })
+            .collect(),
+        g: vec![0; 256],
+        b: vec![0; 256],
+    };
+    let source = ImageDocument::new_stack(
+        "palette",
+        2,
+        2,
+        vec![
+            PixelPlane::Color256 {
+                pixels: vec![0, 1, 2, 255],
+                lut: Box::new(lut.clone()),
+            },
+            PixelPlane::Color256 {
+                pixels: vec![3, 4, 5, 6],
+                lut: Box::new(lut.clone()),
+            },
+        ],
+    )
+    .unwrap();
+    let path = dir.path().join("palette.tif");
+    save_tiff(&path, &source).unwrap();
+    let oracle = stack_to_images_oracle(&bridge, &format!("open(\"{}\");", path.display()), dir.path());
+    let (session, _, ids) = stack_to_images_session(&source);
+    assert_stack_to_images_matches(&oracle, dir.path(), &session, &ids, "palette stack");
+    for id in &ids {
+        let doc = session.get_image(*id).unwrap();
+        let PixelPlane::Color256 { lut: actual, .. } = doc.plane() else {
+            panic!("palette slices stay indexed: {:?}", doc.plane());
+        };
+        assert_eq!(actual.as_ref(), &lut);
+    }
+}
+
+#[test]
+fn parity_stack_to_images_single_slice_error() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let message = match bridge
+        .eval_macro("newImage(\"one\", \"8-bit\", 2, 2, 1); run(\"Stack to Images\");")
+    {
+        Err(ij_bridge::BridgeError::MacroAborted { message, .. }) => message,
+        other => panic!("expected a macro abort, got {other:?}"),
+    };
+    assert!(
+        message.contains("\"Convert Stack to Images\" requires a stack"),
+        "{message}"
+    );
+
+    let mut session = Session::new();
+    let id = session.insert_doc(gray8_doc("one", 2, 2, 1));
+    let error = session
+        .dispatch(Command::StackToImages)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("\"Convert Stack to Images\" requires a stack"),
+        "{error}"
+    );
+    // The single image is untouched.
+    assert_eq!(session.image_ids(), vec![id]);
+    assert_eq!(session.get_image(id).unwrap().slices.len(), 1);
+}
+
+#[test]
+fn parity_images_to_stack_recorder_options() {
+    // GenericDialog smart recording (GenericDialog.java 1230-1236, 1253-1259,
+    // 1327-1336, 1342-1356, 1428-1436; Recorder.java 472-482, 547-556,
+    // 773-780). The Method choice is recorded only when the user changed it
+    // from the dialog's initial index, which is why the harness passes
+    // `staticMethod` explicitly.
+    let stdout = run_java_harness(
+        "ImagesToStackRecorderHarness",
+        r#"
+import ij.*;
+import ij.gui.*;
+import ij.plugin.frame.Recorder;
+import ij.macro.*;
+
+public class ImagesToStackRecorderHarness {
+    static final String[] methods = {"Copy (center)", "Copy (top-left)", "Scale (smallest)", "Scale (largest)"};
+
+    // Recorder.resetCommandOptions() clears the static between runs, so each
+    // case reports the complete option string for that dialog. Trimming would
+    // hide the single space GenericDialog records for an unchanged string field
+    // or an unchecked checkbox when nothing else was recorded
+    // (GenericDialog.java 1334-1335, 1268-1269).
+    static String options() {
+        String all = Recorder.getCommandOptions();
+        return all == null ? "<null>" : all;
+    }
+
+    static void run(String macroOptions, int staticMethod, boolean staticBicubic, boolean staticTitles, boolean staticKeep) {
+        Recorder.record = true;
+        Recorder.recordInMacros = true;
+        Recorder.resetCommandOptions();
+        Macro.setOptions(macroOptions);
+        GenericDialog gd = new GenericDialog("Images to Stack");
+        gd.addChoice("Method:", methods, methods[staticMethod]);
+        gd.setSmartRecording(true);
+        gd.addStringField("Name:", "Stack", 12);
+        gd.addStringField("Title contains:", "", 12);
+        gd.addStringField("Fill color:", "", 12);
+        gd.addCheckbox("Bicubic interpolation", staticBicubic);
+        gd.addCheckbox("Use titles as labels", staticTitles);
+        gd.addCheckbox("Keep source images", staticKeep);
+        gd.showDialog();
+        if (gd.wasCanceled()) { System.out.println("CANCELED"); return; }
+        gd.getNextChoiceIndex();
+        gd.getNextString();
+        gd.getNextString();
+        gd.getNextString();
+        gd.getNextBoolean();
+        gd.getNextBoolean();
+        gd.getNextBoolean();
+    }
+
+    public static void main(String[] args) {
+        Thread.currentThread().setName("Run$_harness");
+        Interpreter.batchMode = true;
+        run("dummy", 0, false, true, false);
+        System.out.println("A_DEFAULT=[" + options() + "]");
+        run("method=[Scale (smallest)]", 0, false, true, false);
+        System.out.println("B_METHOD=[" + options() + "]");
+        run("method=[Scale (largest)] name=Merged", 0, false, true, false);
+        System.out.println("C_NAME=[" + options() + "]");
+        run("dummy", 2, false, true, false);
+        System.out.println("D_STATIC2=[" + options() + "]");
+        run("method=[Scale (smallest)]", 2, false, true, false);
+        System.out.println("E_STATIC2_SAME=[" + options() + "]");
+        run("bicubic", 0, true, true, false);
+        System.out.println("F_BICUBIC=[" + options() + "]");
+        run("dummy", 0, false, false, false);
+        System.out.println("G_NOUSE=[" + options() + "]");
+        run("fill=red", 0, false, true, false);
+        System.out.println("H_FILL=[" + options() + "]");
+        run("title=abc", 0, false, true, false);
+        System.out.println("I_TITLE=[" + options() + "]");
+        run("name=[]", 0, false, true, false);
+        System.out.println("J_EMPTYNAME=[" + options() + "]");
+        run("dummy", 0, false, true, true);
+        System.out.println("K_KEEP=[" + options() + "]");
+        System.exit(0);
+    }
+}
+"#,
+    );
+
+    // Two images of different sizes so `sizesDiffer` is true and the Method
+    // choice and Bicubic checkbox exist (ImagesToStack.java 65, 85-94).
+    let inputs = [
+        gray8_doc("abc", 2, 2, 1),
+        gray8_doc("abcd", 4, 3, 2),
+    ];
+    let cases: [(&str, ImagesToStackOptions); 10] = [
+        ("A_DEFAULT", images_to_stack_options("Stack")),
+        (
+            "B_METHOD",
+            ImagesToStackOptions {
+                method: ImagesToStackMethod::ScaleSmallest,
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "C_NAME",
+            ImagesToStackOptions {
+                method: ImagesToStackMethod::ScaleLargest,
+                name: "Merged".into(),
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "D_STATIC2",
+            ImagesToStackOptions {
+                method: ImagesToStackMethod::ScaleSmallest,
+                method_default: ImagesToStackMethod::ScaleSmallest,
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "E_STATIC2_SAME",
+            ImagesToStackOptions {
+                method: ImagesToStackMethod::ScaleSmallest,
+                method_default: ImagesToStackMethod::ScaleSmallest,
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "F_BICUBIC",
+            ImagesToStackOptions {
+                bicubic: true,
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "G_NOUSE",
+            ImagesToStackOptions {
+                titles_as_labels: false,
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "H_FILL",
+            ImagesToStackOptions {
+                fill: "red".into(),
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "I_TITLE",
+            ImagesToStackOptions {
+                title_filter: "abc".into(),
+                ..images_to_stack_options("Stack")
+            },
+        ),
+        (
+            "J_EMPTYNAME",
+            ImagesToStackOptions {
+                name: String::new(),
+                ..images_to_stack_options("Stack")
+            },
+        ),
+    ];
+    for (key, options) in cases {
+        let (session, _) = images_to_stack_session(&inputs, options);
+        let recorded = session
+            .macro_recorder
+            .last()
+            .expect("Images to Stack records a run() call");
+        let inner = recorded
+            .strip_prefix("run(\"Images to Stack\", \"")
+            .and_then(|rest| rest.strip_suffix("\");"))
+            .unwrap_or_else(|| panic!("unexpected recorder line {recorded}"));
+        // The harness brackets each value so a single-space option string stays
+        // visible in the log; `<null>` means the dialog recorded nothing.
+        let java = stack_convert_field(&stdout, key);
+        let java = java
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or_else(|| panic!("{key}: unbracketed harness value {java}"));
+        let java = if java == "<null>" { "" } else { java };
+        assert_eq!(inner, java, "{key}: recorder options");
+    }
+
+    // "Keep source images" checked (K_KEEP).
+    let (session, _) = images_to_stack_session(
+        &inputs,
+        ImagesToStackOptions {
+            keep: true,
+            ..images_to_stack_options("Stack")
+        },
+    );
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some(&format!(
+            "run(\"Images to Stack\", \"{}\");",
+            stack_convert_field(&stdout, "K_KEEP")
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+        ) as &str)
+    );
+}
+
+// ===================================================================
+// P4.4c review fixes — shared resize, window bookkeeping, labels, recorder
+// ===================================================================
+
+/// `ImageProcessor.resizeLinearly` (ImageProcessor.java 2346-2382) is the
+/// dedicated path for a source that is one pixel wide or tall: Java rotates a
+/// one-column image so the long axis is horizontal, interpolates row 0 with
+/// `scale = (width1-1)/(width2-1)`, replicates that row and rotates back. The
+/// generic 2D algorithm samples the wrong axis, so this table pins the Java
+/// output for both orientations, every processor type and every interpolation
+/// method. `ByteProcessor.java 990-994`, `ShortProcessor.java 907-911`,
+/// `FloatProcessor.java 897-901` and `ColorProcessor.java 975-985` all dispatch
+/// here before their own 2D code.
+#[test]
+fn parity_size_one_pixel_source_matches_java_resize_linearly() {
+    use ij_core::transform::Interpolation;
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // (tag, Java type, Java fill loop, Rust plane, dst width, dst height)
+    let column = |value: f64| -> Vec<f64> { (0..5).map(|y| y as f64 * value).collect() };
+    let cases: [(&str, &str, &str, PixelPlane, u32, u32); 8] = [
+        (
+            "8-bit column",
+            "8-bit black",
+            "for (y=0;y<5;y++) setPixel(0,y,y*50);",
+            PixelPlane::Gray8(column(50.0).into_iter().map(|v| v as u8).collect()),
+            4,
+            3,
+        ),
+        (
+            "8-bit row",
+            "8-bit black",
+            "for (x=0;x<5;x++) setPixel(x,0,x*50);",
+            PixelPlane::Gray8(column(50.0).into_iter().map(|v| v as u8).collect()),
+            3,
+            4,
+        ),
+        (
+            "16-bit column",
+            "16-bit black",
+            "for (y=0;y<5;y++) setPixel(0,y,y*1000+1);",
+            PixelPlane::Gray16(column(1000.0).into_iter().map(|v| v as u16 + 1).collect()),
+            4,
+            3,
+        ),
+        (
+            "32-bit column",
+            "32-bit black",
+            "for (y=0;y<5;y++) setPixel(0,y,y*0.25);",
+            PixelPlane::Gray32(column(0.25).into_iter().map(|v| v as f32).collect()),
+            4,
+            3,
+        ),
+        (
+            "RGB column",
+            "RGB black",
+            "for (y=0;y<5;y++) setPixel(0,y,y*50);",
+            PixelPlane::ColorRgb(
+                column(50.0)
+                    .into_iter()
+                    .map(|v| 0xff00_0000 | (v as u32) * 0x0001_0101)
+                    .collect(),
+            ),
+            4,
+            3,
+        ),
+        (
+            "RGB row",
+            "RGB black",
+            "for (x=0;x<5;x++) setPixel(x,0,x*50);",
+            PixelPlane::ColorRgb(
+                column(50.0)
+                    .into_iter()
+                    .map(|v| 0xff00_0000 | (v as u32) * 0x0001_0101)
+                    .collect(),
+            ),
+            3,
+            4,
+        ),
+        // A one-pixel destination divides by zero in `scale`, so Java's
+        // `fraction` is NaN and `convertToByte` turns the sample into 0.
+        (
+            "8-bit column to single line",
+            "8-bit black",
+            "for (y=0;y<5;y++) setPixel(0,y,y*50);",
+            PixelPlane::Gray8(column(50.0).into_iter().map(|v| v as u8).collect()),
+            4,
+            1,
+        ),
+        // A 1x1 source keeps `scale = 0`, so every output pixel repeats it.
+        (
+            "8-bit single pixel",
+            "8-bit black",
+            "setPixel(0,0,77);",
+            PixelPlane::Gray8(vec![77]),
+            4,
+            3,
+        ),
+    ];
+
+    for (tag, java_type, fill, plane, dst_width, dst_height) in cases {
+        let (src_width, src_height) = if tag.ends_with("row") {
+            (5, 1)
+        } else if tag == "8-bit single pixel" {
+            (1, 1)
+        } else {
+            (1, 5)
+        };
+        for method in [
+            Interpolation::Bilinear,
+            Interpolation::Bicubic,
+            Interpolation::None,
+        ] {
+            let oracle = bridge
+                .eval_macro(&format!(
+                    "newImage(\"t\",\"{java_type}\",{src_width},{src_height},1); {fill} \
+                     run(\"Size...\",\"width={dst_width} height={dst_height} average=false interpolation={}\"); \
+                     print(\"SIZE=\"+getWidth()+\",\"+getHeight()); \
+                     v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);",
+                    method.java_name(),
+                ))
+                .unwrap();
+            let expected: Vec<f64> = oracle_line(&oracle.stdout, "PX=")
+                .trim_start_matches("PX=")
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(|part| part.parse().unwrap())
+                .collect();
+            let mut session = Session::new();
+            let mut doc = ImageDocument::new("t", src_width, src_height, plane.clone()).unwrap();
+            if matches!(plane, PixelPlane::Gray32(_)) {
+                doc.display_range = DisplayRange { min: 0.0, max: 1.0 };
+            }
+            session.insert_doc(doc);
+            session
+                .dispatch(Command::Size {
+                    width: dst_width,
+                    height: dst_height,
+                    depth: None,
+                    constrain: false,
+                    average_when_downsizing: false,
+                    interpolation: method,
+                })
+                .unwrap();
+            let result = session.active_doc().unwrap();
+            assert_eq!(
+                oracle_line(&oracle.stdout, "SIZE="),
+                format!("SIZE={},{}", result.width, result.height),
+                "{tag} {method:?}: size"
+            );
+            let actual = result.plane();
+            assert_eq!(actual.len(), expected.len(), "{tag} {method:?}: pixel count");
+            for (index, want) in expected.iter().enumerate() {
+                assert!(
+                    (actual.sample_f64(index) - want).abs() < 0.0001,
+                    "{tag} {method:?}: pixel {index}: Java {want} Rust {}",
+                    actual.sample_f64(index)
+                );
+            }
+        }
+    }
+}
+
+/// The averaging path reaches `resizeLinearly` through
+/// `FloatProcessor.downsize`'s final `ip2.resize(dstWidth, dstHeight)`
+/// (FloatProcessor.java 966-967), so a one-pixel source must match there too.
+#[test]
+fn parity_size_one_pixel_source_with_averaging_matches_java() {
+    use ij_core::transform::Interpolation;
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let column: Vec<u8> = (0..5).map(|y| y * 50).collect();
+    let cases: [(&str, u32, u32, u32, u32); 3] = [
+        ("column upsized", 1, 5, 4, 3),
+        ("column downsized", 1, 5, 1, 3),
+        ("row downsized", 5, 1, 3, 1),
+    ];
+    for (tag, src_width, src_height, dst_width, dst_height) in cases {
+        let fill = if src_width == 1 {
+            "for (y=0;y<5;y++) setPixel(0,y,y*50);"
+        } else {
+            "for (x=0;x<5;x++) setPixel(x,0,x*50);"
+        };
+        let oracle = bridge
+            .eval_macro(&format!(
+                "newImage(\"t\",\"8-bit black\",{src_width},{src_height},1); {fill} \
+                 run(\"Size...\",\"width={dst_width} height={dst_height} average interpolation=Bilinear\"); \
+                 v=\"\"; for (y=0;y<getHeight();y++) for (x=0;x<getWidth();x++) v=v+getPixel(x,y)+\",\"; print(\"PX=\"+v);"
+            ))
+            .unwrap();
+        let expected: Vec<u8> = oracle_line(&oracle.stdout, "PX=")
+            .trim_start_matches("PX=")
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .map(|part| part.parse().unwrap())
+            .collect();
+        let mut session = Session::new();
+        session.insert_doc(
+            ImageDocument::new(
+                "t",
+                src_width,
+                src_height,
+                PixelPlane::Gray8(column.clone()),
+            )
+            .unwrap(),
+        );
+        session
+            .dispatch(Command::Size {
+                width: dst_width,
+                height: dst_height,
+                depth: None,
+                constrain: false,
+                average_when_downsizing: true,
+                interpolation: Interpolation::Bilinear,
+            })
+            .unwrap();
+        let PixelPlane::Gray8(actual) = session.active_doc().unwrap().plane() else {
+            panic!("{tag}: 8-bit")
+        };
+        assert_eq!(actual, &expected, "{tag}: pixels");
+    }
+}
+
+/// The review's repro: a 1x5 column plus a 4x3 image with `Scale (largest)`.
+/// Java's `resizeLinearly` makes every output row constant, so the old generic
+/// 2D resize produced `[0..], [50..], [150..]` instead of `[0..], [100..],
+/// [200..]` (ImagesToStack.java 212-216 → ByteProcessor.java 990-994).
+#[test]
+fn parity_images_to_stack_one_pixel_source_scale_largest() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    let setup = "newImage(\"a\", \"8-bit black\", 1, 5, 1);\n\
+                 for (y=0;y<5;y++) setPixel(0,y,y*50);\n\
+                 newImage(\"b\", \"8-bit black\", 4, 3, 1);\n\
+                 for (y=0;y<3;y++) for (x=0;x<4;x++) setPixel(x,y,x*64);";
+    let oracle = images_to_stack_oracle(
+        &bridge,
+        setup,
+        "name=Stack method=[Scale (largest)] use",
+        &out,
+    );
+    let inputs = [
+        ImageDocument::new(
+            "a",
+            1,
+            5,
+            PixelPlane::Gray8((0..5).map(|y| y * 50).collect()),
+        )
+        .unwrap(),
+        ImageDocument::new(
+            "b",
+            4,
+            3,
+            PixelPlane::Gray8((0..12).map(|i| (i % 4) * 64).collect()),
+        )
+        .unwrap(),
+    ];
+    let mut options = images_to_stack_options("Stack");
+    options.method = ImagesToStackMethod::ScaleLargest;
+    let (session, id) = images_to_stack_session(&inputs, options);
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "one-pixel scale largest");
+    let doc = session.get_image(id).unwrap();
+    assert_eq!((doc.width, doc.height), (4, 3));
+    let PixelPlane::Gray8(first) = &doc.slices[0] else {
+        panic!("8-bit")
+    };
+    assert_eq!(first, &vec![0u8; 4].into_iter().chain(vec![100u8; 4]).chain(vec![200u8; 4]).collect::<Vec<u8>>());
+}
+
+/// `ImagesToStackPlan::included` indexes the eligible 2D windows, not the full
+/// `WindowManager.getIDList` order, so the session must close the sources
+/// through the same filter. Java closes exactly the merged 2D images and leaves
+/// every stack window alone (ImagesToStack.java 60-66, 208-211).
+#[test]
+fn parity_images_to_stack_closes_only_the_merged_2d_windows() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    // The stack sits before, between and after the 2D inputs.
+    let layouts = [
+        ("stack first", "newImage(\"stk\",\"8-bit\",2,2,3); newImage(\"a\",\"8-bit\",2,2,1); newImage(\"b\",\"8-bit\",2,2,1);"),
+        ("stack between", "newImage(\"a\",\"8-bit\",2,2,1); newImage(\"stk\",\"8-bit\",2,2,3); newImage(\"b\",\"8-bit\",2,2,1);"),
+        ("stack last", "newImage(\"a\",\"8-bit\",2,2,1); newImage(\"b\",\"8-bit\",2,2,1); newImage(\"stk\",\"8-bit\",2,2,3);"),
+    ];
+    for (tag, setup) in layouts {
+        let oracle = bridge
+            .eval_macro(&format!(
+                "{setup} run(\"Images to Stack\", \"name=Stack use\"); \
+                 print(\"N=\"+nImages); \
+                 for (i=0;i<nImages;i++) {{ selectImage(i+1); print(\"W\"+i+\"=\"+getTitle()); }}"
+            ))
+            .unwrap();
+        let java: Vec<String> = (0..oracle_line(&oracle.stdout, "N=")
+            .trim_start_matches("N=")
+            .parse::<usize>()
+            .unwrap())
+            .map(|index| {
+                stack_convert_field(&oracle.stdout, &format!("W{index}")).to_string()
+            })
+            .collect();
+        assert_eq!(java, vec!["stk".to_string(), "Stack".to_string()], "{tag}: Java windows");
+
+        let stack = ImageDocument::new_stack(
+            "stk",
+            2,
+            2,
+            vec![PixelPlane::Gray8(vec![1; 4]); 3],
+        )
+        .unwrap();
+        let a = ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![2; 4])).unwrap();
+        let b = ImageDocument::new("b", 2, 2, PixelPlane::Gray8(vec![3; 4])).unwrap();
+        let inputs: Vec<ImageDocument> = match tag {
+            "stack first" => vec![stack, a, b],
+            "stack between" => vec![a, stack, b],
+            _ => vec![a, b, stack],
+        };
+        let mut session = Session::new();
+        let ids: Vec<ij_session::ImageId> = inputs
+            .into_iter()
+            .map(|doc| session.insert_doc(doc))
+            .collect();
+        let stack_id = match tag {
+            "stack first" => ids[0],
+            "stack between" => ids[1],
+            _ => ids[2],
+        };
+        let (a_id, b_id) = match tag {
+            "stack first" => (ids[1], ids[2]),
+            "stack between" => (ids[0], ids[2]),
+            _ => (ids[0], ids[1]),
+        };
+        let outcome = session
+            .dispatch(Command::ImagesToStack {
+                options: images_to_stack_options("Stack"),
+            })
+            .unwrap();
+        let CommandOutcome::ImageOpened(new_id) = outcome else {
+            panic!("{tag}: Images to Stack must open a stack")
+        };
+        assert_eq!(
+            session.image_ids(),
+            vec![stack_id, new_id],
+            "{tag}: the stack window survives and both 2D sources close"
+        );
+        assert!(session.get_image(a_id).is_none(), "{tag}: a closed");
+        assert!(session.get_image(b_id).is_none(), "{tag}: b closed");
+        assert_eq!(session.get_image(stack_id).unwrap().stack_size(), 3);
+        assert_eq!(session.get_image(new_id).unwrap().stack_size(), 2);
+        assert_eq!(session.active_image_id(), Some(new_id));
+    }
+}
+
+/// The same contract with "Keep source images" on and with a title filter that
+/// excludes one 2D image: only the merged windows may close, and a filtered-out
+/// 2D image stays open (ImagesToStack.java 208-211).
+#[test]
+fn parity_images_to_stack_keep_and_filter_with_a_stack_window() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let setup = "newImage(\"stk\",\"8-bit\",2,2,3); \
+                 newImage(\"keep\",\"8-bit\",2,2,1); \
+                 newImage(\"skip\",\"8-bit\",2,2,1); \
+                 newImage(\"keeper\",\"8-bit\",2,2,1);";
+    for (tag, options) in [
+        ("keep", "name=Stack use keep"),
+        ("filter", "name=Stack use title=keep"),
+        ("filter keep", "name=Stack use title=keep keep"),
+    ] {
+        let oracle = bridge
+            .eval_macro(&format!(
+                "{setup} run(\"Images to Stack\", \"{options}\"); \
+                 print(\"N=\"+nImages); \
+                 for (i=0;i<nImages;i++) {{ selectImage(i+1); print(\"W\"+i+\"=\"+getTitle()); }}"
+            ))
+            .unwrap();
+        let java: Vec<String> = (0..oracle_line(&oracle.stdout, "N=")
+            .trim_start_matches("N=")
+            .parse::<usize>()
+            .unwrap())
+            .map(|index| {
+                stack_convert_field(&oracle.stdout, &format!("W{index}")).to_string()
+            })
+            .collect();
+
+        let mut session = Session::new();
+        let stack_id = session.insert_doc(
+            ImageDocument::new_stack("stk", 2, 2, vec![PixelPlane::Gray8(vec![1; 4]); 3])
+                .unwrap(),
+        );
+        let keep_id =
+            session.insert_doc(ImageDocument::new("keep", 2, 2, PixelPlane::Gray8(vec![2; 4])).unwrap());
+        let skip_id =
+            session.insert_doc(ImageDocument::new("skip", 2, 2, PixelPlane::Gray8(vec![3; 4])).unwrap());
+        let keeper_id = session.insert_doc(
+            ImageDocument::new("keeper", 2, 2, PixelPlane::Gray8(vec![4; 4])).unwrap(),
+        );
+        let mut opts = images_to_stack_options("Stack");
+        let keep = tag.contains("keep");
+        let filtered = tag.starts_with("filter");
+        opts.keep = keep;
+        if filtered {
+            opts.title_filter = "keep".into();
+        }
+        let CommandOutcome::ImageOpened(new_id) =
+            session.dispatch(Command::ImagesToStack { options: opts }).unwrap()
+        else {
+            panic!("{tag}: Images to Stack must open a stack")
+        };
+        let titles: Vec<String> = session
+            .image_ids()
+            .into_iter()
+            .map(|id| session.get_image(id).unwrap().title.clone())
+            .collect();
+        assert_eq!(titles, java, "{tag}: surviving windows");
+        assert_eq!(session.get_image(stack_id).unwrap().stack_size(), 3, "{tag}: stack kept");
+        assert_eq!(
+            session.get_image(new_id).unwrap().stack_size(),
+            if filtered { 2 } else { 3 },
+            "{tag}: merged slice count"
+        );
+        // "skip" never matches the filter, so it is never merged.
+        assert_eq!(
+            session.get_image(skip_id).is_some(),
+            filtered || keep,
+            "{tag}: filtered-out image stays open"
+        );
+        for (name, id) in [("keep", keep_id), ("keeper", keeper_id)] {
+            assert_eq!(
+                session.get_image(id).is_some(),
+                keep,
+                "{tag}: merged image {name} survives only with keep"
+            );
+        }
+    }
+}
+
+/// `run("Images to Stack")` without options skips the dialog, forces
+/// `keep=false` and rejects differing sizes (ImagesToStack.java 64-75,
+/// 114-115). The close contract is the same as the dialog path.
+#[test]
+fn parity_images_to_stack_macro_without_options_with_a_stack_window() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage(\"stk\",\"8-bit\",2,2,3); \
+             newImage(\"a\",\"8-bit\",2,2,1); \
+             newImage(\"b\",\"8-bit\",2,2,1); \
+             run(\"Images to Stack\"); \
+             print(\"N=\"+nImages); \
+             for (i=0;i<nImages;i++) { selectImage(i+1); print(\"W\"+i+\"=\"+getTitle()); }",
+        )
+        .unwrap();
+    let java: Vec<String> = (0..oracle_line(&oracle.stdout, "N=")
+        .trim_start_matches("N=")
+        .parse::<usize>()
+        .unwrap())
+        .map(|index| stack_convert_field(&oracle.stdout, &format!("W{index}")).to_string())
+        .collect();
+    assert_eq!(java, vec!["stk".to_string(), "Stack".to_string()]);
+
+    let mut session = Session::new();
+    let stack_id = session.insert_doc(
+        ImageDocument::new_stack("stk", 2, 2, vec![PixelPlane::Gray8(vec![1; 4]); 3]).unwrap(),
+    );
+    session.insert_doc(ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![2; 4])).unwrap());
+    session.insert_doc(ImageDocument::new("b", 2, 2, PixelPlane::Gray8(vec![3; 4])).unwrap());
+    let CommandOutcome::ImageOpened(new_id) =
+        session.dispatch(Command::ImagesToStackMacro).unwrap()
+    else {
+        panic!("macro Images to Stack must open a stack")
+    };
+    let titles: Vec<String> = session
+        .image_ids()
+        .into_iter()
+        .map(|id| session.get_image(id).unwrap().title.clone())
+        .collect();
+    assert_eq!(titles, java);
+    assert_eq!(session.image_ids(), vec![stack_id, new_id]);
+    // No GenericDialog runs on this branch, so `Recorder.commandOptions` stays
+    // null and `Recorder.saveCommand` writes the bare call
+    // (Recorder.java 547-556). That is distinct from the dialog path, which
+    // always records at least the single-space placeholder.
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Images to Stack\");")
+    );
+}
+
+/// `ImagesToStack.convert` falls back to `ImagePlus.getProp("Slice_Label")`
+/// when "Use titles as labels" is off (ImagesToStack.java 137-141). A stack
+/// reduced to one slice by `Delete Slice` keeps the surviving slice's label as
+/// that property, so the merged stack must carry it. Java probe:
+/// `newImage("s","8-bit",2,2,2)` + labels a,b, `setSlice(1)`, `run("Delete
+/// Slice")`, `newImage("fresh",...)`, `run("Images to Stack","name=Stack")`
+/// prints `LABEL1=[b]` and `LABEL2=[]`.
+#[test]
+fn parity_images_to_stack_slice_label_fallback_after_delete_slice() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.tif");
+    let setup = "newImage(\"s\",\"8-bit\",2,2,2);\n\
+                 setSlice(1); setMetadata(\"Label\",\"a\");\n\
+                 setSlice(2); setMetadata(\"Label\",\"b\");\n\
+                 selectWindow(\"s\"); setSlice(1); run(\"Delete Slice\");\n\
+                 newImage(\"fresh\",\"8-bit\",2,2,1);";
+    let oracle = images_to_stack_oracle(&bridge, setup, "name=Stack", &out);
+    assert_eq!(stack_convert_field(&oracle.stdout, "LABEL1"), "b");
+    assert_eq!(stack_convert_field(&oracle.stdout, "LABEL2"), "");
+
+    let mut session = Session::new();
+    // `newImage` fills 8-bit images with white (NewImage.java 305).
+    let mut stack = ImageDocument::new_stack(
+        "s",
+        2,
+        2,
+        vec![PixelPlane::Gray8(vec![255; 4]), PixelPlane::Gray8(vec![255; 4])],
+    )
+    .unwrap();
+    stack.slice_labels = vec![Some("a".into()), Some("b".into())];
+    session.insert_doc(stack);
+    session.dispatch(Command::DeleteSlice).unwrap();
+    let remaining = session.active_doc().unwrap();
+    assert_eq!(remaining.stack_size(), 1);
+    assert_eq!(remaining.slice_label_property.as_deref(), Some("b"));
+    let restored: ImageDocument = serde_json::from_str(&serde_json::to_string(remaining).unwrap()).unwrap();
+    assert_eq!(restored, *remaining, "Slice_Label survives document serialization");
+    assert_eq!(remaining.slice_labels, vec![Some("b".to_string())]);
+    session.insert_doc(ImageDocument::new("fresh", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap());
+
+    let mut options = images_to_stack_options("Stack");
+    options.titles_as_labels = false;
+    let CommandOutcome::ImageOpened(id) =
+        session.dispatch(Command::ImagesToStack { options }).unwrap()
+    else {
+        panic!("Images to Stack must open a stack")
+    };
+    let doc = session.get_image(id).unwrap();
+    assert_eq!(
+        doc.slice_labels,
+        vec![Some("b".to_string()), None],
+        "the surviving Slice_Label is the fallback; the fresh image has none"
+    );
+    assert_images_to_stack_matches(&oracle, &out, &session, id, "slice label fallback");
+}
+
+/// The reverse direction must stay label-free: `StackEditor.convertStackToImages`
+/// stores the full slice label as the `Info` property, never as `Slice_Label`
+/// (StackEditor.java 276-278), so the new single-slice documents keep no label.
+#[test]
+fn parity_stack_to_images_outputs_have_no_slice_label() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            "newImage(\"s\",\"8-bit\",2,2,2); \
+             setSlice(1); setMetadata(\"Label\",\"a\"); \
+             setSlice(2); setMetadata(\"Label\",\"b\"); \
+             selectWindow(\"s\"); run(\"Stack to Images\"); \
+             for (i=0;i<nImages;i++) { selectImage(i+1); print(\"W\"+i+\"=\"+getTitle()+\"|\"+getMetadata(\"Label\")); }",
+        )
+        .unwrap();
+    let mut session = Session::new();
+    let mut stack = ImageDocument::new_stack(
+        "s",
+        2,
+        2,
+        vec![PixelPlane::Gray8(vec![1; 4]), PixelPlane::Gray8(vec![2; 4])],
+    )
+    .unwrap();
+    stack.slice_labels = vec![Some("a".into()), Some("b".into())];
+    session.insert_doc(stack);
+    let CommandOutcome::ImagesOpened(ids) = session.dispatch(Command::StackToImages).unwrap() else {
+        panic!("Stack to Images must open images")
+    };
+    for (index, id) in ids.iter().enumerate() {
+        let doc = session.get_image(*id).unwrap();
+        assert_eq!(
+            stack_convert_field(&oracle.stdout, &format!("W{index}")),
+            format!("{}|", doc.title),
+            "window {index}: title and empty Slice_Label"
+        );
+        assert_eq!(doc.slice_labels, vec![None], "window {index}: no Slice_Label");
+    }
+}
+
+/// Neither `ImagesToStack` nor `StackEditor.convertStackToImages` touches
+/// `WindowManager`'s one-shot `checkForDuplicateName` gate, so both leave
+/// duplicate output titles. Java probes: an existing `Stack` window plus a new
+/// stack prints `[Stack, a, b, Stack]`, and an existing `x` plus two slices
+/// labelled `x` prints `[x, x, x]`.
+#[test]
+fn parity_stack_conversion_keeps_duplicate_titles() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+
+    // Images to Stack with an existing window of the same name.
+    let oracle = bridge
+        .eval_macro(
+            "newImage(\"Stack\",\"8-bit\",2,2,1); \
+             newImage(\"a\",\"8-bit\",2,2,1); \
+             newImage(\"b\",\"8-bit\",2,2,1); \
+             run(\"Images to Stack\", \"name=Stack use keep\"); \
+             print(\"N=\"+nImages); \
+             for (i=0;i<nImages;i++) { selectImage(i+1); print(\"W\"+i+\"=\"+getTitle()); }",
+        )
+        .unwrap();
+    let java: Vec<String> = (0..oracle_line(&oracle.stdout, "N=")
+        .trim_start_matches("N=")
+        .parse::<usize>()
+        .unwrap())
+        .map(|index| stack_convert_field(&oracle.stdout, &format!("W{index}")).to_string())
+        .collect();
+    assert_eq!(
+        java,
+        vec![
+            "Stack".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "Stack".to_string()
+        ]
+    );
+
+    let mut session = Session::new();
+    let existing = session.insert_doc(
+        ImageDocument::new("Stack", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap(),
+    );
+    session.insert_doc(ImageDocument::new("a", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap());
+    session.insert_doc(ImageDocument::new("b", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap());
+    let mut options = images_to_stack_options("Stack");
+    options.keep = true;
+    let CommandOutcome::ImageOpened(new_id) =
+        session.dispatch(Command::ImagesToStack { options }).unwrap()
+    else {
+        panic!("Images to Stack must open a stack")
+    };
+    let titles: Vec<String> = session
+        .image_ids()
+        .into_iter()
+        .map(|id| session.get_image(id).unwrap().title.clone())
+        .collect();
+    assert_eq!(titles, java, "Images to Stack keeps the duplicate title");
+    assert_eq!(session.get_image(existing).unwrap().title, "Stack");
+    assert_eq!(session.get_image(new_id).unwrap().title, "Stack");
+    assert_eq!(session.active_image_id(), Some(new_id));
+
+    // Stack to Images with an existing window matching a slice label.
+    let oracle = bridge
+        .eval_macro(
+            "newImage(\"x\",\"8-bit\",2,2,1); \
+             newImage(\"s\",\"8-bit\",2,2,2); \
+             setSlice(1); setMetadata(\"Label\",\"x\"); \
+             setSlice(2); setMetadata(\"Label\",\"x\"); \
+             selectWindow(\"s\"); run(\"Stack to Images\"); \
+             print(\"N=\"+nImages); \
+             for (i=0;i<nImages;i++) { selectImage(i+1); print(\"W\"+i+\"=\"+getTitle()); }",
+        )
+        .unwrap();
+    let java: Vec<String> = (0..oracle_line(&oracle.stdout, "N=")
+        .trim_start_matches("N=")
+        .parse::<usize>()
+        .unwrap())
+        .map(|index| stack_convert_field(&oracle.stdout, &format!("W{index}")).to_string())
+        .collect();
+    assert_eq!(java, vec!["x".to_string(), "x".to_string(), "x".to_string()]);
+
+    let mut session = Session::new();
+    let existing = session.insert_doc(
+        ImageDocument::new("x", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap(),
+    );
+    let mut stack = ImageDocument::new_stack(
+        "s",
+        2,
+        2,
+        vec![PixelPlane::Gray8(vec![255; 4]), PixelPlane::Gray8(vec![255; 4])],
+    )
+    .unwrap();
+    stack.slice_labels = vec![Some("x".into()), Some("x".into())];
+    session.insert_doc(stack);
+    let CommandOutcome::ImagesOpened(ids) = session.dispatch(Command::StackToImages).unwrap() else {
+        panic!("Stack to Images must open images")
+    };
+    let titles: Vec<String> = session
+        .image_ids()
+        .into_iter()
+        .map(|id| session.get_image(id).unwrap().title.clone())
+        .collect();
+    assert_eq!(titles, java, "Stack to Images keeps the duplicate titles");
+    assert_eq!(session.get_image(existing).unwrap().title, "x");
+    for id in &ids {
+        assert_eq!(session.get_image(*id).unwrap().title, "x");
+    }
+    assert_eq!(session.active_image_id(), ids.last().copied());
+}
+
+
+#[test]
+fn parity_images_to_stack_copy_display_range_matches_fresh_processor() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (method, label) in [
+        (ImagesToStackMethod::CopyCenter, "Copy (center)"),
+        (ImagesToStackMethod::CopyTopLeft, "Copy (top-left)"),
+        (ImagesToStackMethod::ScaleSmallest, "Scale (smallest)"),
+        (ImagesToStackMethod::ScaleLargest, "Scale (largest)"),
+    ] {
+        for (aw, ah, bw, bh) in [(2, 2, 4, 3), (4, 3, 2, 2), (2, 2, 2, 2)] {
+            let setup = format!(
+                "newImage('a','8-bit black',{aw},{ah},1); setMinAndMax(10,200); \
+                 newImage('b','8-bit black',{bw},{bh},1);"
+            );
+            let path = dir.path().join("copy_range.tif");
+            let oracle =
+                images_to_stack_oracle(&bridge, &setup, &format!("method=[{label}] use"), &path);
+            let mut first =
+                ImageDocument::new("a", aw, ah, PixelPlane::Gray8(vec![0; (aw * ah) as usize]))
+                    .unwrap();
+            first.display_range = DisplayRange {
+                min: 10.0,
+                max: 200.0,
+            };
+            let second =
+                ImageDocument::new("b", bw, bh, PixelPlane::Gray8(vec![0; (bw * bh) as usize]))
+                    .unwrap();
+            let mut options = images_to_stack_options("Stack");
+            options.method = method;
+            let (session, id) = images_to_stack_session(&[first, second], options);
+            assert_images_to_stack_matches(
+                &oracle,
+                &path,
+                &session,
+                id,
+                &format!("{label} {aw}x{ah} + {bw}x{bh}"),
+            );
+        }
+    }
+}
+
+#[test]
+fn parity_images_to_stack_one_slice_stack_does_not_supply_slice_label_property() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("single_stack_label.tif");
+    let setup = "newImage('p','8-bit',2,2,1); newImage('q','8-bit',2,2,1); \
+        run('Images to Stack','name=one title=p use'); \
+        selectWindow('q'); close(); newImage('fresh','8-bit',2,2,1);";
+    let oracle = images_to_stack_oracle(&bridge, setup, "name=Stack", &path);
+    assert_eq!(stack_convert_field(&oracle.stdout, "LABEL1"), "");
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new("p", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap());
+    let q =
+        session.insert_doc(ImageDocument::new("q", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap());
+    let mut options = images_to_stack_options("one");
+    options.title_filter = "p".into();
+    let CommandOutcome::ImageOpened(one) = session
+        .dispatch(Command::ImagesToStack { options })
+        .unwrap()
+    else {
+        panic!("stack output")
+    };
+    assert_eq!(
+        session.get_image(one).unwrap().slice_labels,
+        vec![Some("p".into())]
+    );
+    let single_stack = session.get_image(one).unwrap();
+    assert!(single_stack.slice_label_property.is_none());
+    let json = serde_json::to_string(single_stack).unwrap();
+    assert!(!json.contains("slice_label_property"));
+    let legacy: ImageDocument = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        legacy, *single_stack,
+        "documents without the new optional property remain readable"
+    );
+    session.close_image(q);
+    session.insert_doc(ImageDocument::new("fresh", 2, 2, PixelPlane::Gray8(vec![255; 4])).unwrap());
+    let mut options = images_to_stack_options("Stack");
+    options.titles_as_labels = false;
+    let CommandOutcome::ImageOpened(id) = session
+        .dispatch(Command::ImagesToStack { options })
+        .unwrap()
+    else {
+        panic!("stack output")
+    };
+    assert_images_to_stack_matches(
+        &oracle,
+        &path,
+        &session,
+        id,
+        "one-slice stack label is not Slice_Label",
+    );
+}
+
+#[test]
+fn parity_images_to_stack_copy_uses_new_byte_processor_lut() {
+    let stdout = run_java_harness(
+        "CopyStackProcessorLut",
+        r#"
+import ij.*;
+import ij.process.*;
+import ij.plugin.ImagesToStack;
+import java.awt.image.IndexColorModel;
+public class CopyStackProcessorLut {
+    static ImagePlus image(String title, int w, int h) {
+        byte[] gray = new byte[256];
+        for (int i=0; i<256; i++) gray[i]=(byte)(255-i);
+        return new ImagePlus(title, new ByteProcessor(w,h,new byte[w*h],new IndexColorModel(8,256,gray,gray,gray)));
+    }
+    public static void main(String[] args) {
+        for (boolean largeFirst : new boolean[]{false,true}) {
+            ImagePlus a=image("a",largeFirst?4:2,largeFirst?3:2);
+            ImagePlus b=image("b",largeFirst?2:4,largeFirst?2:3);
+            ImagePlus out=ImagesToStack.run(new ImagePlus[]{a,b});
+            System.out.println("INV"+largeFirst+"="+out.getProcessor().isInvertedLut());
+        }
+    }
+}
+"#,
+    );
+    for large_first in [false, true] {
+        let (aw, ah, bw, bh) = if large_first {
+            (4, 3, 2, 2)
+        } else {
+            (2, 2, 4, 3)
+        };
+        let image = |title: &str, w, h| {
+            ImageDocument::new(
+                title,
+                w,
+                h,
+                PixelPlane::Color256 {
+                    pixels: vec![0; (w * h) as usize],
+                    lut: Box::new(inverted_gray_lut()),
+                },
+            )
+            .unwrap()
+        };
+        let (session, id) = images_to_stack_session(
+            &[image("a", aw, ah), image("b", bw, bh)],
+            images_to_stack_options("Stack"),
+        );
+        let inverted = match session.get_image(id).unwrap().plane() {
+            PixelPlane::Color256 { lut, .. } => lut.is_inverted(),
+            _ => false,
+        };
+        assert_eq!(
+            inverted.to_string(),
+            stack_convert_field(&stdout, &format!("INV{large_first}")),
+            "large first: {large_first}"
+        );
+    }
+}
+
+#[test]
+fn parity_images_to_stack_rgb_processor_display_range_is_default() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rgb_range.tif");
+    let oracle = images_to_stack_oracle(
+        &bridge,
+        "newImage('a','RGB black',2,2,1); setMinAndMax(10,200); newImage('b','RGB black',4,3,1);",
+        "use",
+        &path,
+    );
+    let mut first =
+        ImageDocument::new("a", 2, 2, PixelPlane::ColorRgb(vec![0xff000000; 4])).unwrap();
+    first.display_range = DisplayRange {
+        min: 10.0,
+        max: 200.0,
+    };
+    let second = ImageDocument::new("b", 4, 3, PixelPlane::ColorRgb(vec![0xff000000; 12])).unwrap();
+    let (session, id) = images_to_stack_session(&[first, second], images_to_stack_options("Stack"));
+    assert_display_range(
+        session.get_image(id).unwrap(),
+        parse_minmax(stack_convert_field(&oracle.stdout, "MINMAX")),
+        "RGB stack processor limits",
+    );
 }

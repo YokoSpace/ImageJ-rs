@@ -8,7 +8,7 @@ ImageJ-rs は、ImageJ 1.54u を Rust で再現する開発中のプロジェク
 
 ## デスクトップアプリを試す
 
-新しい Rust ツールチェーン、Python 3、`zsh`、および `java`・`javac`・`jar` を含む JDK が必要です。現在の開発・検証環境は macOS と JDK 27 です。ほかの OS や JDK バージョンは未検証です。
+新しい Rust ツールチェーン、Python 3、`zsh`、および `java`・`javac`・`jar` を含む JDK が必要です。現在のネイティブ開発・検証環境は macOS と JDK 27 です。Linux では Docker デスクトップ環境(Ubuntu Xfce arm64、OpenJDK 25)で `./tools/verify.sh` 全ゲートと実際の X11 ウィンドウを検証済みです。[Docker デスクトップ CI](#docker-デスクトップ-ci) を参照してください。ほかの OS や JDK バージョンは未検証です。
 
 ```sh
 git clone https://github.com/YokoSpace/ImageJ-rs.git
@@ -32,12 +32,13 @@ cargo run --release -p ij-app -- /path/to/image.tif
 - ポイント、角度、折れ線、フリーハンド線、Text、Color Picker を含む全 14 種類のツールバー操作。ROI Manager では選択領域の登録、選択、削除、計測ができます。
 - 表示範囲、Brightness & Contrast、ヒストグラムを伴うしきい値のライブ表示とマスク変換、二値画像の Erode／Dilate／Open／Close、計測、対応コマンドのマクロ記録。
 - Edit → Cut、Copy、Paste、Clear、Fill、Draw。前景色・背景色、ROI マスク、Undo に対応します。
+- File → New → Image、Edit → Clear Outside と Selection → Create Mask/Create Selection、Image → Transform の反転・回転、Image → Adjust → Size。自動しきい値選択は32-bit float画像とスタック全体のヒストグラムにも対応します。
 - Crop、Duplicate、8-bit/16-bit/32-bit/RGB の画像型変換、Set Measurements、Set Scale、Analyze Particles、Histogram、Plot Profile、14 種類の Process → Math 演算、Image Calculator。対応するフィルタ、演算、二値変換はスタックにも適用できます。
 - TIFF、PNG、JPEG の読み書きと Results 表の保存。対応する可逆形式の PNG と TIFF では画素を保持し、JPEG は非可逆圧縮で保存します。
 - ハイパースタックの C/Z/T 操作、スライスのアニメーション再生、ImageJ に合わせた macOS のネイティブメニューバー（ほかの OS ではウィンドウ内メニュー）。
 - 後述する**限定的な範囲**での従来の Java プラグイン実行と、Rust 製画像プラグイン用 API。
 
-[Phase 3 の日常ワークフロー](docs/roadmap_phase3_practical_workflows.md) は、対応する画像形式で実装しました。ただし ImageJ の全機能を再現したわけではなく、一部の TIFF 形式、高度なプラグイン API とダイアログ、専門的な画像コマンドは未対応です。Text は組み込みの小さなビットマップフォントを使用し、32-bit 画像とスタックでは自動しきい値選択を利用できません。以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
+[Phase 3 の日常ワークフロー](docs/roadmap_phase3_practical_workflows.md) と [Phase 4のWave 1](docs/roadmap_phase4_completeness.md) は、テスト対象の画像型で実装しました。ただし ImageJ の全機能を再現したわけではなく、一部の TIFF 形式、高度なプラグイン API とダイアログ、専門的な画像コマンドは未対応です。Text は組み込みの小さなビットマップフォントを使用します。複数領域や穴があり、複合選択領域のShapeRoiを必要とするマスクは未対応です。以前の UI 対応は [Phase 2 ロードマップ](docs/roadmap_phase2_ui_fidelity.md) にまとめています。
 
 ## ベンチマーク
 
@@ -62,6 +63,16 @@ Apple M4 Pro・macOS上で、RustのreleaseビルドとOpenJDK 27を使い、両
 ```
 
 このコマンドは Java の参照ソースの整合性を確認し、ImageJ 1.54u のオラクルをビルドし、Phase 3 の圧縮 TIFF → 粒子解析 → 保存を含む Java との差分テストと、従来の TIFF → ROI → 計測 → 保存の操作を実行します。成功時の最終行は `VERIFY_ALL_OK` です。検証結果は `verification/evidence/latest/` に保存されます。
+
+### Docker デスクトップ CI
+
+リポジトリには `Dockerfile` と `compose.yaml` も同梱しており、[Devin のコンテナ化チュートリアル](https://docs.devin.ai/ja/use-cases/tutorials/containerization)のパターンに沿って、Xfce デスクトップイメージ上にツールチェーン全体を構築します。デスクトップはコンテナ内で動作し、ブラウザから `https://localhost:3001/` でアクセスできます(自己署名証明書。ループバックのみなので公開しないでください)。ホスト側のポートは `DESKTOP_PORT` で変更できます。
+
+```sh
+./docker/ci check
+```
+
+このコマンドはイメージをビルドし、デスクトップのヘルスチェックを待ち、`./tools/verify.sh` を実行し、`ij-app` を実際の X11 ウィンドウとして開いて Ctrl+Q で終了し、検証結果を `desktop-evidence/` にコピーします。対話的に使うには `./docker/ci open` を実行し、ブラウザで `https://localhost:3001/` を開きます。テスト個別実行、GUI ウィンドウ操作(`windows`、`key`、`click`、`screenshot`)、ライブ編集用 compose オーバーレイは [Docker デスクトップ CI ランオブック](docs/docker-desktop-ci.md) を参照してください。`docker compose down` はコンテナ状態を破棄するため、関係ない環境で `./docker/ci down` を実行しないでください。
 
 環境だけを簡単に確認する場合:
 

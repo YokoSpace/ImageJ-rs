@@ -1,4 +1,4 @@
-use ij_core::{ImageDocument, Lut256, MeasurementSummary, PixelPlane};
+use ij_core::{ImageDocument, Lut256, MeasurementSummary, PixelPlane, ResultsTable};
 use ij_plugin_api::{ImageMetadata, PixelKind, PluginContext, RustImagePlugin};
 use ij_session::{Command, Session};
 
@@ -53,7 +53,9 @@ fn rust_plugin_commits_pixels_results_and_undo_only_after_success() {
         session.active_doc().unwrap().plane(),
         &PixelPlane::Gray8(vec![11, 20, 30, 40])
     );
-    assert_eq!(session.results.rows, vec![row]);
+    let mut expected = ResultsTable::new();
+    expected.push(row);
+    assert_eq!(session.results, expected);
     assert!(session.is_dirty(id));
     assert!(session.image_revision(id) > revision);
     assert!(session.active_doc().unwrap().snapshot.is_some());
@@ -90,16 +92,14 @@ fn rust_plugin_rejects_unsupported_or_invalid_output_without_mutation() {
     let doc =
         ImageDocument::new("unsupported", 2, 2, PixelPlane::Gray16(vec![1, 2, 3, 4])).unwrap();
     let id = session.insert_doc(doc.clone());
-    assert!(
-        session
-            .run_rust_plugin(&EditAndMeasure {
-                fail: false,
-                row: None
-            })
-            .unwrap_err()
-            .to_string()
-            .contains("requires 8-bit grayscale")
-    );
+    assert!(session
+        .run_rust_plugin(&EditAndMeasure {
+            fail: false,
+            row: None
+        })
+        .unwrap_err()
+        .to_string()
+        .contains("requires 8-bit grayscale"));
     assert_eq!(session.get_image(id), Some(&doc));
 
     struct BadLength;
@@ -123,14 +123,12 @@ fn rust_plugin_rejects_unsupported_or_invalid_output_without_mutation() {
 #[test]
 fn rust_plugin_requires_active_image() {
     let mut session = Session::new();
-    assert!(
-        session
-            .run_rust_plugin(&EditAndMeasure {
-                fail: false,
-                row: None
-            })
-            .is_err()
-    );
+    assert!(session
+        .run_rust_plugin(&EditAndMeasure {
+            fail: false,
+            row: None
+        })
+        .is_err());
 }
 
 #[test]
@@ -155,7 +153,9 @@ fn results_only_rust_plugin_keeps_image_clean_and_undo_state_untouched() {
     let id = session.insert_doc(doc);
     let revision = session.image_revision(id);
     session.run_rust_plugin(&AnalyzeOnly(row.clone())).unwrap();
-    assert_eq!(session.results.rows, vec![row]);
+    let mut expected = ResultsTable::new();
+    expected.push(row);
+    assert_eq!(session.results, expected);
     assert!(!session.is_dirty(id));
     assert_eq!(session.image_revision(id), revision);
     assert!(session.active_doc().unwrap().snapshot.is_none());
@@ -194,4 +194,47 @@ fn rust_plugin_rejects_malformed_palette_output_without_commit() {
     let error = session.run_rust_plugin(&BadPalette).unwrap_err();
     assert!(error.to_string().contains("palette"));
     assert_eq!(session.get_image(id), Some(&doc));
+}
+
+#[test]
+fn rust_plugin_appends_new_results_columns_after_measurement() {
+    struct AppendRows(Vec<MeasurementSummary>);
+    impl RustImagePlugin for AppendRows {
+        fn name(&self) -> &str {
+            "Append results"
+        }
+        fn supports(&self, _: &ImageMetadata) -> Result<(), String> {
+            Ok(())
+        }
+        fn run(&self, ctx: &mut PluginContext) -> Result<(), String> {
+            for row in &self.0 {
+                ctx.append_result(row.clone());
+            }
+            Ok(())
+        }
+    }
+    let mut session = Session::new();
+    session.insert_doc(ImageDocument::new_ramp_8bit("t", 16, 16).unwrap());
+    session
+        .dispatch(Command::SetMeasurements {
+            flags: 1,
+            precision: 3,
+        })
+        .unwrap();
+    session.dispatch(Command::Measure).unwrap();
+    session
+        .run_rust_plugin(&AppendRows(vec![
+            MeasurementSummary {
+                point: Some((3.0, 4.0)),
+                ..Default::default()
+            },
+            MeasurementSummary {
+                mean: 7.0,
+                measurement_flags: Some(19),
+                ..Default::default()
+            },
+        ]))
+        .unwrap();
+    let tsv = session.results.to_tsv();
+    assert_eq!(tsv, " \tArea\tMean\tMin\tMax\tX\tY\n1\t256\t0\t0\t0\t0\t0\n2\t0\t0\t0\t0\t3\t4\n3\t0\t7\t0\t0\t0\t0\n");
 }

@@ -1,0 +1,20 @@
+services:
+  desktop:
+    build: .
+    environment:
+      PUID: '1000'
+      PGID: '1000'
+      START_DOCKER: 'false'
+      PIXELFLUX_WAYLAND: 'false'
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    ports:
+      - '127.0.0.1:${DESKTOP_PORT:-3001}:3001'
+    shm_size: '1gb'
+    healthcheck:
+      test: ['CMD-SHELL', 'xprop -root _NET_SUPPORTING_WM_CHECK | grep -q "window id" && curl -kfsS -o /dev/null https://localhost:3001/']
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s

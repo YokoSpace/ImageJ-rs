@@ -27,6 +27,16 @@ You are implementing `ImageJ-rs`, a faithful Rust reproduction of ImageJ 1.54u (
    ```
 7. Only declare the unit complete when `./tools/verify.sh` exits with code `0` and prints `VERIFY_ALL_OK`.
 
+## Docker desktop environment
+
+When a task needs a real X11 desktop (Linux UI regressions, window-level input), use the containerized Xfce environment instead of skipping GUI verification:
+
+- `./docker/ci check` — build, health check, `./tools/verify.sh`, native-window smoke (Ctrl+Q clean quit), evidence copy. This wraps the same full gate; it is never a substitute or bypass for it, and every fence above still applies.
+- `./docker/ci test <crate> <test_target>` — run one Rust test target inside the container for the RED→GREEN loop.
+- `./docker/ci open` + `windows` / `key` / `click` / `screenshot` — inspect and drive real windows. See `docs/docker-desktop-ci.md` for details.
+
+For an integration regression, use `./docker/ci test CRATE TARGET EXACT_NAME` for RED and GREEN. Finish with `./docker/ci check CRATE TARGET EXACT_NAME` on the plain Compose configuration. This checks that exactly one regression case passed, then verifies the workspace, native desktop, and evidence copy. For other test types, run the issue-specific test and finish with `./docker/ci check`. Do not report done on partial success: both `VERIFY_ALL_OK` and `DESKTOP_SMOKE_OK` plus the issue-specific test must pass. When a step fails, inspect the bounded tail printed by `./docker/ci` and `rg -n -m 5 'error|FAILED|panicked' <run-log> | cut -c1-240` in the `desktop-evidence/run.*/` dir; follow the stop/retry limits in roadmap section 0.2 instead of re-running the same failing gate. Never weaken tests and never guess.
+
 ## Key repository levers
 
 - `./tools/verify.sh` — Runs ledger synchronization check, builds/verifies the Java 1.54u oracle, runs `cargo test --workspace`, executes `ij-cli slice1`, and verifies output artifacts.

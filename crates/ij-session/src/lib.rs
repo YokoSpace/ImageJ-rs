@@ -173,6 +173,8 @@ pub enum SessionError {
     InvalidNewImageDimensions,
     #[error("unsupported newImage type: {0}")]
     UnsupportedNewImageType(String),
+    #[error("{0}")]
+    StackConvert(#[from] ij_core::StackConvertError),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -406,6 +408,16 @@ pub enum Command {
     /// `run("Crop")` (Resizer.java crop branch). Crops every slice to the
     /// clipped area-selection bounds and records `run("Crop");`.
     Crop,
+    /// `Image > Stacks > Add Slice` (`ij.plugin.StackEditor("add")`,
+    /// StackEditor.java 30-49). `insert_before_current` is `IJ.altKeyDown()`:
+    /// the blank slice goes in front of the current slice instead of after it.
+    /// Hyperstacks and C/T stacks are rejected rather than flattened.
+    AddSlice {
+        insert_before_current: bool,
+    },
+    /// `Image > Stacks > Delete Slice` (`ij.plugin.StackEditor("delete")`,
+    /// StackEditor.java 51-71). Deleting the last remaining slice is an error.
+    DeleteSlice,
     /// `Image > Duplicate...` (Duplicator.java 36-135). `title: None` asks
     /// for a `WindowManager.getUniqueName`-style title; an explicit title is
     /// used verbatim. `duplicate_stack` copies the whole stack or the
@@ -540,6 +552,39 @@ pub enum Command {
     /// active threshold without touching pixels.
     ResetThreshold,
     InvertStack,
+    /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`). Projects a
+    /// grayscale stack over `start_slice..=stop_slice` (one-based) into a new
+    /// image. `start_slice`/`stop_slice` are the raw dialog numbers cast like
+    /// `(int)gd.getNextNumber()`; out-of-range values are ignored exactly
+    /// like `ZProjector.setStartSlice/setStopSlice` (ZProjector.java
+    /// 110-120). RGB stacks and hyperstacks are rejected because the Java
+    /// RGB/C/Z/T branches are not implemented yet.
+    ZProject {
+        options: ij_core::ZProjectionOptions,
+    },
+    /// Raw GenericDialog numeric fields retain smart-recording text semantics.
+    ZProjectFromDialog {
+        method: ij_core::ZProjectionMethod,
+        start: String,
+        stop: String,
+    },
+    /// `Image > Stacks > Images to Stack` with explicit dialog options
+    /// (`ij.plugin.ImagesToStack.convertImagesToStack`,
+    /// original_imagej/ij/plugin/ImagesToStack.java 36-116). Every open 2D
+    /// image (optionally filtered by title) becomes one slice of a new stack;
+    /// the sources are closed unless `keep` is set.
+    ImagesToStack {
+        options: ij_core::ImagesToStackOptions,
+    },
+    /// `run("Images to Stack")` with no options: Java skips the dialog, forces
+    /// `keep=false` and rejects differing image sizes
+    /// (ImagesToStack.java 64-75, 114-115).
+    ImagesToStackMacro,
+    /// `Image > Stacks > Stack to Images`
+    /// (`ij.plugin.StackEditor.convertStackToImages`,
+    /// original_imagej/ij/plugin/StackEditor.java 240-310). Every slice of the
+    /// active stack becomes its own window and the source stack is closed.
+    StackToImages,
     /// Whole-stack answers to the "Process Stack?" prompt for the grayscale
     /// filters. Each one records ImageJ's `stack` option
     /// (original_imagej/ij/IJ.java 1287).
@@ -587,6 +632,10 @@ pub enum Command {
     /// profile data is returned and `run("Plot Profile");` is recorded.
     PlotProfile,
     ClearResults,
+    /// `Analyze > Summarize` (`Analyzer.summarize`, Analyzer.java 888-927).
+    /// Appends the Mean/SD/Min/Max rows to the existing Results table; the
+    /// active image is not read.
+    Summarize,
     SaveResultsTsv {
         path: PathBuf,
     },
@@ -610,12 +659,19 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum CommandOutcome {
     ImageOpened(ImageId),
+    /// Several windows were opened at once, in creation order
+    /// (`StackEditor.convertStackToImages`).
+    ImagesOpened(Vec<ImageId>),
     Saved(PathBuf),
     Updated,
     Measured(MeasurementSummary),
     HistogramComputed(HistogramSummary),
     ProfileComputed(ProfileData),
     ResultsCleared,
+    /// `Analyze > Summarize` appended the four summary rows. `appended` is
+    /// false when `Analyzer.summarize` returned before `rt.show`
+    /// (Analyzer.java 889-897).
+    Summarized { appended: bool },
     /// New `minThreshold`/`maxThreshold` state; pixels are unchanged.
     Thresholded(ThresholdLevels),
     /// `resetThreshold()` succeeded; threshold state was cleared and pixels
@@ -889,7 +945,9 @@ impl Session {
             self.bump_image_revision(id);
             self.dirty_images.insert(id);
         }
-        self.results.rows.extend(rows);
+        for row in rows {
+            self.results.push(row);
+        }
         Ok(())
     }
 
@@ -1077,6 +1135,247 @@ impl Session {
         let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
         self.bump_image_revision(id);
         self.images.get_mut(&id).ok_or(SessionError::NoActiveImage)
+    }
+
+    fn dispatch_zproject(
+        &mut self,
+        options: ij_core::ZProjectionOptions,
+        dialog_fields: Option<[String; 2]>,
+    ) -> Result<CommandOutcome, SessionError> {
+        let (stack_size, new_doc) = {
+            let doc = self.active_doc()?;
+            let base = format!("{}{}", options.method.title_prefix(), doc.title);
+            // WindowManager.makeUniqueName (WindowManager.java
+            // 385-387): the prefixed title is kept unless another
+            // image already uses it.
+            let titles: Vec<&str> = self.images.values().map(|doc| doc.title.as_str()).collect();
+            let title = if titles.iter().any(|title| *title == base) {
+                default_duplicate_title(&titles, &base)
+            } else {
+                base
+            };
+            (
+                doc.stack_size() as u32,
+                ij_core::zproject::z_project(doc, &options, title)?,
+            )
+        };
+        let new_id = self.insert_doc(new_doc);
+        self.dirty_images.insert(new_id);
+        // GenericDialog smart recording only emits the Start/Stop
+        // slice fields when the typed text differs from the defaults
+        // (ZProjector.java 164-172, GenericDialog.java 1203-1205);
+        // the Projection type choice is recorded unconditionally
+        // after smart recording is switched off
+        // (ZProjector.java 172-173).
+        let mut parts = Vec::new();
+        let fields = dialog_fields.unwrap_or_else(|| {
+            [
+                format_scale_number(options.start_slice),
+                format_scale_number(options.stop_slice),
+            ]
+        });
+        for (key, text, default) in [
+            ("start", &fields[0], "1".to_string()),
+            ("stop", &fields[1], stack_size.to_string()),
+        ] {
+            if *text != default {
+                let mut recorded = text.as_str();
+                if let Some(value) = recorded.strip_suffix(".0") {
+                    recorded = value;
+                }
+                if let Some(value) = recorded.strip_suffix(".00") {
+                    recorded = value;
+                }
+                parts.push(format!(
+                    "{key}={}",
+                    if recorded.is_empty() {
+                        "[]".into()
+                    } else {
+                        macro_option_value(recorded)
+                    }
+                ));
+            }
+        }
+        parts.push(format!(
+            "projection={}",
+            macro_option_value(options.method.label())
+        ));
+        self.macro_recorder.push(format!(
+            "run(\"Z Project...\", \"{}\");",
+            macro_string(&parts.join(" "))
+        ));
+        Ok(CommandOutcome::ImageOpened(new_id))
+    }
+
+    /// `ImagesToStack.convertImagesToStack` (ImagesToStack.java 36-116) plus
+    /// `convert` (118-253). `macro_without_options` selects the branch where
+    /// Java skips the dialog, forces `keep=false` and rejects differing sizes.
+    fn dispatch_images_to_stack(
+        &mut self,
+        options: ij_core::ImagesToStackOptions,
+        macro_without_options: bool,
+    ) -> Result<CommandOutcome, SessionError> {
+        let ids = self.image_ids();
+        // `ImagesToStackPlan::included` indexes the eligible 2D windows, i.e.
+        // `WindowManager.getIDList` with the stacks removed
+        // (ImagesToStack.java 60-66), so the ids used to close the sources must
+        // be built from that same filter. Using the full id list here would
+        // close a stack window and leave a merged 2D image open.
+        let eligible_ids: Vec<ImageId> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.images
+                    .get(id)
+                    .is_some_and(|doc| doc.stack_size() == 1)
+            })
+            .collect();
+        let (output, sizes_differ) = {
+            let docs: Vec<&ImageDocument> =
+                ids.iter().filter_map(|id| self.images.get(id)).collect();
+            // `sizesDiffer` is computed before the "Title contains" filter is
+            // applied (ImagesToStack.java 78-79 vs 108-113), so it decides
+            // whether the dialog shows the Method choice and Bicubic checkbox
+            // and therefore whether the recorder writes them.
+            let unfiltered = ij_core::images_to_stack_plan(
+                &docs,
+                &ij_core::ImagesToStackOptions {
+                    title_filter: String::new(),
+                    ..options.clone()
+                },
+            )?;
+            if macro_without_options && unfiltered.sizes_differ() {
+                return Err(ij_core::StackConvertError::SizeMismatch.into());
+            }
+            let output = ij_core::images_to_stack(&docs, &options, options.name.clone())?;
+            (output, unfiltered.sizes_differ())
+        };
+        let doc = output.document;
+        // ImagesToStack.java 208-211: the sources are closed inside the
+        // conversion loop, before the new window is created. `included` holds
+        // positions in `eligible_ids`, not in `ids`.
+        if !options.keep {
+            for &index in &output.included {
+                self.close_image(eligible_ids[index]);
+            }
+        }
+        // ImagesToStack never calls WindowManager.checkForDuplicateName, so a
+        // new stack may share a title with an existing window
+        // (ImagesToStack.java 240-252 creates the ImagePlus directly).
+        let new_id = self.insert_doc(doc);
+        self.dirty_images.insert(new_id);
+        // GenericDialog smart recording (GenericDialog.java 1327-1336,
+        // 1261-1271): string fields only when they differ from their default,
+        // and checkboxes by their label's first word lowercased. The getters
+        // run in dialog order (ImagesToStack.java 107-115), and
+        // `Recorder.commandOptions` is a state machine: an unchanged field or
+        // unchecked box only seeds the single-space placeholder when nothing
+        // has been recorded yet (Recorder.java 521-531), while a changed field
+        // appends to it verbatim (Recorder.java 472-482), which is why a
+        // changed "Fill color:" after an unchanged "Name:" yields two spaces.
+        let mut recorded: Option<String> = None;
+        let record_option = |recorded: &mut Option<String>, key: &str, value: &str| {
+            match recorded {
+                Some(existing) => {
+                    existing.push(' ');
+                    existing.push_str(key);
+                    existing.push('=');
+                    existing.push_str(value);
+                }
+                None => *recorded = Some(format!("{key}={value}")),
+            }
+        };
+        let record_flag = |recorded: &mut Option<String>, key: &str| match recorded {
+            Some(existing) if existing != " " => {
+                existing.push(' ');
+                existing.push_str(key);
+            }
+            _ => *recorded = Some(key.to_string()),
+        };
+        // GenericDialog.getNextChoiceIndex records the choice only when it
+        // differs from the dialog's initial index (GenericDialog.java
+        // 1428-1436), and the choice only exists when the sizes differ.
+        if sizes_differ && options.method != options.method_default {
+            record_option(
+                &mut recorded,
+                "method",
+                &format!("[{}]", options.method.label()),
+            );
+        }
+        for (key, text, default) in [
+            ("name", options.name.as_str(), "Stack"),
+            ("title", options.title_filter.as_str(), ""),
+            ("fill", options.fill.as_str(), ""),
+        ] {
+            if text != default {
+                record_option(
+                    &mut recorded,
+                    key,
+                    &if text.is_empty() {
+                        "[]".to_string()
+                    } else {
+                        macro_option_value(text)
+                    },
+                );
+            } else if recorded.is_none() {
+                recorded = Some(" ".to_string());
+            }
+        }
+        if sizes_differ {
+            if options.bicubic {
+                record_flag(&mut recorded, "bicubic");
+            } else if recorded.is_none() {
+                recorded = Some(" ".to_string());
+            }
+        }
+        for (key, checked) in [
+            ("use", options.titles_as_labels),
+            ("keep", options.keep),
+        ] {
+            if checked {
+                record_flag(&mut recorded, key);
+            } else if recorded.is_none() {
+                recorded = Some(" ".to_string());
+            }
+        }
+        // `Recorder.saveCommand` writes `run("Images to Stack");` when the
+        // dialog never ran, which is the macro-without-options branch
+        // (ImagesToStack.java 80-86; Recorder.java 547-556).
+        let line = if macro_without_options {
+            "run(\"Images to Stack\");".to_string()
+        } else {
+            format!(
+                "run(\"Images to Stack\", \"{}\");",
+                macro_string(recorded.as_deref().unwrap_or(""))
+            )
+        };
+        self.macro_recorder.push(line);
+        Ok(CommandOutcome::ImageOpened(new_id))
+    }
+
+    /// `StackEditor.convertStackToImages` (StackEditor.java 240-310): every
+    /// slice becomes its own window and the source stack is closed.
+    fn dispatch_stack_to_images(&mut self) -> Result<CommandOutcome, SessionError> {
+        let source_id = self.active_image.ok_or(SessionError::NoActiveImage)?;
+        let images = {
+            let source = self.images.get(&source_id).ok_or(SessionError::NoActiveImage)?;
+            ij_core::stack_to_images(source)?
+        };
+        // StackEditor.java 291-297: the source is closed after the new windows
+        // exist, so its title is still taken when the outputs are named.
+        self.close_image(source_id);
+        let mut ids = Vec::with_capacity(images.len());
+        for doc in images {
+            // StackEditor.convertStackToImages never calls
+            // WindowManager.checkForDuplicateName, so two slices with the same
+            // label produce two windows with the same title
+            // (StackEditor.java 272-290).
+            let id = self.insert_doc(doc);
+            self.dirty_images.insert(id);
+            ids.push(id);
+        }
+        self.macro_recorder.push("run(\"Stack to Images\");".into());
+        Ok(CommandOutcome::ImagesOpened(ids))
     }
 
     pub fn dispatch(&mut self, cmd: Command) -> Result<CommandOutcome, SessionError> {
@@ -1960,6 +2259,23 @@ impl Session {
                 self.macro_recorder.push("run(\"Crop\");".into());
                 Ok(CommandOutcome::Updated)
             }
+            Command::AddSlice {
+                insert_before_current,
+            } => {
+                self.active_doc_mut()?.add_slice(insert_before_current)?;
+                self.mark_active_dirty();
+                // StackEditor records no options, and Recorder.saveCommand
+                // only emits setKeyDown("alt") for Open Next and Plot Profile
+                // (Recorder.java 675-676), so Alt is not part of the macro.
+                self.macro_recorder.push("run(\"Add Slice\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::DeleteSlice => {
+                self.active_doc_mut()?.delete_slice()?;
+                self.mark_active_dirty();
+                self.macro_recorder.push("run(\"Delete Slice\");".into());
+                Ok(CommandOutcome::Updated)
+            }
             Command::Duplicate {
                 title,
                 duplicate_stack,
@@ -2302,6 +2618,18 @@ impl Session {
                 self.mark_active_dirty();
                 Ok(CommandOutcome::Updated)
             }
+            Command::ZProject { options } => self.dispatch_zproject(options, None),
+            Command::ZProjectFromDialog { method, start, stop } => {
+                let options = ij_core::ZProjectionOptions {
+                    method, start_slice: zproject_dialog_number(&start), stop_slice: zproject_dialog_number(&stop),
+                };
+                self.dispatch_zproject(options, Some([start,stop]))
+            }
+            Command::ImagesToStack { options } => self.dispatch_images_to_stack(options, false),
+            Command::ImagesToStackMacro => {
+                self.dispatch_images_to_stack(ij_core::ImagesToStackOptions::default(), true)
+            }
+            Command::StackToImages => self.dispatch_stack_to_images(),
             Command::SmoothStack => {
                 let doc = self.active_doc_mut()?;
                 let is_stack = doc.stack_size() > 1;
@@ -2423,7 +2751,23 @@ impl Session {
                     flags,
                     precision: precision.min(9),
                 };
+                let previous = self.results.config;
+                // Analyzer.setOptions (Analyzer.java 235-255): a changed option
+                // set clears the trailing summary rows and then updates the
+                // columns. Scientific notation is excluded from the comparison
+                // because it only changes formatting.
+                if (previous.flags & !MeasurementFlags::SCIENTIFIC_NOTATION)
+                    != (config.flags & !MeasurementFlags::SCIENTIFIC_NOTATION)
+                    && !self.results.rows.is_empty()
+                {
+                    self.results.clear_summary();
+                    let image = self.active_image.and_then(|id| self.images.get(&id));
+                    self.results.update_columns(config.flags, image);
+                }
                 self.results.config = config;
+                if !config.contains(MeasurementFlags::LABELS) {
+                    self.results.disable_row_labels();
+                }
                 self.macro_recorder.push(format!(
                     "run(\"Set Measurements...\", \"{}\");",
                     measurement_macro_options(config)
@@ -2454,7 +2798,18 @@ impl Session {
                 if clear_results {
                     self.results.clear();
                 }
-                for particle in particles {
+                // ParticleAnalyzer.saveResults delegates to Analyzer.saveResults
+                // (ParticleAnalyzer.java 967-968), which clears the trailing
+                // summary rows before the first particle row is appended and
+                // writes the image name into the Label column when Display
+                // label is on (Analyzer.java 554-555).
+                let particle_label = if self.results.config.contains(MeasurementFlags::LABELS) {
+                    Some(self.active_doc()?.results_label())
+                } else {
+                    None
+                };
+                self.results.clear_summary();
+                for mut particle in particles {
                     if add_to_manager {
                         let doc = self.active_doc()?;
                         self.roi_manager.push(NamedRoi {
@@ -2467,6 +2822,9 @@ impl Session {
                                 .then(|| doc.convert_index_to_position(doc.current_slice as i32))
                                 .transpose()?,
                         });
+                    }
+                    if let Some(label) = &particle_label {
+                        particle.measurement.label = label.clone();
                     }
                     self.results.push(particle.measurement);
                 }
@@ -2536,10 +2894,21 @@ impl Session {
                 Ok(CommandOutcome::Updated)
             }
             Command::Measure => {
-                let rows = self
+                let mut rows = self
                     .active_doc()?
                     .measure_rows_with_config(self.results.config)?;
                 let stats = rows.last().cloned().ok_or(CoreError::EmptySelection)?;
+                // Analyzer.saveResults writes the image name into the Label
+                // column when Display label is on (Analyzer.java 554-555).
+                if self.results.config.contains(MeasurementFlags::LABELS) {
+                    let label = self.active_doc()?.results_label();
+                    for row in &mut rows {
+                        row.label = label.clone();
+                    }
+                }
+                // Analyzer.saveResults clears the trailing summary rows before
+                // it appends (Analyzer.java 544-548, 726-732).
+                self.results.clear_summary();
                 for row in rows {
                     self.results.push(row);
                 }
@@ -2629,6 +2998,11 @@ impl Session {
                 self.results.clear();
                 self.macro_recorder.push("run(\"Clear Results\");".into());
                 Ok(CommandOutcome::ResultsCleared)
+            }
+            Command::Summarize => {
+                let appended = self.results.summarize()?;
+                self.macro_recorder.push("run(\"Summarize\");".into());
+                Ok(CommandOutcome::Summarized { appended })
             }
             Command::SaveResultsTsv { path } => {
                 let tsv = self.results.to_tsv();
@@ -2997,6 +3371,97 @@ fn parse_new_image_type(type_name: &str) -> Result<(NewImageType, NewImageFill),
         NewImageFill::White
     };
     Ok((image_type, fill))
+}
+
+// GenericDialog.getNextNumber (1189-1242): lowercase 0x uses parseHex;
+// other fields use Double.valueOf, with invalid input represented as NaN.
+fn zproject_dialog_number(text: &str) -> f64 {
+    if let Some(hex) = text.strip_prefix("0x") {
+        return i32::from_str_radix(hex, 16).unwrap_or(0) as f64;
+    }
+    let number = text.trim_matches(|c: char| c <= '\u{20}');
+    let number = number.strip_suffix(['d', 'D', 'f', 'F']).unwrap_or(number);
+    number
+        .parse()
+        .ok()
+        .or_else(|| zproject_hex_number(number))
+        .unwrap_or(f64::NAN)
+}
+
+// Double.valueOf also accepts signed/uppercase hexadecimal floating values.
+// Retain guard bits and a sticky bit so rounding near an integer slice bound
+// matches Java even when the mantissa has more than 53 significant bits.
+fn zproject_hex_number(text: &str) -> Option<f64> {
+    let (sign, text) = if let Some(s) = text.strip_prefix('-') {
+        (-1.0, s)
+    } else {
+        (1.0, text.strip_prefix('+').unwrap_or(text))
+    };
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))?;
+    let (mantissa, exponent) = text.split_once(['p', 'P'])?;
+    let exp_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exp_digits.is_empty() || !exp_digits.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let exponent = exponent
+        .parse::<i64>()
+        .unwrap_or(if exponent.starts_with('-') {
+            i64::MIN
+        } else {
+            i64::MAX
+        });
+    let mut significant = 0u64;
+    let mut count = 0i64;
+    let mut sticky = false;
+    let mut any_digit = false;
+    let mut fraction_digits = 0i64;
+    let mut fraction = false;
+    for c in mantissa.chars() {
+        if c == '.' {
+            if fraction {
+                return None;
+            }
+            fraction = true;
+            continue;
+        }
+        let digit = c.to_digit(16)?;
+        any_digit = true;
+        if fraction {
+            fraction_digits += 1;
+        }
+        if count == 0 && digit == 0 {
+            continue;
+        }
+        count += 1;
+        if count <= 15 {
+            significant = significant * 16 + digit as u64;
+        } else {
+            sticky |= digit != 0;
+        }
+    }
+    if !any_digit {
+        return None;
+    }
+    if significant == 0 {
+        return Some(sign * 0.0);
+    }
+    if sticky {
+        significant |= 1;
+    }
+    let power = exponent
+        .saturating_sub(fraction_digits.saturating_mul(4))
+        .saturating_add((count - 15).max(0).saturating_mul(4));
+    // Values outside this range cast to the same out-of-range slice bound.
+    let value = if power > 2000 {
+        f64::INFINITY
+    } else if power < -2000 {
+        0.0
+    } else {
+        significant as f64 * 2.0f64.powi(power as i32)
+    };
+    Some(sign * value)
 }
 
 fn macro_string(value: &str) -> String {

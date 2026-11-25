@@ -7,9 +7,12 @@ pub mod histogram;
 pub mod math;
 pub mod new_image;
 pub mod particles;
+pub mod stack_convert;
+pub mod stack_edit;
 pub mod threshold_palette;
 pub mod transform;
 pub mod wand;
+pub mod zproject;
 
 pub use binary::StackBinaryOptions;
 pub use contrast::{
@@ -21,6 +24,11 @@ pub use filters::{AutoThresholdMethod, RankFilterKind};
 pub use histogram::{display_histogram, DisplayHistogram};
 pub use new_image::{NewImageFill, NewImageType};
 pub use particles::{AnalyzedParticle, ParticleAnalysisOptions};
+pub use stack_convert::{
+    images_to_stack, images_to_stack_plan, stack_to_images, ImagesToStackMethod,
+    ImagesToStackOptions, ImagesToStackOutput, ImagesToStackPlan, StackConvertError, StackType,
+    IMAGES_TO_STACK_METHODS,
+};
 pub use threshold_palette::{
     adjust_max_threshold, adjust_min_threshold, format_threshold_label, plot_threshold_bins,
     scale_down, scale_up, scale_up_and_set, threshold_to_sliders, ThresholdSliders,
@@ -28,6 +36,7 @@ pub use threshold_palette::{
     FLOAT_NEG_LIMIT, FLOAT_POS_LIMIT, NO_THRESHOLD_PLOT_BIN, THRESHOLD_SLIDER_RANGE,
 };
 pub use wand::{Wand, WandMode};
+pub use zproject::{ZProjectionMethod, ZProjectionOptions};
 pub use edit::{CREATE_SELECTION_NOT_MASK_OR_THRESHOLDED, CREATE_SELECTION_REQUIRES_SHAPE_ROI};
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +69,11 @@ pub enum CoreError {
     },
     #[error("empty selection or no pixels inside threshold")]
     EmptySelection,
+    /// `Analyzer.summarize` reads `rt.getLabel(rt.size()-1)` before its
+    /// one-row guard, so an empty table throws "Row out of range"
+    /// (Analyzer.java 889, ResultsTable.java 542-545).
+    #[error("Results table is empty")]
+    EmptyResults,
     #[error("{0}")]
     InvalidOperation(&'static str),
     #[error("polygon ROI needs at least 3 non-collinear points")]
@@ -88,6 +102,22 @@ pub enum CoreError {
     },
     #[error("stack index {index} out of range 1..={stack_size}")]
     StackIndexOutOfRange { index: i32, stack_size: usize },
+    /// `IJ.error("\"Delete Slice\" requires a stack")`
+    /// (original_imagej/ij/plugin/StackEditor.java 52-53).
+    #[error("\"Delete Slice\" requires a stack")]
+    DeleteSliceRequiresStack,
+    /// Add Slice / Delete Slice only edit plain Z-stacks. A hyperstack or a
+    /// C/T-only stack takes ImageJ's C/Z/T dialog path
+    /// (original_imagej/ij/plugin/StackEditor.java 31-34, 54-57), which
+    /// P4.4d2 owns; flattening the axis here would silently lose it.
+    #[error(
+        "Add Slice and Delete Slice do not support hyperstacks or C/T stacks yet (C={channels} Z={slices} T={frames})"
+    )]
+    UnsupportedStackAxisEdit {
+        channels: u32,
+        slices: u32,
+        frames: u32,
+    },
     #[error("auto-threshold method \"{0}\" is not implemented (supported: IsoData, Otsu)")]
     UnsupportedThresholdMethod(String),
     #[error("8-bit stack required to process a single slice (Thresholder.java 129-131)")]
@@ -124,6 +154,28 @@ impl Default for Lut256 {
         let g: Vec<u8> = (0..=255).collect();
         let b: Vec<u8> = (0..=255).collect();
         Self { r, g, b }
+    }
+}
+
+impl Lut256 {
+    /// `ImageProcessor.isInvertedLut` (ImageProcessor.java 299-320): true when
+    /// no LUT entry raises the summed RGB value, i.e. zero displays as white.
+    pub fn is_inverted(&self) -> bool {
+        for i in 1..255 {
+            let previous =
+                u32::from(self.r[i - 1]) + u32::from(self.g[i - 1]) + u32::from(self.b[i - 1]);
+            let current = u32::from(self.r[i]) + u32::from(self.g[i]) + u32::from(self.b[i]);
+            if previous < current {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `ImageProcessor.isColorLut` (ImageProcessor.java 327-350): true when any
+    /// entry is not gray.
+    pub fn is_color(&self) -> bool {
+        (0..256).any(|i| self.r[i] != self.g[i] || self.g[i] != self.b[i])
     }
 }
 
@@ -1238,7 +1290,7 @@ pub(crate) fn float_to_byte(pixel: f32, min: f64, scale: f64) -> u8 {
 
 /// TypeConverter.convertRGBToByte (TypeConverter.java 95-117) with
 /// ColorProcessor's default equal weights (ColorProcessor.java 26).
-fn rgb_to_byte(pixel: u32) -> u8 {
+pub(crate) fn rgb_to_byte(pixel: u32) -> u8 {
     let r = f64::from((pixel >> 16) & 0xff);
     let g = f64::from((pixel >> 8) & 0xff);
     let b = f64::from(pixel & 0xff);
@@ -1248,7 +1300,7 @@ fn rgb_to_byte(pixel: u32) -> u8 {
 
 /// TypeConverter.convertRGBToFloat (TypeConverter.java 123-139) with
 /// ColorProcessor's default equal weights (ColorProcessor.java 26).
-fn rgb_to_float(pixel: u32) -> f32 {
+pub(crate) fn rgb_to_float(pixel: u32) -> f32 {
     let r = f64::from((pixel >> 16) & 0xff);
     let g = f64::from((pixel >> 8) & 0xff);
     let b = f64::from(pixel & 0xff);
@@ -1290,7 +1342,7 @@ fn byte_display_rgb_table(lut: &Lut256, min: f64, max: f64) -> [u32; 256] {
 /// model. 8-bit planes display through their LUT with the range baked in; a
 /// stack's slices take that range from the current processor, which has
 /// already rounded it (ImageStack.java 205-208, 330-331).
-fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) -> PixelPlane {
+pub(crate) fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) -> PixelPlane {
     let gray = |value: u8| 0xff00_0000 | u32::from(value) * 0x0001_0101;
     match plane {
         PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => {
@@ -1341,7 +1393,7 @@ fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) 
 
 /// ImageProcessor.isPseudoColorLut (ImageProcessor.java 351-386). The active
 /// threshold case cannot occur because `Converter.java 55-56` resets it first.
-fn is_pseudo_color_lut(lut: &Lut256) -> bool {
+pub(crate) fn is_pseudo_color_lut(lut: &Lut256) -> bool {
     let mut r2 = i32::from(lut.r[0]);
     let mut g2 = i32::from(lut.g[0]);
     let mut b2 = i32::from(lut.b[0]);
@@ -1439,6 +1491,11 @@ pub struct ImageDocument {
     pub slices: Vec<PixelPlane>,
     /// Optional ImageJ slice labels in stack order.
     pub slice_labels: Vec<Option<String>>,
+    /// `ImagePlus.getProp("Slice_Label")`, separate from a one-slice stack's
+    /// label. Delete Slice sets it when collapsing a stack (StackEditor.java
+    /// 63-66); Images to Stack reads this property, not the stack label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_label_property: Option<String>,
     /// One-based dimensions matching ImagePlus.nChannels/nSlices/nFrames.
     pub n_channels: u32,
     pub n_slices: u32,
@@ -1516,6 +1573,7 @@ impl ImageDocument {
             height,
             slices,
             slice_labels,
+            slice_label_property: None,
             n_channels,
             n_slices,
             n_frames,
@@ -1648,6 +1706,30 @@ impl ImageDocument {
         (self.current_slice.clamp(1, size) - 1) as usize
     }
 
+    /// `Analyzer.getFileName` (Analyzer.java 811-841): the image title, plus
+    /// the current slice label or number for stacks. This is the text
+    /// `Analyzer.saveResults` writes into the Label column when Display label
+    /// is on (Analyzer.java 554-555). Rust ROIs are unnamed, so the `:roiName`
+    /// suffix Java appends for named ROIs never applies.
+    pub fn results_label(&self) -> String {
+        let mut label = self.title.clone();
+        if self.stack_size() > 1 {
+            let slice = self.current_slice.clamp(1, self.stack_size() as u32);
+            let slice_label = self
+                .slice_labels
+                .get(slice as usize - 1)
+                .cloned()
+                .flatten()
+                .filter(|label| !label.is_empty());
+            let colon = if label.is_empty() { "" } else { ":" };
+            match slice_label {
+                Some(slice_label) => label.push_str(&format!("{colon}{slice_label}")),
+                None => label.push_str(&format!("{colon}{slice}")),
+            }
+        }
+        label
+    }
+
     pub fn get_n_channels(&self) -> u32 {
         self.n_channels
     }
@@ -1704,6 +1786,15 @@ impl ImageDocument {
     /// 1294-1297).
     pub fn is_hyperstack(&self) -> bool {
         self.get_n_dimensions() > 3
+    }
+
+    /// True when `Image > Stacks > Add Slice` / `Delete Slice` can edit this
+    /// document: a single image or a plain Z-stack. ImageJ routes a hyperstack
+    /// or composite to the C/Z/T dialog (StackEditor.java 31-34, 54-57); a
+    /// C- or T-only stack is also excluded here because editing it would grow
+    /// that axis instead of Z.
+    pub fn supports_stack_axis_edit(&self) -> bool {
+        self.n_channels == 1 && self.n_frames == 1 && !self.is_hyperstack()
     }
 
     /// ImagePlus.verifyDimensions (original_imagej/ij/ImagePlus.java
@@ -3798,6 +3889,10 @@ impl ImageDocument {
             line: None,
             point: None,
             angle: None,
+            summary: None,
+            label: String::new(),
+            measurement_flags: None,
+            cells: None,
         }
     }
 
@@ -5003,6 +5098,29 @@ pub struct StackPosition {
     pub frame: Option<u32>,
 }
 
+/// One row appended by `Analyze > Summarize` (Analyzer.java 888-927): the row
+/// label and the explicit cells `ResultsTable.setValue` writes. Summary rows
+/// are not image measurements, so they carry no pixel statistics.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SummaryRow {
+    /// `Mean`, `SD`, `Min` or `Max` (Analyzer.java 916-919). This is the row's
+    /// identity and survives `disableRowLabels`; the label cell it shows lives
+    /// in [`MeasurementSummary::label`].
+    pub label: String,
+    /// Cells indexed by [`RESULT_HEADINGS`]. `None` leaves a column that was
+    /// not in the table when `summarize` ran.
+    pub cells: Vec<Option<f64>>,
+}
+
+impl SummaryRow {
+    /// The cell for `heading` in [`RESULT_HEADINGS`] order, or `None` when the
+    /// column was absent from the table when `summarize` ran.
+    pub fn cell(&self, heading: &str) -> Option<f64> {
+        let column = RESULT_HEADINGS.iter().position(|name| *name == heading)?;
+        self.cells.get(column).copied().flatten()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MeasurementSummary {
     pub pixel_count: u64,
@@ -5066,9 +5184,45 @@ pub struct MeasurementSummary {
     pub point: Option<(f64, f64)>,
     #[serde(default)]
     pub angle: Option<f64>,
+    /// Set only on the four rows `Analyze > Summarize` appends; measurement
+    /// rows leave it `None` (Analyzer.java 916-925).
+    #[serde(default)]
+    pub summary: Option<SummaryRow>,
+    /// `ResultsTable.rowLabels[row]`: the label cell this row shows while the
+    /// Label column exists. `Analyzer.saveResults` writes the image name
+    /// through `rt.addLabel("Label", getFileName())` when Display label is on
+    /// (Analyzer.java 554-555), and `Analyzer.summarize` writes `Mean`, `SD`,
+    /// `Min` or `Max` (Analyzer.java 916-919). Empty when the row has no
+    /// label, which is what `getLabel` reports as null
+    /// (ResultsTable.java 542-548).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub label: String,
+    /// The `Measurements` flags in force when this row was appended to a
+    /// Results table. `None` means the row was built directly (tests, plugins)
+    /// and its cells follow the table's current config. Java stores the values
+    /// `Analyzer.saveResults` wrote, so a later `Set Measurements` never
+    /// re-derives an existing row (ResultsTable.java 190-218).
+    #[serde(default)]
+    pub measurement_flags: Option<u32>,
+    /// Stored measurement cells in [`RESULT_HEADINGS`] order. Tables capture
+    /// these on append so removing and reallocating a column cannot restore
+    /// old statistics (ResultsTable.java 1155-1163). Absent on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cells: Option<Vec<Option<f64>>>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// One allocated Results table column (`ResultsTable.columns[i] != null`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultColumn {
+    /// `ResultsTable.keep[i]`: set by the String `addValue` overload, so
+    /// `update` never drops the column (ResultsTable.java 245, 263, 1162).
+    pub kept: bool,
+    /// `ResultsTable.NaNEmptyCells` when the column was allocated: cells the
+    /// rows never wrote hold NaN instead of zero (ResultsTable.java 205-213).
+    pub nan_empty: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultsTable {
     pub rows: Vec<MeasurementSummary>,
     /// `Analyze > Set Measurements...` state applied to this table. Defaults
@@ -5076,12 +5230,44 @@ pub struct ResultsTable {
     /// `to_tsv_basic()` (Analyzer.java line 40).
     #[serde(default)]
     pub config: MeasurementConfig,
+    /// `ResultsTable.rowLabels != null`: whether the Label column is shown.
+    /// `Analyzer.summarize` creates it through `setLabel`; `Set Measurements`
+    /// with Display label off and `Clear Results` drop it
+    /// (ResultsTable.java 291-305, 1019-1033).
+    #[serde(default)]
+    pub row_labels: bool,
+    /// Allocated columns in [`RESULT_HEADINGS`] order. `update` adds and drops
+    /// columns here and discards the removed column's stored cells
+    /// (ResultsTable.java 1135-1170).
+    #[serde(default = "no_result_columns")]
+    pub columns: Vec<Option<ResultColumn>>,
+    /// `ResultsTable.decimalPlaces[i] != AUTO_FORMAT`. Formatting survives
+    /// removal and reallocation of the column's values (ResultsTable.java
+    /// 214-217, 867-880, 1155-1163).
+    #[serde(default)]
+    pub fixed_columns: Vec<bool>,
+    /// `ResultsTable.lastColumn`: the highest column index allocated since the
+    /// last reset. `update` drops a column without lowering it, so a table
+    /// whose last column was dropped still renders a trailing delimiter
+    /// (ResultsTable.java 644-667, 700-733, 1150-1163).
+    #[serde(default)]
+    pub last_column: Option<usize>,
+}
+
+fn no_result_columns() -> Vec<Option<ResultColumn>> {
+    vec![None; RESULT_HEADING_COUNT]
+}
+
+impl Default for ResultsTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// `ResultsTable.defaultHeadings` (ResultsTable.java 42-45) plus the
 /// dynamically allocated `Length` column at index 38. `Angle` reserves index
 /// 17, so it precedes `Length` in every table that has both.
-const RESULT_HEADINGS: [&str; 39] = [
+pub const RESULT_HEADINGS: [&str; 39] = [
     "Area",
     "Mean",
     "StdDev",
@@ -5129,6 +5315,10 @@ const COLUMN_ASPECT_RATIO: usize = 33;
 const COLUMN_ROUNDNESS: usize = 34;
 const COLUMN_SOLIDITY: usize = 35;
 const COLUMN_LENGTH: usize = 38;
+const COLUMN_X: usize = 6;
+const COLUMN_Y: usize = 7;
+
+const RESULT_HEADING_COUNT: usize = RESULT_HEADINGS.len();
 
 /// Flags for which `Analyzer.measureLength` takes the full `saveResults` path.
 /// When none is selected, only `Length` and `Angle` are written
@@ -5146,15 +5336,341 @@ impl ResultsTable {
         Self {
             rows: Vec::new(),
             config: MeasurementConfig::default(),
+            row_labels: false,
+            columns: no_result_columns(),
+            fixed_columns: Vec::new(),
+            last_column: None,
         }
     }
 
-    pub fn push(&mut self, row: MeasurementSummary) {
+    /// Builds a table from rows that were not appended through [`Self::push`],
+    /// recording the columns and flags each row writes.
+    pub fn from_rows(rows: Vec<MeasurementSummary>, config: MeasurementConfig) -> Self {
+        let mut table = Self::new();
+        table.config = config;
+        for row in rows {
+            table.push(row);
+        }
+        table
+    }
+
+    /// Appends a measurement row the way `Analyzer.saveResults` does: the row
+    /// keeps the flags in force now, and every cell it writes allocates its
+    /// column (ResultsTable.java 190-218).
+    pub fn push(&mut self, mut row: MeasurementSummary) {
+        if row.measurement_flags.is_none() {
+            row.measurement_flags = Some(self.config.flags);
+        }
+        let cells = row.table_cells(self.config);
+        if row.summary.is_none() {
+            row.cells = Some(cells.to_vec());
+        }
+        let string_api = row.string_api_columns();
+        let nan_empty = self.config.contains(MeasurementFlags::NAN_EMPTY_CELLS);
+        let row_index = self.rows.len();
+        for (column, value) in cells.iter().enumerate() {
+            let Some(value) = value else { continue };
+            let state = self.column_state_mut(column).get_or_insert(ResultColumn {
+                kept: false,
+                nan_empty,
+            });
+            state.kept |= string_api[column];
+            // addValue only fixes a column's decimal places while the counter
+            // is below 25 (ResultsTable.java 214-217).
+            if row_index < 24 && !value.is_nan() && !is_java_int(*value) {
+                self.fix_column_precision(column);
+            }
+            self.last_column =
+                Some(self.last_column.map_or(column, |last| last.max(column)));
+        }
         self.rows.push(row);
     }
 
+    /// `ResultsTable.reset` (ResultsTable.java 1019-1033): drops the rows, the
+    /// allocated columns, the last-column mark and the row labels.
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.row_labels = false;
+        self.columns = no_result_columns();
+        self.fixed_columns.clear();
+        self.last_column = None;
+    }
+
+    /// `Analyzer.clearSummary` (Analyzer.java 726-732): deletes exactly the
+    /// four trailing summary rows, and only when the last row is labelled
+    /// `Max`. `getLabel` returns null once row labels are disabled
+    /// (ResultsTable.java 542-548), so a disabled label column makes this a
+    /// no-op.
+    pub fn clear_summary(&mut self) {
+        let last = self.rows.len().saturating_sub(1);
+        if self.rows.len() >= 4 && self.row_label(last) == Some("Max") {
+            self.rows.truncate(self.rows.len() - 4);
+        }
+    }
+
+    /// `ResultsTable.disableRowLabels` (ResultsTable.java 302-305): the label
+    /// array is dropped, so every stored label is lost and a later `setLabel`
+    /// starts from an empty array. The summary rows keep their `Mean`/`SD`/
+    /// `Min`/`Max` identity in [`SummaryRow::label`]; only the label cell goes.
+    pub fn disable_row_labels(&mut self) {
+        self.row_labels = false;
+        for row in &mut self.rows {
+            row.label.clear();
+        }
+    }
+
+    fn column_state(&self, column: usize) -> Option<ResultColumn> {
+        self.columns.get(column).copied().flatten()
+    }
+
+    fn fix_column_precision(&mut self, column: usize) {
+        self.fixed_columns.resize(RESULT_HEADING_COUNT, false);
+        self.fixed_columns[column] = true;
+    }
+
+    fn column_state_mut(&mut self, column: usize) -> &mut Option<ResultColumn> {
+        if self.columns.len() < RESULT_HEADING_COUNT {
+            self.columns.resize(RESULT_HEADING_COUNT, None);
+        }
+        &mut self.columns[column]
+    }
+
+    /// `ResultsTable.getLabel` (ResultsTable.java 542-548): the row's label, or
+    /// `None` when the row has none or the label column is disabled.
+    pub fn row_label(&self, row: usize) -> Option<&str> {
+        if !self.row_labels {
+            return None;
+        }
+        let label = self.rows.get(row)?.label.as_str();
+        (!label.is_empty()).then_some(label)
+    }
+
+    /// `ResultsTable.update(measurements, imp, null)` (ResultsTable.java
+    /// 1135-1170): adds the columns the new option set selects and drops the
+    /// ones it no longer selects, discarding their stored values. New
+    /// columns are allocated with the NaN-empty-cells option in force *before*
+    /// the change, because `Analyzer.setOptions` runs on an Analyzer that was
+    /// constructed with the previous options (Analyzer.java 57-64, 235-255).
+    pub fn update_columns(&mut self, flags: u32, image: Option<&ImageDocument>) {
+        let nan_empty = self.config.contains(MeasurementFlags::NAN_EMPTY_CELLS);
+        let mut wanted = flag_columns(MeasurementConfig {
+            flags,
+            precision: self.config.precision,
+        });
+        // update builds its column template with the current image, so these
+        // headings depend on its type and axes (Analyzer.java 660-703).
+        if flags & MeasurementFlags::LIMIT != 0
+            && image.is_some_and(|doc| doc.plane().bit_depth() != 24)
+        {
+            wanted.extend([36, 37]);
+        }
+        if flags & MeasurementFlags::STACK_POSITION != 0 {
+            let position = image.map_or(
+                StackPosition {
+                    slice: Some(1),
+                    ..StackPosition::default()
+                },
+                ImageDocument::stack_position,
+            );
+            for (column, value) in [
+                (26, position.channel),
+                (27, position.slice),
+                (28, position.frame),
+            ] {
+                if value.is_some() {
+                    wanted.push(column);
+                }
+            }
+        }
+        for column in 0..RESULT_HEADING_COUNT {
+            let selected = wanted.contains(&column);
+            match (selected, self.column_state(column)) {
+                (true, None) => {
+                    *self.column_state_mut(column) = Some(ResultColumn {
+                        kept: false,
+                        nan_empty,
+                    });
+                    // getFreeColumn raises lastColumn when it allocates
+                    // (ResultsTable.java 444-453).
+                    self.last_column =
+                        Some(self.last_column.map_or(column, |last| last.max(column)));
+                }
+                (false, Some(state)) if !state.kept => {
+                    *self.column_state_mut(column) = None;
+                    for row in &mut self.rows {
+                        if let Some(summary) = &mut row.summary {
+                            if let Some(cell) = summary.cells.get_mut(column) {
+                                *cell = None;
+                            }
+                        } else {
+                            let cells = row.table_cells(self.config);
+                            let stored = row.cells.get_or_insert_with(|| cells.to_vec());
+                            if let Some(cell) = stored.get_mut(column) {
+                                *cell = None;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // rt2 is built by saveResults with the new options, so it carries row
+        // labels exactly when Display label is selected (ResultsTable.java
+        // 1165-1170). Without labels the existing label array is dropped.
+        if flags & MeasurementFlags::LABELS != 0 {
+            self.row_labels = true;
+        } else {
+            self.disable_row_labels();
+        }
+    }
+
+    /// The value a row shows in `column`: the cell it wrote, or the zero/NaN
+    /// the column was allocated with (ResultsTable.java 470-480, 205-213).
+    fn cell_value(&self, row: &MeasurementSummary, column: usize) -> f64 {
+        if let Some(value) = row.table_cells(self.config)[column] {
+            return value;
+        }
+        match self.column_state(column) {
+            Some(state) if state.nan_empty => f64::NAN,
+            _ => 0.0,
+        }
+    }
+
+    /// Columns this table shows, in [`RESULT_HEADINGS`] order.
+    fn present_columns(&self) -> [bool; RESULT_HEADING_COUNT] {
+        let mut present = [false; RESULT_HEADING_COUNT];
+        if self.rows.is_empty() {
+            // An empty table still has default headings in Rust's slice-1
+            // output, so derive the header from the flags.
+            for column in flag_columns(self.config) {
+                present[column] = true;
+            }
+        } else if (0..RESULT_HEADING_COUNT).all(|column| self.column_state(column).is_none())
+            && self
+                .rows
+                .iter()
+                .all(|row| row.measurement_flags.is_none())
+        {
+            // A table built as a bare struct literal (or deserialized without
+            // column state) falls back to the columns its rows write.
+            for row in &self.rows {
+                for (column, value) in row.table_cells(self.config).iter().enumerate() {
+                    if value.is_some() {
+                        present[column] = true;
+                    }
+                }
+            }
+        } else {
+            for (column, included) in present.iter_mut().enumerate() {
+                *included = self.column_state(column).is_some();
+            }
+        }
+        present
+    }
+
+    /// `Analyzer.summarize` (Analyzer.java 888-927): appends the `Mean`, `SD`,
+    /// `Min` and `Max` rows for every column already in the table. The
+    /// arithmetic order, the `Double.MAX_VALUE` bounds and the NaN behaviour
+    /// are copied from the Java source rather than recomputed. Returns whether
+    /// the four rows were appended; Java returns before `rt.show` otherwise.
+    pub fn summarize(&mut self) -> Result<bool, CoreError> {
+        // Analyzer.java 889 reads the last row label before the one-row guard,
+        // so an empty table throws instead of doing nothing.
+        if self.rows.is_empty() {
+            return Err(CoreError::EmptyResults);
+        }
+        let last = self.rows.len() - 1;
+        if self.row_label(last) == Some("Max") {
+            return Ok(false);
+        }
+        let n = self.rows.len();
+        if n < 2 {
+            return Ok(false);
+        }
+
+        let present = self.present_columns();
+        // Analyzer.java 896-897: a table with no columns at all is left alone.
+        // Rust cannot reach Java's label-only table, so the label column is
+        // not counted here.
+        if !present.iter().any(|included| *included) {
+            return Ok(false);
+        }
+
+        let mut min = [f64::MAX; RESULT_HEADING_COUNT];
+        let mut max = [-f64::MAX; RESULT_HEADING_COUNT];
+        let mut sum = [0.0; RESULT_HEADING_COUNT];
+        let mut sum2 = [0.0; RESULT_HEADING_COUNT];
+        for row in &self.rows {
+            for (column, included) in present.iter().enumerate() {
+                if !*included {
+                    continue;
+                }
+                // ResultsTable.getValue returns the stored cell, so a column
+                // allocated with NaN empty cells contributes NaN
+                // (ResultsTable.java 470-480, 205-213).
+                let value = self.cell_value(row, column);
+                if value < min[column] {
+                    min[column] = value;
+                }
+                if value > max[column] {
+                    max[column] = value;
+                }
+                sum[column] += value;
+                sum2[column] += value * value;
+            }
+        }
+
+        let count = n as f64;
+        let mut rows = Vec::with_capacity(4);
+        for (label, kind) in [("Mean", 0), ("SD", 1), ("Min", 2), ("Max", 3)] {
+            let mut cells = vec![None; RESULT_HEADING_COUNT];
+            for (column, included) in present.iter().enumerate() {
+                if !*included {
+                    continue;
+                }
+                cells[column] = Some(match kind {
+                    0 => sum[column] / count,
+                    // Analyzer.java 922: sqrt((sum2 - sum*sum/n)/(n-1)).
+                    1 => ((sum2[column] - sum[column] * sum[column] / count) / (count - 1.0))
+                        .sqrt(),
+                    2 => min[column],
+                    _ => max[column],
+                });
+            }
+            rows.push(MeasurementSummary {
+                summary: Some(SummaryRow {
+                    label: label.to_string(),
+                    cells,
+                }),
+                // rt.setLabel writes the same text into rowLabels
+                // (Analyzer.java 916-919).
+                label: label.to_string(),
+                ..MeasurementSummary::default()
+            });
+        }
+        // setValue has no counter<25 guard, so a fractional summary cell fixes
+        // its column's decimal places (ResultsTable.java 556-594).
+        let mut fixed = [false; RESULT_HEADING_COUNT];
+        for row in &rows {
+            for (column, value) in row.table_cells(self.config).iter().enumerate() {
+                let Some(value) = value else { continue };
+                if !value.is_nan() && !is_java_int(*value) {
+                    fixed[column] = true;
+                }
+            }
+        }
+        self.rows.extend(rows);
+        // rt.setLabel creates rowLabels and the "Label" heading
+        // (ResultsTable.java 291-300).
+        self.row_labels = true;
+        for (column, fixed) in fixed.iter().enumerate() {
+            if *fixed {
+                if self.column_state(column).is_some() {
+                    self.fix_column_precision(column);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Emits the selected columns in `ResultsTable.defaultHeadings` order with
@@ -5170,26 +5686,31 @@ impl ResultsTable {
             precision
         };
 
-        let mut present = [false; RESULT_HEADINGS.len()];
-        let mut fixed_places: [Option<i32>; RESULT_HEADINGS.len()] =
-            [None; RESULT_HEADINGS.len()];
-
-        if self.rows.is_empty() {
-            // An empty table still has default headings in Rust's slice-1
-            // output, so derive the header from the flags.
-            for column in flag_columns(self.config) {
-                present[column] = true;
+        let present = self.present_columns();
+        let mut fixed_places: [Option<i32>; RESULT_HEADING_COUNT] = [None; RESULT_HEADING_COUNT];
+        // decimalPlaces is column state, so a fix survives the row that set it
+        // (ResultsTable.java 867-880).
+        for (column, places) in fixed_places.iter_mut().enumerate() {
+            if self.fixed_columns.get(column) == Some(&true) {
+                *places = Some(table_precision);
             }
         }
+        // ResultsTable.getHeadings prepends rowLabelHeading once rowLabels is
+        // non-null (ResultsTable.java 670-690).
+        let has_labels = self.row_labels;
 
         for (row_index, row) in self.rows.iter().enumerate() {
             let cells = row.table_cells(self.config);
             for (column, value) in cells.iter().enumerate() {
                 let Some(value) = value else { continue };
-                present[column] = true;
                 // addValue only fixes a column's decimal places while the
-                // counter is below 25 (ResultsTable.java 214-217).
-                if row_index < 24 && !value.is_nan() && !is_java_int(*value) {
+                // counter is below 25 (ResultsTable.java 214-217), but
+                // setValue, which writes the summary rows, has no row limit
+                // (ResultsTable.java 556-594).
+                if (row.summary.is_some() || row_index < 24)
+                    && !value.is_nan()
+                    && !is_java_int(*value)
+                {
                     fixed_places[column] = Some(table_precision);
                 }
             }
@@ -5217,40 +5738,61 @@ impl ResultsTable {
         }
 
         let mut out = String::from(" \t");
-        let mut first = true;
+        if has_labels {
+            out.push_str("Label\t");
+        }
+        // getColumnHeadings appends the delimiter after a column whenever its
+        // index is not lastColumn, and lastColumn is a high-water mark that
+        // update never lowers (ResultsTable.java 644-667, 1150-1163).
+        let last_column = self
+            .last_column
+            .or_else(|| present.iter().rposition(|included| *included));
         for (column, included) in present.iter().enumerate() {
             if !*included {
                 continue;
             }
-            if !first {
+            out.push_str(RESULT_HEADINGS[column]);
+            if Some(column) != last_column {
                 out.push('\t');
             }
-            first = false;
-            out.push_str(RESULT_HEADINGS[column]);
         }
         out.push('\n');
 
         for (row_index, row) in self.rows.iter().enumerate() {
-            let cells = row.table_cells(self.config);
             out.push_str(&(row_index + 1).to_string());
+            out.push('\t');
+            if has_labels {
+                out.push_str(&row.label);
+                out.push('\t');
+            }
             for (column, included) in present.iter().enumerate() {
                 if !*included {
                     continue;
                 }
-                out.push('\t');
-                let value = cells[column].unwrap_or(0.0);
+                let value = self.cell_value(row, column);
                 out.push_str(&format_results_cell(
                     value,
                     fixed_places[column],
                     table_precision,
                 ));
+                if Some(column) != last_column {
+                    out.push('\t');
+                }
             }
             out.push('\n');
         }
         out
     }
 
+    /// The Vertical Slice 1 evidence renderer: `Area`, `Mean`, `Min`, `Max`
+    /// plus the line-only `Angle`/`Length` columns. A table that carries
+    /// `Analyze > Summarize` rows has no such shape, so the documented contract
+    /// is a full-renderer fallback instead of printing summary statistics as
+    /// fake zeros. Ordinary slice-1 tables are unchanged.
     pub fn to_tsv_basic(&self) -> String {
+        if self.rows.iter().any(|row| row.summary.is_some()) {
+            return self.to_tsv();
+        }
         let has_line = self.rows.iter().any(|row| row.line.is_some());
         // ResultsTable's default headings reserve indexes 0..36, so "Angle"
         // (17) is emitted before the dynamically allocated "Length" column
@@ -5309,12 +5851,62 @@ impl MeasurementSummary {
         config.flags & LINE_STAT_FLAGS != 0
     }
 
+    /// Columns this row writes through the String `addValue` overload, which
+    /// sets `ResultsTable.keep[]` so `update` never drops them
+    /// (ResultsTable.java 245, 263; Analyzer.java 660-697, 748-800).
+    fn string_api_columns(&self) -> [bool; RESULT_HEADING_COUNT] {
+        let mut columns = [false; RESULT_HEADING_COUNT];
+        if let Some(line) = self.line {
+            columns[COLUMN_LENGTH] = true;
+            if line.show_angle {
+                columns[COLUMN_ANGLE] = true;
+            }
+        }
+        if self.angle.is_some() {
+            columns[COLUMN_ANGLE] = true;
+        }
+        if self.point.is_some() {
+            columns[COLUMN_X] = true;
+            columns[COLUMN_Y] = true;
+        }
+        if self.stack_position.channel.is_some() {
+            columns[26] = true;
+        }
+        if self.stack_position.slice.is_some() {
+            columns[27] = true;
+        }
+        if self.stack_position.frame.is_some() {
+            columns[28] = true;
+        }
+        columns
+    }
+
     /// Cells this row actually writes, indexed by `ResultsTable`'s default
     /// headings. Unwritten cells stay `None` and render as the zero that
     /// `ResultsTable.addValue` would leave in an all-zero column
     /// (ResultsTable.java 205-213, 720-731).
     fn table_cells(&self, config: MeasurementConfig) -> [Option<f64>; 39] {
         let mut cells = [None; 39];
+        if let Some(stored) = &self.cells {
+            for (column, value) in stored.iter().enumerate().take(39) {
+                cells[column] = *value;
+            }
+            return cells;
+        }
+        if let Some(summary) = &self.summary {
+            // Summary rows carry the cells `ResultsTable.setValue` wrote, so
+            // they do not depend on the current measurement options.
+            for (column, value) in summary.cells.iter().enumerate().take(39) {
+                cells[column] = *value;
+            }
+            return cells;
+        }
+        // A row keeps the cells it wrote when it was appended; a later
+        // Set Measurements never re-derives them (ResultsTable.java 190-218).
+        let config = MeasurementConfig {
+            flags: self.measurement_flags.unwrap_or(config.flags),
+            precision: config.precision,
+        };
         if self.line.is_some() && !self.has_line_stat_columns(config) {
             // Analyzer.measureLength's early return writes only these two cells
             // (Analyzer.java 464-474); the Angle cell is again a straight-line
@@ -5654,6 +6246,39 @@ mod tests {
         assert_eq!(stats.max, 144.0);
         assert_eq!(stats.x_centroid, 6.0);
         assert_eq!(stats.y_centroid, 6.0);
+    }
+
+    #[test]
+    fn results_label_matches_analyzer_get_file_name() {
+        // Analyzer.getFileName (Analyzer.java 811-841) returns the image title
+        // and appends ":" plus the slice label, or the slice number when the
+        // slice has no label, for stacks. Rust ROIs are unnamed, so the
+        // ":roiName" suffix Java adds for named ROIs never applies.
+        let doc = ImageDocument::new_ramp_8bit("t", 16, 16).unwrap();
+        assert_eq!(doc.results_label(), "t");
+
+        let mut stack = ImageDocument::new_stack(
+            "stack",
+            4,
+            4,
+            vec![
+                PixelPlane::Gray8(vec![0; 16]),
+                PixelPlane::Gray8(vec![1; 16]),
+            ],
+        )
+        .unwrap();
+        stack.current_slice = 2;
+        assert_eq!(stack.results_label(), "stack:2");
+
+        stack.slice_labels = vec![None, Some("second".to_string())];
+        assert_eq!(stack.results_label(), "stack:second");
+
+        stack.slice_labels = vec![None, Some(String::new())];
+        assert_eq!(
+            stack.results_label(),
+            "stack:2",
+            "an empty slice label falls back to the slice number"
+        );
     }
 
     #[test]

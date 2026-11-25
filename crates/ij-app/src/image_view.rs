@@ -287,7 +287,7 @@ fn plural_unit(unit: &str) -> &str {
 
 /// Checks whether the active plane has an inverting LUT matching
 /// ImageProcessor.isInvertedLut (original_imagej/ij/process/ImageProcessor.java lines 299-318).
-fn is_inverted_lut(doc: &ImageDocument) -> bool {
+pub(crate) fn is_inverted_lut(doc: &ImageDocument) -> bool {
     match doc.plane() {
         PixelPlane::Color256 { lut, .. } => {
             if lut.r.len() < 256 || lut.g.len() < 256 || lut.b.len() < 256 {
