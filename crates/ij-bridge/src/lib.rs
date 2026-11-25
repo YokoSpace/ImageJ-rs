@@ -277,7 +277,10 @@ pub use plugin_discovery::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
 
     #[cfg(unix)]
     fn write_counting_runner(dir: &Path) -> PathBuf {
@@ -289,39 +292,12 @@ mod tests {
         let state_text = state.display().to_string().replace('\'', "'\\''");
         let script_text = r#"#!/bin/sh
 state='__STATE__'
-lock="$state/lock"
-
-acquire_lock() {
-    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
-}
-
-release_lock() {
-    rmdir "$lock"
-}
-
-acquire_lock
-active=0
-if [ -f "$state/active" ]; then active=$(cat "$state/active"); fi
-active=$((active + 1))
-echo "$active" > "$state/active"
-echo "$active" >> "$state/peaks"
-release_lock
-
-while :; do
-    acquire_lock
-    active=$(cat "$state/active")
-    release_lock
-    if [ "$active" -ge 4 ]; then break; fi
+touch "$state/start-$$"
+tries=0
+while [ ! -f "$state/release" ] && [ "$tries" -lt 1500 ]; do
+    tries=$((tries + 1))
     sleep 0.01
 done
-
-sleep 1
-
-acquire_lock
-active=$(cat "$state/active")
-active=$((active - 1))
-echo "$active" > "$state/active"
-release_lock
 exit 0
 "#
         .replace("__STATE__", &state_text);
@@ -343,25 +319,48 @@ exit 0
         });
         let workers = 8;
         let barrier = Arc::new(Barrier::new(workers));
+        let entered = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
         for _ in 0..workers {
             let bridge = Arc::clone(&bridge);
             let barrier = Arc::clone(&barrier);
+            let entered = Arc::clone(&entered);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
+                entered.fetch_add(1, Ordering::SeqCst);
                 bridge.eval_macro("ignored")
             }));
         }
+
+        while entered.load(Ordering::SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let state = temp.path().join("state");
+        let count_started = || {
+            std::fs::read_dir(&state)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("start-"))
+                })
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count_started() < 4 {
+            if Instant::now() >= deadline {
+                std::fs::write(state.join("release"), "").unwrap();
+                panic!("timed out waiting for the bounded batch");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let peak = count_started();
+        std::fs::write(state.join("release"), "").unwrap();
+
         for handle in handles {
             handle.join().unwrap().unwrap();
         }
-        let peak = std::fs::read_to_string(temp.path().join("state/peaks"))
-            .unwrap()
-            .lines()
-            .map(|line| line.parse::<usize>().unwrap())
-            .max()
-            .unwrap();
-        assert!(peak > 1, "test must exercise overlapping child processes");
         assert_eq!(peak, 4, "oracle child process peak");
     }
 }
