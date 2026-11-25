@@ -287,13 +287,45 @@ mod tests {
         std::fs::create_dir(&state).unwrap();
         let script = dir.join("counting-runner.sh");
         let state_text = state.display().to_string().replace('\'', "'\\''");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nstate='{state_text}'\nlock=\"$state/lock\"\nwhile ! mkdir \"$lock\" 2>/dev/null; do sleep 0.01; done\nactive=0\nif [ -f \"$state/active\" ]; then active=$(cat \"$state/active\"); fi\nactive=$((active + 1))\necho \"$active\" > \"$state/active\"\necho \"$active\" >> \"$state/peaks\"\nrmdir \"$lock\"\nsleep 1\nwhile ! mkdir \"$lock\" 2>/dev/null; do sleep 0.01; done\nactive=$(cat \"$state/active\")\nactive=$((active - 1))\necho \"$active\" > \"$state/active\"\nrmdir \"$lock\"\nexit 0\n"
-            ),
-        )
-        .unwrap();
+        let script_text = r#"#!/bin/sh
+state='__STATE__'
+lock="$state/lock"
+
+acquire_lock() {
+    while ! mkdir "$lock" 2>/dev/null; do sleep 0.01; done
+}
+
+release_lock() {
+    rmdir "$lock"
+}
+
+acquire_lock
+active=0
+if [ -f "$state/active" ]; then active=$(cat "$state/active"); fi
+active=$((active + 1))
+echo "$active" > "$state/active"
+echo "$active" >> "$state/peaks"
+release_lock
+
+while :; do
+    acquire_lock
+    active=$(cat "$state/active")
+    release_lock
+    if [ "$active" -ge 4 ]; then break; fi
+    sleep 0.01
+done
+
+sleep 1
+
+acquire_lock
+active=$(cat "$state/active")
+active=$((active - 1))
+echo "$active" > "$state/active"
+release_lock
+exit 0
+"#
+        .replace("__STATE__", &state_text);
+        std::fs::write(&script, script_text).unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
