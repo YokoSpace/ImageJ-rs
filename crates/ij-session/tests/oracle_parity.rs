@@ -21417,6 +21417,64 @@ fn parity_zproject_all_methods_32bit_with_nan_and_infinity() {
 }
 
 #[test]
+fn parity_zproject_title_collisions_and_repeated_numbering() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let source = ImageDocument::new_stack(
+        "input.tif",
+        4,
+        3,
+        (1..=3u8)
+            .map(|s| PixelPlane::Gray8((0..12).map(|i| s * 10 + i).collect::<Vec<u8>>()))
+            .collect(),
+    )
+    .unwrap();
+    let java = bridge
+        .run_macro_on_image(
+            &source,
+            "call('tools.oracle.UiProbe.zProjectRealWindowTitles', 'x');",
+        )
+        .unwrap();
+    let line = oracle_line(&java.stdout, "TITLES=").trim_start_matches("TITLES=");
+    let (titles, state) = line.split_once('|').unwrap();
+    assert!(
+        state.split('|').any(|part| part == "visible=true"),
+        "projection windows must be visible: {state}"
+    );
+    assert!(
+        state.split('|').any(|part| part == "windows=5"),
+        "input, blocker, and three projection windows must be registered: {state}"
+    );
+    let java_titles: Vec<&str> = titles.split(';').collect();
+    assert_eq!(java_titles.len(), 3);
+
+    let mut session = Session::new();
+    let input = session.insert_doc(source.clone());
+    session.insert_doc(
+        ImageDocument::new("MAX_input.tif", 4, 3, PixelPlane::Gray8(vec![0; 12])).unwrap(),
+    );
+    session.set_active_image(input).unwrap();
+    let avg = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Average, 1.0, 3.0),
+    );
+    session.set_active_image(input).unwrap();
+    let max1 = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Max, 1.0, 3.0),
+    );
+    session.set_active_image(input).unwrap();
+    let max2 = dispatch_zproject(
+        &mut session,
+        zproject_options(ZProjectionMethod::Max, 1.0, 3.0),
+    );
+    let rust_titles: Vec<String> = [avg, max1, max2]
+        .iter()
+        .map(|id| session.get_image(*id).unwrap().title.clone())
+        .collect();
+    assert_eq!(java_titles, rust_titles, "WindowManager unique titles");
+}
+
+#[test]
 fn parity_zproject_slice_range_and_invalid_fields() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let dir = tempfile::tempdir().unwrap();
@@ -22032,6 +22090,18 @@ fn parity_zproject_dialog_fields_match_real_generic_dialog() {
         ("0X1.8p1", "3"),
         ("+0x1.ffffffffffffffffp0", "3"),
         ("-0x1p-2000", "3"),
+        ("-0.0", "3"),
+        ("-0x0p0", "3"),
+        ("2147483647", "3"),
+        ("2147483648", "3"),
+        ("-2147483648", "3"),
+        ("-2147483649", "3"),
+        ("0x7fffffff", "3"),
+        ("0x80000000", "3"),
+        ("1.7976931348623157e308", "3"),
+        ("4.9e-324", "3"),
+        ("1e309", "3"),
+        ("1e-400", "3"),
     ] {
         let result=bridge.run_macro_on_image(&source,&format!(
             "print(\"FIELDS=\"+call(\"tools.oracle.UiProbe.zProjectNumbers\",\"{start}\",\"{stop}\",\"3\"));")).unwrap();
