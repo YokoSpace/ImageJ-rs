@@ -15,3 +15,4 @@ __pycache__/
 /tools/plugin-host/fixtures/fixtures.jar
 /tools/plugin-host/.build.lock/
 /tools/plugin-host/.build.*/
+/desktop-evidence/

@@ -8,7 +8,7 @@ This is a development project, not a complete replacement for ImageJ or Fiji. Th
 
 ## Try the desktop app
 
-You need a recent Rust toolchain, Python 3, `zsh`, and a JDK providing `java`, `javac`, and `jar`. Development and verification currently take place on macOS with JDK 27. Other platforms and JDK versions have not been verified.
+You need a recent Rust toolchain, Python 3, `zsh`, and a JDK providing `java`, `javac`, and `jar`. Development and verification currently take place natively on macOS with JDK 27. On Linux, the full `./tools/verify.sh` gate and the app's real X11 window have been validated inside the Docker desktop environment (Ubuntu Xfce arm64, OpenJDK 25); see [Docker desktop CI](#docker-desktop-ci). Other platforms and JDK versions have not been verified.
 
 ```sh
 git clone https://github.com/YokoSpace/ImageJ-rs.git
@@ -63,6 +63,16 @@ Plug-ins do **not** run in a security sandbox. Run only code you trust. The [`ij
 ```
 
 This checks the untouched Java reference, builds the ImageJ 1.54u oracle, runs Rust tests including differential comparisons and the Phase 3 compressed TIFF → particle analysis → save workflow, and exercises the original TIFF → ROI → measurement → save slice. Success ends with `VERIFY_ALL_OK`; artifacts are written to `verification/evidence/latest/`.
+
+### Docker desktop CI
+
+The repository also ships a `Dockerfile` and `compose.yaml` that build the full toolchain on top of an Xfce desktop image, following the pattern in the [Devin containerization tutorial](https://docs.devin.ai/use-cases/tutorials/containerization). The desktop runs inside the container and is reachable from a browser at `https://localhost:3001/` (self-signed certificate; bound to loopback only — do not expose it). Set `DESKTOP_PORT` to change the host port.
+
+```sh
+./docker/ci check
+```
+
+This builds the image, waits for the desktop health check, runs `./tools/verify.sh`, opens `ij-app` as a real X11 window, quits it with Ctrl+Q, and copies the verification evidence to `desktop-evidence/`. To use the app interactively, run `./docker/ci open` and open `https://localhost:3001/` in a browser. See the [Docker desktop CI runbook](docs/docker-desktop-ci.md) for per-test commands, GUI window inspection (`windows`, `key`, `click`, `screenshot`), and the optional live-edit compose overlay. `docker compose down` discards container state, so do not run `./docker/ci down` on an unrelated environment.
 
 To compare processing time and peak process memory with ImageJ 1.54u, run `python3 tools/benchmark/compare.py --out-dir verification/benchmarks/manual`. The [benchmark guide](tools/benchmark/README.md) explains the workloads, output, and measurement boundaries.
 

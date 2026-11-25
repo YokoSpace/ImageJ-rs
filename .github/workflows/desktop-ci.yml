@@ -1,0 +1,26 @@
+name: Desktop CI
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Wrapper failure-path tests
+        run: bash docker/tests/ci-errors.sh
+      - name: Desktop check
+        run: ./docker/ci check ij-app new_image_ui_test file_new_menu_wires_new_image
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-evidence
+          path: desktop-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Stop desktop
+        if: always()
+        run: ./docker/ci down

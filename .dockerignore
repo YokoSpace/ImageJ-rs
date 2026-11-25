@@ -1,0 +1,29 @@
+# Allowlist: only the files the CI image needs are sent to the build context.
+# This keeps .git/, host build artifacts (target/), secrets, and local
+# verification output out of the image.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!docs/
+!original_imagej/
+!tools/
+!docker/
+
+# Generated/ignored build outputs under tools/ (see .gitignore).
+# .DS_Store is not excluded here so that hidden files inside
+# original_imagej/ always reach the manifest integrity check.
+tools/oracle/.build/
+tools/oracle/.oracle_build.lock
+tools/oracle/.build_stamp.json
+tools/oracle/ij-oracle.jar
+tools/oracle/java-applet-shim.jar
+tools/oracle/__pycache__/
+tools/plugin-host/.build.*/
+tools/plugin-host/.build.lock/
+tools/plugin-host/classes/
+tools/plugin-host/fixtures/classes/
+tools/plugin-host/fixtures/fixtures.jar
+tools/plugin-host/plugin-host.jar
+tools/**/__pycache__/
+tools/**/*.pyc
