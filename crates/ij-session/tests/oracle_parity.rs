@@ -13357,6 +13357,7 @@ fn assert_duplicate_matches_oracle(
         actual.display_range, oracle_doc.display_range,
         "{context}: display range"
     );
+    assert_eq!(actual.display_lut, oracle_doc.display_lut, "{context}: display LUT");
     assert_eq!(actual.roi, oracle_doc.roi, "{context}: ROI");
 }
 
@@ -14716,6 +14717,35 @@ fn parity_convert_to_rgb_indexed_color_luts_match_java_oracle() {
             assert_rgb_matches_oracle(&doc, &oracle_doc, &format!("{name} range {min}..{max}"));
         }
     }
+}
+
+#[test]
+fn parity_convert_to_rgb_uses_inverted_gray16_display_lut() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut doc = pattern_16bit("rgb-inverted-lut.tif", 2, 2, &[0, 1, 32768, 65535]);
+    let oracle = bridge
+        .run_macro_on_image(&doc, "run(\"Invert LUT\"); run(\"RGB Color\");")
+        .unwrap();
+    let oracle_doc = oracle.output_image.expect("oracle must return saved TIFF");
+    doc.invert_lut().unwrap();
+    doc.convert_to_rgb();
+    assert_rgb_matches_oracle(&doc, &oracle_doc, "inverted gray16 display LUT");
+}
+
+#[test]
+fn parity_duplicate_preserves_inverted_gray16_display_lut() {
+    let mut doc = duplicate_stack_input();
+    doc.invert_lut().unwrap();
+    doc.current_slice = 2;
+    doc.position = [1, 2, 1];
+    let prelude = "Property.setSliceLabel(\"L1\",1); Property.setSliceLabel(\"L2\",2); \
+                   Property.setSliceLabel(\"L3\",3); Property.setSliceLabel(\"L4\",4); \
+                   setSlice(2);";
+    let (oracle_doc, stdout) = oracle_duplicate(&doc, prelude, "duplicate");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let actual = doc.duplicate(title, true, None).unwrap();
+    assert_duplicate_matches_oracle(&actual, &oracle_doc, &stdout, "inverted LUT stack");
+    assert!(actual.current_lut_is_inverted());
 }
 
 #[test]
@@ -16446,6 +16476,32 @@ fn parity_jpeg_dimensions_and_lossy_pixels_with_java() {
         .sum::<f64>()
         / ramp.len() as f64;
     assert!(mse < 100.0, "Java JPEG MSE {mse}");
+}
+
+#[test]
+fn png_and_jpeg_use_inverted_gray8_display_lut() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut doc = ImageDocument::new("inverted", 16, 16, PixelPlane::Gray8((0..256).map(|v| v as u8).collect())).unwrap();
+    doc.invert_lut().unwrap();
+
+    let png_path = dir.path().join("inverted.png");
+    save_png(&png_path, &doc).unwrap();
+    let png = load_image(&png_path).unwrap();
+    let PixelPlane::ColorRgb(pixels) = png.plane() else {
+        panic!("inverted grayscale PNG must be saved through its RGB display, got {:?}", png.plane())
+    };
+    assert_eq!(pixels[0] & 0xffffff, 0xffffff);
+    assert_eq!(pixels[255] & 0xffffff, 0x000000);
+
+    let jpeg_path = dir.path().join("inverted.jpg");
+    save_jpeg(&jpeg_path, &doc, 100).unwrap();
+    let jpeg = load_image(&jpeg_path).unwrap();
+    let PixelPlane::ColorRgb(pixels) = jpeg.plane() else {
+        panic!("inverted grayscale JPEG must be saved through its RGB display, got {:?}", jpeg.plane())
+    };
+    assert_eq!(pixels.len(), 256);
+    assert!((pixels[0] & 0xffffff) > 0xf0f0f0, "first JPEG pixel {:06x}", pixels[0]);
+    assert!((pixels[255] & 0xffffff) < 0x101010, "last JPEG pixel {:06x}", pixels[255]);
 }
 
 #[test]

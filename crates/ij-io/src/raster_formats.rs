@@ -187,8 +187,34 @@ fn display_gray8(doc: &ImageDocument, plane: &PixelPlane) -> Result<Vec<u8>, IoE
     }
 }
 
+fn grayscale_display_rgb(doc: &ImageDocument, plane: &PixelPlane) -> Result<Option<Vec<u8>>, IoError> {
+    let Some(lut) = doc.display_lut.as_ref().filter(|lut| !lut.is_default()) else {
+        return Ok(None);
+    };
+    if !matches!(
+        plane,
+        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_)
+    ) {
+        return Ok(None);
+    }
+    let gray = display_gray8(doc, plane)?;
+    Ok(Some(
+        gray.iter()
+            .flat_map(|&index| {
+                let i = usize::from(index);
+                [lut.r[i], lut.g[i], lut.b[i]]
+            })
+            .collect(),
+    ))
+}
+
 fn dynamic_for_png(doc: &ImageDocument, plane: &PixelPlane) -> Result<DynamicImage, IoError> {
     let (w, h) = (doc.width, doc.height);
+    if let Some(rgb) = grayscale_display_rgb(doc, plane)? {
+        return Ok(DynamicImage::ImageRgb8(
+            ImageBuffer::<Rgb<u8>, _>::from_raw(w, h, rgb).unwrap(),
+        ));
+    }
     let image = match plane {
         PixelPlane::Gray8(values) => DynamicImage::ImageLuma8(
             ImageBuffer::<Luma<u8>, _>::from_raw(w, h, values.clone()).unwrap(),
@@ -217,6 +243,16 @@ pub fn save_png(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoErr
 
 pub fn save_jpeg(path: impl AsRef<Path>, doc: &ImageDocument, quality: u8) -> Result<(), IoError> {
     let plane = current_plane(doc)?;
+    if let Some(rgb) = grayscale_display_rgb(doc, plane)? {
+        let image = DynamicImage::ImageRgb8(
+            ImageBuffer::<Rgb<u8>, _>::from_raw(doc.width, doc.height, rgb).unwrap(),
+        );
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality.clamp(1, 100))
+            .encode_image(&image)?;
+        write_atomic(path.as_ref(), &bytes)?;
+        return Ok(());
+    }
     let image = match plane {
         PixelPlane::ColorRgb(_) | PixelPlane::Color256 { .. } => DynamicImage::ImageRgb8(
             ImageBuffer::<Rgb<u8>, _>::from_raw(doc.width, doc.height, rgb_from_plane(plane)?)

@@ -1364,14 +1364,19 @@ fn byte_display_rgb_table(lut: &Lut256, min: f64, max: f64) -> [u32; 256] {
 /// model. 8-bit planes display through their LUT with the range baked in; a
 /// stack's slices take that range from the current processor, which has
 /// already rounded it (ImageStack.java 205-208, 330-331).
-pub(crate) fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, stack: bool) -> PixelPlane {
+pub(crate) fn plane_to_displayed_rgb(
+    plane: &PixelPlane,
+    range: DisplayRange,
+    stack: bool,
+    display_lut: Option<&Lut256>,
+) -> PixelPlane {
     let gray = |value: u8| 0xff00_0000 | u32::from(value) * 0x0001_0101;
     match plane {
         PixelPlane::Gray8(pixels) | PixelPlane::Color256 { pixels, .. } => {
             let default_lut = Lut256::default();
             let lut = match plane {
                 PixelPlane::Color256 { lut, .. } => lut.as_ref(),
-                _ => &default_lut,
+                _ => display_lut.unwrap_or(&default_lut),
             };
             let (min, max) = if stack {
                 (
@@ -1393,7 +1398,10 @@ pub(crate) fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, st
             PixelPlane::ColorRgb(
                 pixels
                     .iter()
-                    .map(|&px| gray(short_to_byte(px, min, scale)))
+                    .map(|&px| {
+                        let byte = short_to_byte(px, min, scale);
+                        display_lut.map_or_else(|| gray(byte), |lut| 0xff00_0000 | lut_rgb(lut, byte))
+                    })
                     .collect(),
             )
         }
@@ -1405,7 +1413,10 @@ pub(crate) fn plane_to_displayed_rgb(plane: &PixelPlane, range: DisplayRange, st
             PixelPlane::ColorRgb(
                 pixels
                     .iter()
-                    .map(|&px| gray(float_to_byte(px, min, scale)))
+                    .map(|&px| {
+                        let byte = float_to_byte(px, min, scale);
+                        display_lut.map_or_else(|| gray(byte), |lut| 0xff00_0000 | lut_rgb(lut, byte))
+                    })
                     .collect(),
             )
         }
@@ -2336,6 +2347,7 @@ impl ImageDocument {
         // 2649-2654, ByteProcessor.java 136-143, ShortProcessor.java 183-188).
         doc.calibration = self.calibration.clone();
         doc.display_range = self.display_range;
+        doc.display_lut = self.display_lut.clone();
         doc.roi = relocated_roi;
         doc.threshold = None;
         if current_slice != 1 {
@@ -2821,12 +2833,15 @@ impl ImageDocument {
                 range = float_processor_range(pixels);
             }
         }
+        let display_lut = self.display_lut.clone();
         for plane in &mut self.slices {
-            *plane = plane_to_displayed_rgb(plane, range, is_stack);
+            *plane = plane_to_displayed_rgb(plane, range, is_stack, display_lut.as_ref());
         }
         if !is_stack {
             self.snapshot_display_range = Some(self.display_range);
         }
+        // A ColorProcessor does not carry the source image's display LUT.
+        self.display_lut = None;
         // A new ColorProcessor starts with the default 0..255 range.
         self.display_range = DisplayRange {
             min: 0.0,
