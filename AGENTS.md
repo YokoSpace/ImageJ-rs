@@ -42,3 +42,8 @@ For an integration regression, use `./docker/ci test CRATE TARGET EXACT_NAME` fo
 - `./tools/verify.sh` — Runs ledger synchronization check, builds/verifies the Java 1.54u oracle, runs `cargo test --workspace`, executes `ij-cli slice1`, and verifies output artifacts.
 - `./tools/oracle/run_oracle.sh -eval "<macro>" -batch` — Runs any ImageJ 1.54u macro directly against the unmodified Java reference implementation and prints stdout. Use this whenever you need to observe what original ImageJ does on an input.
 - `python3 tools/ledger/sync_ledger.py` — Regenerates `docs/command_ledger.md` and `crates/ij-session/src/generated_commands.rs` from `original_imagej/ij/Menus.java` and `original_imagej/IJ_Props.txt`.
+
+## Formatting and stacked pull requests
+
+- Format only the Rust files changed for the task. For a module root, use `rustfmt --edition 2024 --config skip_children=true path/to/file.rs` and pass any edited children explicitly. Check `git diff --name-status HEAD` and `git diff --cached` before committing. In a clean worktree, `git diff --exit-code HEAD -- . ':(exclude)path/to/file.rs'` detects tracked changes outside the planned files (repeat the exclusion for each intended path). Inspect unexpected paths for pre-existing user edits before removing formatting changes.
+- Merge a dependent PR after its prerequisite lands. Check the dependent PR's current base (GitHub may already have updated it), set it to main when needed, then inspect the changed files and the checks for the updated PR. Wait for Desktop CI to pass on the intended head and base before merging.
