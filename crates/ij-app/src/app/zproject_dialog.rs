@@ -5,6 +5,14 @@ use ij_core::zproject::{
 };
 
 impl ImageJApp {
+    fn record_zproject_cancelled_command(&mut self) {
+        // Executer saves the command after the plugin returns, even when the
+        // dialog was canceled (Executer.java 57-63; Recorder.java 676-684).
+        self.session
+            .macro_recorder
+            .push("run(\"Z Project...\");".into());
+    }
+
     /// `Image > Stacks > Z Project...` (ZProjector.run2,
     /// original_imagej/ij/plugin/ZProjector.java 140-155): a single-slice
     /// image errors before the dialog, an inverting LUT warns via
@@ -20,6 +28,7 @@ impl ImageJApp {
             // IJ.error("Z Project", "Stack required") (ZProjector.java
             // 144-147).
             self.dialogs.last_error = Some(Z_PROJECT_STACK_REQUIRED.into());
+            self.record_zproject_cancelled_command();
             return;
         }
         if crate::image_view::is_inverted_lut(doc) {
@@ -40,6 +49,8 @@ impl ImageJApp {
             if let Some(source) = source {
                 self.show_zproject_dialog(source);
             }
+        } else if source.is_some() {
+            self.record_zproject_cancelled_command();
         }
     }
 
@@ -63,7 +74,10 @@ impl ImageJApp {
 
     /// Cancel returns without projecting (ZProjector.java 160-162).
     pub fn cancel_zproject_dialog(&mut self) {
-        self.dialogs.zproject.open = false;
+        if self.dialogs.zproject.open {
+            self.dialogs.zproject.open = false;
+            self.record_zproject_cancelled_command();
+        }
     }
 
     /// OK on the ZProjection GenericDialog: parses the numeric fields, runs
@@ -151,8 +165,9 @@ impl ImageJApp {
                     .with_inner_size([420.0, 140.0])
                     .with_resizable(false),
                 |ctx, class| {
-                    if !matches!(class, egui::ViewportClass::Embedded)
-                        && ctx.input(|i| i.viewport().close_requested())
+                    if (!matches!(class, egui::ViewportClass::Embedded)
+                        && ctx.input(|i| i.viewport().close_requested()))
+                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
                     {
                         resolved = Some(false);
                     }
@@ -185,8 +200,9 @@ impl ImageJApp {
                     .with_inner_size([280.0, 160.0])
                     .with_resizable(false),
                 |ctx, class| {
-                    if !matches!(class, egui::ViewportClass::Embedded)
-                        && ctx.input(|i| i.viewport().close_requested())
+                    if (!matches!(class, egui::ViewportClass::Embedded)
+                        && ctx.input(|i| i.viewport().close_requested()))
+                        || ctx.input(|i| i.key_pressed(egui::Key::Escape))
                     {
                         cancel = true;
                     }

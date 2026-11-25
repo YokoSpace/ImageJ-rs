@@ -4,10 +4,40 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const DEFAULT_ORACLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_ORACLE_PROCESSES: usize = 4;
+
+static ORACLE_CONCURRENCY: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+fn oracle_concurrency() -> &'static (Mutex<usize>, Condvar) {
+    ORACLE_CONCURRENCY.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+struct OracleConcurrencyPermit;
+
+impl Drop for OracleConcurrencyPermit {
+    fn drop(&mut self) {
+        let (lock, available) = oracle_concurrency();
+        let mut active = lock.lock().unwrap();
+        *active = active.saturating_sub(1);
+        drop(active);
+        available.notify_one();
+    }
+}
+
+fn acquire_oracle_concurrency_permit() -> OracleConcurrencyPermit {
+    let (lock, available) = oracle_concurrency();
+    let mut active = lock.lock().unwrap();
+    while *active >= MAX_CONCURRENT_ORACLE_PROCESSES {
+        active = available.wait(active).unwrap();
+    }
+    *active += 1;
+    OracleConcurrencyPermit
+}
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
@@ -95,6 +125,7 @@ impl JavaOracleBridge {
         cmd: &mut Command,
         timeout: Duration,
     ) -> Result<OracleRunOutput, BridgeError> {
+        let _permit = acquire_oracle_concurrency_permit();
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -242,3 +273,94 @@ pub use plugin_discovery::{
     InspectionSummary, PluginCatalog, PluginDiscoveryError, PluginInspection,
     PluginInspectionFailure, PluginKind, PluginSource, ScanOptions,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Barrier,
+    };
+
+    #[cfg(unix)]
+    fn write_counting_runner(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = dir.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let script = dir.join("counting-runner.sh");
+        let state_text = state.display().to_string().replace('\'', "'\\''");
+        let script_text = r#"#!/bin/sh
+state='__STATE__'
+touch "$state/start-$$"
+tries=0
+while [ ! -f "$state/release" ] && [ "$tries" -lt 1500 ]; do
+    tries=$((tries + 1))
+    sleep 0.01
+done
+exit 0
+"#
+        .replace("__STATE__", &state_text);
+        std::fs::write(&script, script_text).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oracle_processes_are_bounded_to_four_concurrent_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_counting_runner(temp.path());
+        let bridge = Arc::new(JavaOracleBridge {
+            runner_script: script,
+            timeout: Duration::from_secs(10),
+        });
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let bridge = Arc::clone(&bridge);
+            let barrier = Arc::clone(&barrier);
+            let entered = Arc::clone(&entered);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                entered.fetch_add(1, Ordering::SeqCst);
+                bridge.eval_macro("ignored")
+            }));
+        }
+
+        while entered.load(Ordering::SeqCst) < workers {
+            std::thread::yield_now();
+        }
+        let state = temp.path().join("state");
+        let count_started = || {
+            std::fs::read_dir(&state)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|entry| entry.file_name().to_string_lossy().starts_with("start-"))
+                })
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while count_started() < 4 {
+            if Instant::now() >= deadline {
+                std::fs::write(state.join("release"), "").unwrap();
+                panic!("timed out waiting for the bounded batch");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        let peak = count_started();
+        std::fs::write(state.join("release"), "").unwrap();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(peak, 4, "oracle child process peak");
+    }
+}

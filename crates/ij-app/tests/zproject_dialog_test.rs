@@ -137,7 +137,36 @@ fn zproject_cancel_creates_nothing() {
     app.cancel_zproject_dialog();
     assert!(!app.dialogs.zproject.open);
     assert_eq!(app.session.image_ids().len(), image_count);
-    assert!(app.session.macro_recorder.is_empty());
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Z Project...\");")
+    );
+}
+
+#[test]
+fn zproject_escape_cancels_like_generic_dialog() {
+    let ctx = egui::Context::default();
+    let (mut app, _) = app_with(gray8_stack(3));
+    let image_count = app.session.image_ids().len();
+    app.perform(AppAction::ZProject, &ctx);
+    assert!(app.dialogs.zproject.open);
+
+    let mut input = egui::RawInput::default();
+    input.events.push(egui::Event::Key {
+        key: egui::Key::Escape,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::default(),
+    });
+    let _ = ctx.run(input, |ctx| app.update_ui(ctx));
+
+    assert!(!app.dialogs.zproject.open);
+    assert_eq!(app.session.image_ids().len(), image_count);
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Z Project...\");")
+    );
 }
 
 #[test]

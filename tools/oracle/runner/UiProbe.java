@@ -1,9 +1,12 @@
 package tools.oracle;
 
 import ij.IJ;
+import ij.ImageJ;
 import ij.ImagePlus;
 import ij.WindowManager;
 import ij.gui.ImageWindow;
+import ij.macro.Interpreter;
+import ij.plugin.ZProjector;
 import ij.measure.ResultsTable;
 import ij.plugin.filter.Analyzer;
 import java.lang.reflect.Field;
@@ -50,6 +53,56 @@ public final class UiProbe {
             ij.plugin.frame.Recorder.record = savedRecord;
             if (dialog != null && !disposed) dialog.dispose();
             ij.Macro.setOptions(savedMacroOptions);
+        }
+    }
+
+    /** Creates real ImageWindow instances and observes ZProjector title uniquification. */
+    public static String zProjectRealWindowTitles(String unused) {
+        try {
+            String result = zProjectRealWindowTitlesOrThrow();
+            System.out.println("TITLES=" + result);
+            return result;
+        } catch (Throwable t) {
+            return "ERROR=" + t.getClass().getName() + ":" + t.getMessage();
+        }
+    }
+
+    private static String zProjectRealWindowTitlesOrThrow() {
+        boolean savedBatchMode = Interpreter.batchMode;
+        java.util.List<ImageWindow> windows = new java.util.ArrayList<ImageWindow>();
+        try {
+            ImagePlus input = WindowManager.getCurrentImage();
+            if (input == null)
+                throw new IllegalStateException("No current image");
+            Interpreter.batchMode = false;
+            if (IJ.getInstance() == null)
+                new ImageJ();
+            windows.add(new ImageWindow(input));
+            ImagePlus blocker = new ImagePlus(
+                "MAX_input.tif",
+                new ij.process.ByteProcessor(input.getWidth(), input.getHeight())
+            );
+            windows.add(new ImageWindow(blocker));
+
+            ImagePlus avg = ZProjector.run(input, "avg");
+            ImageWindow avgWindow = new ImageWindow(avg);
+            windows.add(avgWindow);
+            ImagePlus max1 = ZProjector.run(input, "max");
+            ImageWindow max1Window = new ImageWindow(max1);
+            windows.add(max1Window);
+            ImagePlus max2 = ZProjector.run(input, "max");
+            ImageWindow max2Window = new ImageWindow(max2);
+            windows.add(max2Window);
+
+            return avg.getTitle() + ";" + max1.getTitle() + ";" + max2.getTitle()
+                + "|visible=" + (avgWindow.isVisible() && max1Window.isVisible() && max2Window.isVisible())
+                + "|windows=" + WindowManager.getWindowCount();
+        } finally {
+            for (ImageWindow window : windows) {
+                window.setVisible(false);
+                window.dispose();
+            }
+            Interpreter.batchMode = savedBatchMode;
         }
     }
 
