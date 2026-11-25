@@ -18,6 +18,13 @@ use thiserror::Error;
 
 pub const DEFAULT_PLUGIN_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Maximum child-output bytes retained for each host stdout/stderr stream.
+/// The pipes are drained fully after this cap; only retention is bounded.
+pub const MAX_HOST_OUTPUT_STREAM_BYTES: usize = 1024 * 1024;
+
+/// Maximum accepted size of a plugin-host protocol result JSON file.
+pub const MAX_PROTOCOL_RESULT_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Cooperative cancellation handle shared between the caller and the bridge's
 /// child-process wait loop. Cancellation is sticky and may be requested before
 /// the child process is spawned.
@@ -68,6 +75,10 @@ pub enum PluginBridgeError {
     IdentityMismatch { expected: String, actual: String },
     #[error("Failed to parse plugin host JSON output: {error}\nraw: {raw}")]
     ProtocolError { error: String, raw: String },
+    #[error(
+        "Plugin host protocol result at {path} is {size} bytes, exceeding the {max}-byte limit"
+    )]
+    ProtocolResultTooLarge { path: PathBuf, size: u64, max: u64 },
     #[error("PlugInFilter input is outside the supported subset: {0}")]
     UnsupportedFilterInput(#[from] PluginFilterInputError),
     #[error("PlugInFilter requires parameters for {schema:?}")]
@@ -683,8 +694,43 @@ fn terminate_process_group(child: &mut std::process::Child) {
 /// the reader threads drain/exit on their own when the last writer closes.
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(300);
 
+#[derive(Clone, Default)]
+struct CapturedStream {
+    bytes: Vec<u8>,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+impl CapturedStream {
+    fn append(&mut self, chunk: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
+        let remaining = MAX_HOST_OUTPUT_STREAM_BYTES.saturating_sub(self.bytes.len());
+        let keep = remaining.min(chunk.len());
+        if keep > 0 {
+            self.bytes.extend_from_slice(&chunk[..keep]);
+        }
+        if keep < chunk.len() {
+            self.truncated = true;
+        }
+    }
+
+    fn into_lossy_string(self, stream_name: &str) -> String {
+        let mut text = String::from_utf8_lossy(&self.bytes).into_owned();
+        if self.truncated {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            let discarded = self.total_bytes.saturating_sub(self.bytes.len() as u64);
+            text.push_str(&format!(
+                "[ij-bridge: {stream_name} truncated after {MAX_HOST_OUTPUT_STREAM_BYTES} retained bytes; discarded {discarded} bytes]\n"
+            ));
+        }
+        text
+    }
+}
+
 struct OutputCapture {
-    buffer: Arc<Mutex<Vec<u8>>>,
+    buffer: Arc<Mutex<CapturedStream>>,
     finished: std::sync::mpsc::Receiver<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -694,7 +740,7 @@ impl OutputCapture {
     where
         R: Read + Send + 'static,
     {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let buffer = Arc::new(Mutex::new(CapturedStream::default()));
         let sink = Arc::clone(&buffer);
         let (finished_tx, finished) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -705,7 +751,7 @@ impl OutputCapture {
                     Ok(n) => sink
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .extend_from_slice(&chunk[..n]),
+                        .append(&chunk[..n]),
                     Err(ref err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
@@ -723,7 +769,7 @@ impl OutputCapture {
     /// The reader thread is deliberately abandoned on timeout: it stays
     /// blocked on the inherited pipe until the detached descendant exits and
     /// must not keep the caller (or the UI's Cancelling state) waiting.
-    fn finish(mut self, deadline: Instant) -> Vec<u8> {
+    fn finish(mut self, deadline: Instant) -> CapturedStream {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if self.finished.recv_timeout(remaining).is_ok() {
             if let Some(thread) = self.thread.take() {
@@ -737,7 +783,10 @@ impl OutputCapture {
     }
 }
 
-fn collect_output(stdout: OutputCapture, stderr: OutputCapture) -> (Vec<u8>, Vec<u8>) {
+fn collect_output(
+    stdout: OutputCapture,
+    stderr: OutputCapture,
+) -> (CapturedStream, CapturedStream) {
     // Give each stream its own grace window: one stream may be held open by a
     // detached descendant while the other already has the diagnostics we need.
     let stdout = stdout.finish(Instant::now() + OUTPUT_DRAIN_GRACE);
@@ -803,9 +852,34 @@ fn run_host_process(
 
     Ok(HostProcessOutput {
         status,
-        stdout: String::from_utf8_lossy(&stdout_bytes).to_string(),
-        stderr: String::from_utf8_lossy(&stderr_bytes).to_string(),
+        stdout: stdout_bytes.into_lossy_string("stdout"),
+        stderr: stderr_bytes.into_lossy_string("stderr"),
     })
+}
+
+fn read_protocol_result(path: &Path) -> Result<String, PluginBridgeError> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_PROTOCOL_RESULT_BYTES {
+        return Err(PluginBridgeError::ProtocolResultTooLarge {
+            path: path.to_path_buf(),
+            size,
+            max: MAX_PROTOCOL_RESULT_BYTES,
+        });
+    }
+
+    let file = std::fs::File::open(path)?;
+    let mut bounded = file.take(MAX_PROTOCOL_RESULT_BYTES + 1);
+    let mut raw = String::new();
+    bounded.read_to_string(&mut raw)?;
+    let size = raw.len() as u64;
+    if size > MAX_PROTOCOL_RESULT_BYTES {
+        return Err(PluginBridgeError::ProtocolResultTooLarge {
+            path: path.to_path_buf(),
+            size,
+            max: MAX_PROTOCOL_RESULT_BYTES,
+        });
+    }
+    Ok(raw)
 }
 
 fn directory_has_newer_file(dir: &Path, threshold: SystemTime) -> std::io::Result<bool> {
@@ -1045,7 +1119,7 @@ impl PluginBridge {
 
         // 2. Read protocol result file or fallback to stdout
         let output = if result_file.is_file() {
-            let raw_json = std::fs::read_to_string(&result_file)?;
+            let raw_json = read_protocol_result(&result_file)?;
             serde_json::from_str::<PluginRunOutput>(&raw_json).map_err(|e| {
                 PluginBridgeError::ProtocolError {
                     error: e.to_string(),
@@ -1202,7 +1276,7 @@ impl PluginBridge {
         }
 
         let output = if result_file.is_file() {
-            let raw_json = std::fs::read_to_string(&result_file)?;
+            let raw_json = read_protocol_result(&result_file)?;
             serde_json::from_str::<PluginInspectionHostOutput>(&raw_json).map_err(|e| {
                 PluginBridgeError::ProtocolError {
                     error: e.to_string(),
@@ -1357,7 +1431,7 @@ impl PluginBridge {
         }
 
         let output = if result_file.is_file() {
-            let raw_json = std::fs::read_to_string(&result_file)?;
+            let raw_json = read_protocol_result(&result_file)?;
             serde_json::from_str::<PluginFilterHostOutput>(&raw_json).map_err(|e| {
                 PluginBridgeError::ProtocolError {
                     error: e.to_string(),
