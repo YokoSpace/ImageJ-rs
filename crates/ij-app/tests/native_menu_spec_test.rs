@@ -427,27 +427,43 @@ fn native_appkit_menu_and_unsaved_quit_smoke() {
     let source = temp.path().join("native_menu_smoke.rs");
     let binary = temp.path().join("native_menu_smoke");
     std::fs::write(&source, NATIVE_MENU_SMOKE_SOURCE).unwrap();
-    let deps = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
+    let exe = std::env::current_exe().unwrap();
+    let profile = exe
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join("deps").is_dir() && ancestor.join("build").is_dir())
+        .unwrap_or_else(|| panic!("no cargo profile directory above {}", exe.display()));
+    let mut search_dirs = vec![profile.join("deps")];
+    if let Ok(packages) = std::fs::read_dir(profile.join("build")) {
+        for package in packages.filter_map(Result::ok) {
+            if let Ok(units) = std::fs::read_dir(package.path()) {
+                for unit in units.filter_map(Result::ok) {
+                    let out = unit.path().join("out");
+                    if out.is_dir() {
+                        search_dirs.push(out);
+                    }
+                }
+            }
+        }
+    }
     let mut rustc = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()));
-    rustc
-        .arg("--edition=2024")
-        .arg("-L")
-        .arg(format!("dependency={}", deps.display()));
+    rustc.arg("--edition=2024");
+    for dir in &search_dirs {
+        rustc.arg("-L").arg(format!("dependency={}", dir.display()));
+    }
     for name in ["ij_app", "eframe", "egui"] {
         let prefix = format!("lib{name}-");
-        let lib = std::fs::read_dir(&deps)
-            .unwrap()
+        let lib = search_dirs
+            .iter()
+            .filter_map(|dir| std::fs::read_dir(dir).ok())
+            .flatten()
             .filter_map(Result::ok)
             .filter(|entry| {
                 entry.file_name().to_string_lossy().starts_with(&prefix)
                     && entry.path().extension().is_some_and(|ext| ext == "rlib")
             })
             .max_by_key(|entry| entry.metadata().unwrap().modified().unwrap())
-            .unwrap();
+            .unwrap_or_else(|| panic!("missing compiled rlib for {name}"));
         rustc
             .arg("--extern")
             .arg(format!("{name}={}", lib.path().display()));

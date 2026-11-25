@@ -4,10 +4,40 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const DEFAULT_ORACLE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_ORACLE_PROCESSES: usize = 4;
+
+static ORACLE_CONCURRENCY: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+fn oracle_concurrency() -> &'static (Mutex<usize>, Condvar) {
+    ORACLE_CONCURRENCY.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+struct OracleConcurrencyPermit;
+
+impl Drop for OracleConcurrencyPermit {
+    fn drop(&mut self) {
+        let (lock, available) = oracle_concurrency();
+        let mut active = lock.lock().unwrap();
+        *active = active.saturating_sub(1);
+        drop(active);
+        available.notify_one();
+    }
+}
+
+fn acquire_oracle_concurrency_permit() -> OracleConcurrencyPermit {
+    let (lock, available) = oracle_concurrency();
+    let mut active = lock.lock().unwrap();
+    while *active >= MAX_CONCURRENT_ORACLE_PROCESSES {
+        active = available.wait(active).unwrap();
+    }
+    *active += 1;
+    OracleConcurrencyPermit
+}
 
 #[derive(Debug, Error)]
 pub enum BridgeError {
@@ -95,6 +125,7 @@ impl JavaOracleBridge {
         cmd: &mut Command,
         timeout: Duration,
     ) -> Result<OracleRunOutput, BridgeError> {
+        let _permit = acquire_oracle_concurrency_permit();
         cmd.stdin(Stdio::null());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -242,3 +273,63 @@ pub use plugin_discovery::{
     InspectionSummary, PluginCatalog, PluginDiscoveryError, PluginInspection,
     PluginInspectionFailure, PluginKind, PluginSource, ScanOptions,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[cfg(unix)]
+    fn write_counting_runner(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state = dir.join("state");
+        std::fs::create_dir(&state).unwrap();
+        let script = dir.join("counting-runner.sh");
+        let state_text = state.display().to_string().replace('\'', "'\\''");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nstate='{state_text}'\nlock=\"$state/lock\"\nwhile ! mkdir \"$lock\" 2>/dev/null; do sleep 0.01; done\nactive=0\nif [ -f \"$state/active\" ]; then active=$(cat \"$state/active\"); fi\nactive=$((active + 1))\necho \"$active\" > \"$state/active\"\necho \"$active\" >> \"$state/peaks\"\nrmdir \"$lock\"\nsleep 1\nwhile ! mkdir \"$lock\" 2>/dev/null; do sleep 0.01; done\nactive=$(cat \"$state/active\")\nactive=$((active - 1))\necho \"$active\" > \"$state/active\"\nrmdir \"$lock\"\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oracle_processes_are_bounded_to_four_concurrent_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = write_counting_runner(temp.path());
+        let bridge = Arc::new(JavaOracleBridge {
+            runner_script: script,
+            timeout: Duration::from_secs(10),
+        });
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            let bridge = Arc::clone(&bridge);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                bridge.eval_macro("ignored")
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let peak = std::fs::read_to_string(temp.path().join("state/peaks"))
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<usize>().unwrap())
+            .max()
+            .unwrap();
+        assert!(peak > 1, "test must exercise overlapping child processes");
+        assert_eq!(peak, 4, "oracle child process peak");
+    }
+}

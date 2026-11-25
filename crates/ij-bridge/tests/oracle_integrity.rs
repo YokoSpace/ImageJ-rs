@@ -339,7 +339,7 @@ fn test_oracle_cold_parallel_invocations() {
             b.wait();
             let bridge = JavaOracleBridge::locate_from_repo_root(r).unwrap();
             let macro_code = format!("print(\"thread_{i}=\" + ({i} * 7));");
-            bridge.eval_macro(&macro_code)
+            bridge.eval_macro_with_timeout(&macro_code, Duration::from_secs(180))
         }));
     }
 

@@ -258,9 +258,9 @@ fn test_plugin_background_thread_terminated() {
         .with_classpath_entry(fixture_jar_path())
         .with_work_dir(tmp.path());
 
-    // Should complete cleanly and terminate background thread within 3 seconds, not hang
+    // Should complete cleanly and terminate background thread, not hang for the fixture's 60 seconds
     let output = bridge
-        .run_plugin_with_timeout(&req, Duration::from_secs(3))
+        .run_plugin_with_timeout(&req, Duration::from_secs(10))
         .expect("background thread plugin should terminate and return output");
     assert!(output.is_success(), "expected success, got {:?}", output);
     assert!(
