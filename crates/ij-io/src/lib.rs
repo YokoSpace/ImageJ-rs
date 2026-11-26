@@ -823,6 +823,11 @@ pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoEr
     if doc.slices.is_empty() {
         return Err(IoError::UnsupportedFormat("empty image stack".into()));
     }
+    if doc.composite_display.is_some() {
+        return Err(IoError::UnsupportedFormat(
+            "composite channel LUT metadata is not yet serializable; refusing to drop it".into(),
+        ));
+    }
 
     let display_lut = match doc.plane() {
         PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => doc

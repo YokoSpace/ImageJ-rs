@@ -3,8 +3,8 @@ use ij_core::{
     default_duplicate_title, display_histogram, format_ij_num, CoreError, DisplayHistogram,
     DisplayRange, ImageDocument, LineMeasurement, LineRoi, Lut256, MeasurementConfig,
     MeasurementFlags,
-    MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
-    CompositeProjection,
+    CompositeDisplay, CompositeDisplayMode, CompositeProjection, MeasurementSummary, PixelPlane,
+    PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
     ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions, RESULT_HEADINGS,
 };
 use ij_io::{load_image, load_tiff, save_jpeg, save_png, save_tiff};
@@ -26558,6 +26558,70 @@ fn parity_invert_luts_gray16_transforms_display_lut_and_projection() {
 }
 
 #[test]
+fn parity_invert_luts_composite_channels_match_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("comp","8-bit composite-mode",2,2,2,1,1); run("Invert LUTs"); for(c=1;c<=2;c++){Stack.setChannel(c); getLut(r,g,b); print("C"+c+"="+r[0]+","+g[0]+","+b[0]+";"+r[1]+","+g[1]+","+b[1]+";"+r[128]+","+g[128]+","+b[128]+";"+r[255]+","+g[255]+","+b[255]);} print("MODE="+Property.get("CompositeProjection"));"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "C1="), "C1=255,255,255;255,254,254;255,127,127;255,0,0");
+    assert_eq!(oracle_line(&oracle.stdout, "C2="), "C2=255,255,255;254,255,254;127,255,127;0,255,0");
+    assert_eq!(oracle_line(&oracle.stdout, "MODE="), "MODE=Invert");
+
+    let original_slices = vec![
+        PixelPlane::Gray8(vec![0, 1, 2, 3]),
+        PixelPlane::Gray8(vec![4, 5, 6, 7]),
+    ];
+    let mut doc = ImageDocument::new_hyperstack(
+        "composite.tif",
+        2,
+        2,
+        original_slices.clone(),
+        2,
+        1,
+        1,
+    )
+    .unwrap();
+    doc.composite_display = Some(CompositeDisplay::new(
+        2,
+        doc.display_range,
+        CompositeDisplayMode::Composite,
+    ));
+    doc.set_position(2, 1, 1);
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session.dispatch(Command::InvertLuts).unwrap();
+
+    let rust = session.get_image(id).unwrap();
+    assert_eq!(rust.slices, original_slices, "Invert LUTs must not edit pixels");
+    assert_eq!(rust.get_channel(), 1, "InvertAllLuts returns to channel 1");
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Invert));
+    let composite = rust.composite_display.as_ref().unwrap();
+    assert_eq!(composite.channels[0].lut.r[0], 255);
+    assert_eq!(composite.channels[0].lut.g[1], 254);
+    assert_eq!(composite.channels[0].lut.b[128], 127);
+    assert_eq!(composite.channels[0].lut.r[255], 255);
+    assert_eq!(composite.channels[1].lut.r[0], 255);
+    assert_eq!(composite.channels[1].lut.r[1], 254);
+    assert_eq!(composite.channels[1].lut.g[128], 255);
+    assert_eq!(composite.channels[1].lut.g[255], 255);
+    assert_eq!(composite.channels[0].lut.b[255], 0);
+    assert_eq!(composite.channels[1].lut.b[255], 0);
+
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust = session.get_image(id).unwrap();
+    let composite = rust.composite_display.as_ref().unwrap();
+    assert_eq!(composite.channels[0].lut.r[255], 255);
+    assert_eq!(composite.channels[0].lut.g[255], 0);
+    assert_eq!(composite.channels[0].lut.b[255], 0);
+    assert_eq!(composite.channels[1].lut.r[255], 0);
+    assert_eq!(composite.channels[1].lut.g[255], 255);
+    assert_eq!(composite.channels[1].lut.b[255], 0);
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Sum));
+}
+
+#[test]
 fn invert_luts_rejects_rgb_without_pixels_or_recording() {
     let mut session = Session::new();
     let doc = ImageDocument::new("rgb.tif", 1, 1, PixelPlane::ColorRgb(vec![0xff112233])).unwrap();
@@ -26568,12 +26632,23 @@ fn invert_luts_rejects_rgb_without_pixels_or_recording() {
 }
 
 #[test]
-fn invert_luts_rejects_multi_channel_until_channel_luts_are_modeled() {
+fn parity_invert_luts_noncomposite_multichannel_reuses_one_processor_lut() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("plain","8-bit black",2,2,2); Stack.setDimensions(2,1,1); print("COMP="+is("composite")); run("Invert LUTs"); getLut(r,g,b); print("LUT="+r[0]+","+g[0]+","+b[0]+";"+r[255]+","+g[255]+","+b[255]+" inv="+is("Inverting LUT")); print("MODE="+Property.get("CompositeProjection"));"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "COMP="), "COMP=0");
+    assert_eq!(oracle_line(&oracle.stdout, "LUT="), "LUT=0,0,0;255,255,255 inv=0");
+    assert_eq!(oracle_line(&oracle.stdout, "MODE="), "MODE=Invert");
+
+    let original_slices = vec![PixelPlane::Gray8(vec![0]), PixelPlane::Gray8(vec![1])];
     let doc = ImageDocument::new_hyperstack(
         "two-channel.tif",
         1,
         1,
-        vec![PixelPlane::Gray8(vec![0]), PixelPlane::Gray8(vec![1])],
+        original_slices.clone(),
         2,
         1,
         1,
@@ -26581,13 +26656,13 @@ fn invert_luts_rejects_multi_channel_until_channel_luts_are_modeled() {
     .unwrap();
     let mut session = Session::new();
     let id = session.insert_doc(doc);
-    let error = session.dispatch(Command::InvertLuts).unwrap_err().to_string();
-    assert!(
-        error.contains("multi-channel"),
-        "expected explicit multi-channel rejection, got {error}"
-    );
-    assert_eq!(session.get_image(id).unwrap().display_lut, None);
-    assert!(session.macro_recorder.is_empty());
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust = session.get_image(id).unwrap();
+    assert_eq!(rust.slices, original_slices);
+    assert_eq!(rust.display_lut, Some(Lut256::default()));
+    assert!(!rust.current_lut_is_inverted());
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Invert));
+    assert_eq!(rust.get_channel(), 1);
 }
 
 #[test]

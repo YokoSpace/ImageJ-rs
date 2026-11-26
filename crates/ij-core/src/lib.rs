@@ -149,6 +149,61 @@ pub enum CompositeProjection {
     Invert,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompositeDisplayMode {
+    Composite,
+    Color,
+    Grayscale,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompositeChannelDisplay {
+    pub lut: Lut256,
+    pub display_range: DisplayRange,
+}
+
+/// CompositeImage's per-channel LUT array. Presence of this value means the
+/// image is composite; ordinary multi-channel ImagePlus values keep using the
+/// shared processor LUT and have `None` here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompositeDisplay {
+    pub mode: CompositeDisplayMode,
+    pub channels: Vec<CompositeChannelDisplay>,
+}
+
+impl CompositeDisplay {
+    /// Default channel LUTs installed by `CompositeImage.setupLuts`: red,
+    /// green, blue, white, cyan, magenta, yellow, then white beyond 7 channels.
+    pub fn new(
+        channel_count: u32,
+        display_range: DisplayRange,
+        mode: CompositeDisplayMode,
+    ) -> Self {
+        const COLORS: [(u8, u8, u8); 8] = [
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 255),
+            (0, 255, 255),
+            (255, 0, 255),
+            (255, 255, 0),
+            (255, 255, 255),
+        ];
+        let channels = (0..channel_count)
+            .map(|index| {
+                let (red, green, blue) = COLORS[index.min(7) as usize];
+                let lut = Lut256 {
+                    r: (0..=255u32).map(|i| (i * u32::from(red) / 255) as u8).collect(),
+                    g: (0..=255u32).map(|i| (i * u32::from(green) / 255) as u8).collect(),
+                    b: (0..=255u32).map(|i| (i * u32::from(blue) / 255) as u8).collect(),
+                };
+                CompositeChannelDisplay { lut, display_range }
+            })
+            .collect();
+        Self { mode, channels }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lut256 {
     pub r: Vec<u8>,
@@ -1601,6 +1656,10 @@ pub struct ImageDocument {
     /// property observed before `InvertAllLuts` first runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite_projection: Option<CompositeProjection>,
+    /// Per-channel LUT state when this is a CompositeImage. `None` means an
+    /// ordinary ImagePlus, including ordinary non-composite hyperstacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_display: Option<CompositeDisplay>,
     pub calibration: Calibration,
     pub roi: Option<Roi>,
     /// Active threshold levels (`ImageProcessor.NO_THRESHOLD` is modelled as
@@ -1678,6 +1737,7 @@ impl ImageDocument {
             display_range,
             display_lut: None,
             composite_projection: None,
+            composite_display: None,
             calibration: Calibration::default(),
             roi: None,
             threshold: None,
@@ -2408,6 +2468,7 @@ impl ImageDocument {
         doc.calibration = self.calibration.clone();
         doc.display_range = self.display_range;
         doc.display_lut = self.display_lut.clone();
+        doc.composite_display = self.composite_display.clone();
         doc.roi = relocated_roi;
         doc.threshold = None;
         if current_slice != 1 {
@@ -3095,35 +3156,49 @@ impl ImageDocument {
         Ok(())
     }
 
-    /// Applies the single-channel part of `InvertAllLuts.txt`: transform the
-    /// display LUT, then align the observable CompositeProjection property.
-    /// Multi-channel images need per-channel LUT storage and are rejected
-    /// explicitly rather than being treated as one shared LUT.
+    /// Applies `InvertAllLuts.txt`: transform every channel LUT, return to
+    /// channel 1, then align the observable CompositeProjection property.
+    /// Composite images use their per-channel LUT array. Ordinary multi-channel
+    /// ImagePlus values reuse one processor LUT, so the loop transforms that
+    /// shared LUT once per channel (ImagePlus.setSlice reuses the processor).
     pub fn invert_luts(&mut self) -> Result<(), CoreError> {
-        if self.n_channels != 1 {
-            return Err(CoreError::InvalidOperation(
-                "Invert LUTs does not support multi-channel images yet",
-            ));
-        }
         let index = self.current_slice_index();
-        match &self.slices[index] {
-            PixelPlane::ColorRgb(_) => {
-                return Err(CoreError::InvalidOperation("Non-RGB image expected"));
+        if matches!(self.slices[index], PixelPlane::ColorRgb(_)) {
+            return Err(CoreError::InvalidOperation("Non-RGB image expected"));
+        }
+
+        if let Some(composite) = &mut self.composite_display {
+            for channel in &mut composite.channels {
+                channel.lut = channel.lut.complement_hue_rotated();
             }
-            PixelPlane::Color256 { .. } => {
-                for plane in &mut self.slices {
-                    if let PixelPlane::Color256 { lut, .. } = plane {
-                        *lut = Box::new(lut.complement_hue_rotated());
+        } else {
+            for _ in 0..self.n_channels.max(1) {
+                match &self.slices[index] {
+                    PixelPlane::ColorRgb(_) => unreachable!("RGB rejected above"),
+                    PixelPlane::Color256 { .. } => {
+                        for plane in &mut self.slices {
+                            if let PixelPlane::Color256 { lut, .. } = plane {
+                                *lut = Box::new(lut.complement_hue_rotated());
+                            }
+                        }
+                    }
+                    PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
+                        let lut = self.display_lut.clone().unwrap_or_default();
+                        self.display_lut = Some(lut.complement_hue_rotated());
                     }
                 }
             }
-            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
-                let lut = self.display_lut.clone().unwrap_or_default();
-                self.display_lut = Some(lut.complement_hue_rotated());
-            }
         }
 
-        let inverted = self.current_lut_is_inverted();
+        self.set_position(1, self.get_slice() as i32, self.get_frame() as i32);
+        let inverted = if let Some(composite) = &self.composite_display {
+            composite
+                .channels
+                .first()
+                .is_some_and(|channel| channel.lut.is_inverted())
+        } else {
+            self.current_lut_is_inverted()
+        };
         let mode = self.composite_projection;
         let unchanged = (inverted
             && matches!(
