@@ -4,6 +4,7 @@ use ij_core::{
     DisplayRange, ImageDocument, LineMeasurement, LineRoi, Lut256, MeasurementConfig,
     MeasurementFlags,
     MeasurementSummary, PixelPlane, PolygonRoi, RectRoi, ResultsTable, Roi, StackPosition,
+    CompositeProjection,
     ThresholdLevels, Wand, WandMode, ParticleAnalysisOptions, RESULT_HEADINGS,
 };
 use ij_io::{load_image, load_tiff, save_jpeg, save_png, save_tiff};
@@ -14749,6 +14750,40 @@ fn parity_duplicate_preserves_inverted_gray16_display_lut() {
 }
 
 #[test]
+fn parity_duplicate_preserves_composite_projection_after_invert_luts() {
+    let doc = pattern_16bit("projection-dupe.tif", 2, 2, &[0, 1, 32768, 65535]);
+    let (oracle_doc, stdout) = oracle_duplicate(&doc, r#"run("Invert LUTs");"#, "duplicate");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let mut rust_source = doc.clone();
+    rust_source.invert_luts().unwrap();
+    let mut actual = rust_source.duplicate(title, false, None).unwrap();
+    let _ = stdout;
+    assert_eq!(oracle_doc.composite_projection, Some(CompositeProjection::Invert));
+    assert_eq!(actual.composite_projection, oracle_doc.composite_projection);
+    actual.invert_luts().unwrap();
+    assert_eq!(actual.composite_projection, Some(CompositeProjection::Sum));
+}
+
+#[test]
+fn duplicate_preserves_composite_projection_for_single_stack_and_range_modes() {
+    let mut source = duplicate_stack_input();
+    source.invert_luts().unwrap();
+    for (duplicate_stack, range, label) in [
+        (false, None, "single image"),
+        (true, None, "whole stack"),
+        (true, Some((2, 3)), "slice range"),
+    ] {
+        let title = format!("projection-{label}.tif");
+        let duplicated = source.duplicate(title, duplicate_stack, range).unwrap();
+        assert_eq!(
+            duplicated.composite_projection,
+            Some(CompositeProjection::Invert),
+            "{label} duplicate must preserve CompositeProjection"
+        );
+    }
+}
+
+#[test]
 fn parity_convert_to_rgb_rgb_is_a_noop_like_java_oracle() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let pixels: Vec<u32> = (0..32u32)
@@ -26434,6 +26469,160 @@ fn parity_invert_lut_indexed_color_reverses_every_channel() {
     }
 }
 
+
+#[test]
+fn parity_invert_luts_single_channel_custom_lut_and_projection_match_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let r: Vec<u8> = (0..=255).collect();
+    let g: Vec<u8> = (0..=255).map(|v| 255 - v).collect();
+    let b: Vec<u8> = (0..=255u32).map(|v| ((v * 37) % 256) as u8).collect();
+    let lut = Lut256 { r, g, b };
+    let original = ImageDocument::new(
+        "invert-luts-indexed.tif",
+        2,
+        2,
+        PixelPlane::Color256 {
+            pixels: vec![0, 1, 128, 255],
+            lut: Box::new(lut.clone()),
+        },
+    )
+    .unwrap();
+    let oracle = bridge
+        .run_macro_on_image(
+            &original,
+            "run(\"Invert LUTs\"); print(\"AFTER=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,17,34,255\")); print(\"MODE=\"+Property.get(\"CompositeProjection\"));",
+        )
+        .unwrap();
+    let after = lut_probe_line(&oracle.stdout, "AFTER=");
+    assert!(after.contains("entries=0:0,255,0"), "after: {after}");
+    assert!(after.contains("17:17,238,117"), "after: {after}");
+    assert!(after.contains("34:21,208,221"), "after: {after}");
+    assert!(after.contains("255:255,0,219"), "after: {after}");
+    assert_eq!(oracle_line(&oracle.stdout, "MODE="), "MODE=Invert");
+    let oracle_doc = oracle.output_image.expect("oracle must return the TIFF");
+    let PixelPlane::Color256 {
+        pixels: oracle_pixels,
+        lut: oracle_lut,
+    } = oracle_doc.plane()
+    else {
+        panic!("oracle output must remain indexed")
+    };
+    assert_eq!(oracle_pixels, &vec![0, 1, 128, 255], "Invert LUTs must not edit pixels");
+
+    let rust_dir = tempfile::tempdir().unwrap();
+    let rust_path = rust_dir.path().join(original.title.clone());
+    save_tiff(&rust_path, &original).unwrap();
+    let mut session = Session::new();
+    let id = match session
+        .dispatch(Command::OpenTiff { path: rust_path })
+        .unwrap()
+    {
+        CommandOutcome::ImageOpened(id) => id,
+        other => panic!("expected ImageOpened, got {other:?}"),
+    };
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust = session.get_image(id).unwrap();
+    let PixelPlane::Color256 { pixels, lut: rust_lut } = rust.plane() else {
+        panic!("indexed input must remain indexed")
+    };
+    assert_eq!(pixels, &vec![0, 1, 128, 255]);
+    assert_eq!(rust_lut.as_ref(), oracle_lut.as_ref());
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Invert));
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Invert LUTs\");")
+    );
+
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust = session.get_image(id).unwrap();
+    let PixelPlane::Color256 { lut: twice_lut, .. } = rust.plane() else {
+        panic!("indexed input must remain indexed")
+    };
+    assert_eq!(twice_lut.as_ref(), &lut, "Invert LUTs must be reversible");
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Sum));
+}
+
+#[test]
+fn parity_invert_luts_gray16_transforms_display_lut_and_projection() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let mut original = pattern_16bit("invert-luts-gray16.tif", 2, 2, &[0, 1, 32768, 65535]);
+    original.display_range = DisplayRange { min: 0.0, max: 65535.0 };
+    let oracle = bridge
+        .run_macro_on_image(
+            &original,
+            "run(\"Invert LUTs\"); print(\"AFTER=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,1,255\")); print(\"MODE=\"+Property.get(\"CompositeProjection\"));",
+        )
+        .unwrap();
+    let after = lut_probe_line(&oracle.stdout, "AFTER=");
+    assert!(after.contains("inv=true"), "after: {after}");
+    assert!(after.contains("entries=0:255,255,255,1:254,254,254,255:0,0,0"), "after: {after}");
+    assert_eq!(oracle_line(&oracle.stdout, "MODE="), "MODE=Invert");
+    let oracle_doc = oracle.output_image.expect("oracle must return the TIFF");
+    assert_eq!(oracle_doc.slices, original.slices, "Invert LUTs must not edit pixels");
+
+    let mut session = Session::new();
+    let id = session.insert_doc(original.clone());
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust = session.get_image(id).unwrap();
+    assert_eq!(rust.slices, original.slices);
+    assert_eq!(rust.display_range, original.display_range);
+    assert_eq!(rust.display_lut, Some(Lut256::default().inverted()));
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Invert));
+    assert_eq!(
+        session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Invert LUTs\");")
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rust-invert-luts-gray16.tif");
+    save_tiff(&path, rust).unwrap();
+    let reloaded = load_tiff(&path).unwrap();
+    assert_eq!(reloaded.display_lut, Some(Lut256::default().inverted()));
+    assert_eq!(reloaded.composite_projection, Some(CompositeProjection::Invert));
+    let java = bridge
+        .eval_macro(&format!(
+            "open(\"{}\"); print(\"RUST_MODE=\"+Property.get(\"CompositeProjection\")); print(\"RUST_LUT=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,255\"));",
+            path.display()
+        ))
+        .unwrap();
+    assert_eq!(oracle_line(&java.stdout, "RUST_MODE="), "RUST_MODE=Invert");
+    let rust_lut = lut_probe_line(&java.stdout, "RUST_LUT=");
+    assert!(rust_lut.contains("inv=true"), "rust lut in Java: {rust_lut}");
+    assert!(rust_lut.contains("entries=0:255,255,255,255:0,0,0"), "rust lut in Java: {rust_lut}");
+}
+
+#[test]
+fn invert_luts_rejects_rgb_without_pixels_or_recording() {
+    let mut session = Session::new();
+    let doc = ImageDocument::new("rgb.tif", 1, 1, PixelPlane::ColorRgb(vec![0xff112233])).unwrap();
+    let id = session.insert_doc(doc);
+    assert!(session.dispatch(Command::InvertLuts).is_err());
+    assert_eq!(session.get_image(id).unwrap().slices[0], PixelPlane::ColorRgb(vec![0xff112233]));
+    assert!(session.macro_recorder.is_empty());
+}
+
+#[test]
+fn invert_luts_rejects_multi_channel_until_channel_luts_are_modeled() {
+    let doc = ImageDocument::new_hyperstack(
+        "two-channel.tif",
+        1,
+        1,
+        vec![PixelPlane::Gray8(vec![0]), PixelPlane::Gray8(vec![1])],
+        2,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    let error = session.dispatch(Command::InvertLuts).unwrap_err().to_string();
+    assert!(
+        error.contains("multi-channel"),
+        "expected explicit multi-channel rejection, got {error}"
+    );
+    assert_eq!(session.get_image(id).unwrap().display_lut, None);
+    assert!(session.macro_recorder.is_empty());
+}
 
 #[test]
 fn parity_inverted_gray16_display_lut_survives_rust_tiff_for_java() {

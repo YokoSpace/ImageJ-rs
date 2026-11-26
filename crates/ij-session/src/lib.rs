@@ -236,6 +236,10 @@ pub enum Command {
     /// LutLoader.java 162-182). Display-only: pixels and display range are
     /// unchanged and the command does not set `ImagePlus.changes`.
     InvertLut,
+    /// `Image > Color > Invert LUTs` (`InvertAllLuts.txt`). This first unit
+    /// covers single-channel images; multi-channel images are rejected
+    /// explicitly until per-channel LUTs are modeled.
+    InvertLuts,
     MakeRectRoi {
         x: i32,
         y: i32,
@@ -1520,6 +1524,11 @@ impl Session {
             Command::InvertLut => {
                 self.active_doc_mut()?.invert_lut()?;
                 self.macro_recorder.push("run(\"Invert LUT\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::InvertLuts => {
+                self.active_doc_mut()?.invert_luts()?;
+                self.macro_recorder.push("run(\"Invert LUTs\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::AutoDisplayRange { min, max } => {

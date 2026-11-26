@@ -141,6 +141,14 @@ pub enum CoreError {
     EmptyThresholdHistogram { bins: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompositeProjection {
+    Sum,
+    Min,
+    Max,
+    Invert,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lut256 {
     pub r: Vec<u8>,
@@ -198,6 +206,53 @@ impl Lut256 {
             g: reverse(&self.g),
             b: reverse(&self.b),
         }
+    }
+    /// `InvertAllLuts.txt` in `ij.jar`: complement each entry, rotate its HSV
+    /// hue by half the hue circle, and round the resulting RGB entry.
+    pub fn complement_hue_rotated(&self) -> Self {
+        fn hsv_from_rgb(r: f64, g: f64, b: f64) -> [f64; 3] {
+            let v = r.max(g).max(b);
+            let c = v - r.min(g).min(b);
+            let mut h = 0.0;
+            if c > 0.0 {
+                if v == r {
+                    h = 256.0 / 6.0 * (g - b) / c;
+                } else if v == g {
+                    h = 256.0 / 6.0 * (2.0 + (b - r) / c);
+                } else if v == b {
+                    h = 256.0 / 6.0 * (4.0 + (r - g) / c);
+                }
+            }
+            h = (h + 256.0) % 256.0;
+            let s = if v > 0.0 { c / v * 256.0 } else { 0.0 };
+            [h, s, v]
+        }
+
+        fn rgb_from_hsv(h: f64, s: f64, v: f64) -> [f64; 3] {
+            let factor = |offset: f64| {
+                let x = (offset + h / 256.0 * 6.0) % 6.0;
+                (4.0 - x).min(1.0).min(x).max(0.0)
+            };
+            [
+                v - v * s / 256.0 * factor(5.0),
+                v - v * s / 256.0 * factor(3.0),
+                v - v * s / 256.0 * factor(1.0),
+            ]
+        }
+
+        let mut out = Lut256::default();
+        for i in 0..256 {
+            let hsv = hsv_from_rgb(
+                255.0 - f64::from(self.r[i]),
+                255.0 - f64::from(self.g[i]),
+                255.0 - f64::from(self.b[i]),
+            );
+            let rgb = rgb_from_hsv((hsv[0] + 128.0) % 256.0, hsv[1], hsv[2]);
+            out.r[i] = rgb[0].round() as u8;
+            out.g[i] = rgb[1].round() as u8;
+            out.b[i] = rgb[2].round() as u8;
+        }
+        out
     }
 }
 
@@ -1542,6 +1597,10 @@ pub struct ImageDocument {
     /// grayscale LUT; indexed-color planes carry their LUT in `PixelPlane`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_lut: Option<Lut256>,
+    /// ImagePlus `CompositeProjection` property. `None` is the unset empty
+    /// property observed before `InvertAllLuts` first runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_projection: Option<CompositeProjection>,
     pub calibration: Calibration,
     pub roi: Option<Roi>,
     /// Active threshold levels (`ImageProcessor.NO_THRESHOLD` is modelled as
@@ -1618,6 +1677,7 @@ impl ImageDocument {
             position: [1, 1, 1],
             display_range,
             display_lut: None,
+            composite_projection: None,
             calibration: Calibration::default(),
             roi: None,
             threshold: None,
@@ -2348,6 +2408,7 @@ impl ImageDocument {
         doc.calibration = self.calibration.clone();
         doc.display_range = self.display_range;
         doc.display_lut = self.display_lut.clone();
+        doc.composite_projection = self.composite_projection;
         doc.roi = relocated_roi;
         doc.threshold = None;
         if current_slice != 1 {
@@ -3031,6 +3092,57 @@ impl ImageDocument {
                 let lut = self.display_lut.clone().unwrap_or_default();
                 self.display_lut = Some(lut.inverted());
             }
+        }
+        Ok(())
+    }
+
+    /// Applies the single-channel part of `InvertAllLuts.txt`: transform the
+    /// display LUT, then align the observable CompositeProjection property.
+    /// Multi-channel images need per-channel LUT storage and are rejected
+    /// explicitly rather than being treated as one shared LUT.
+    pub fn invert_luts(&mut self) -> Result<(), CoreError> {
+        if self.n_channels != 1 {
+            return Err(CoreError::InvalidOperation(
+                "Invert LUTs does not support multi-channel images yet",
+            ));
+        }
+        let index = self.current_slice_index();
+        match &self.slices[index] {
+            PixelPlane::ColorRgb(_) => {
+                return Err(CoreError::InvalidOperation("Non-RGB image expected"));
+            }
+            PixelPlane::Color256 { .. } => {
+                for plane in &mut self.slices {
+                    if let PixelPlane::Color256 { lut, .. } = plane {
+                        *lut = Box::new(lut.complement_hue_rotated());
+                    }
+                }
+            }
+            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
+                let lut = self.display_lut.clone().unwrap_or_default();
+                self.display_lut = Some(lut.complement_hue_rotated());
+            }
+        }
+
+        let inverted = self.current_lut_is_inverted();
+        let mode = self.composite_projection;
+        let unchanged = (inverted
+            && matches!(
+                mode,
+                Some(CompositeProjection::Min) | Some(CompositeProjection::Invert)
+            ))
+            || (!inverted
+                && matches!(
+                    mode,
+                    Some(CompositeProjection::Sum) | Some(CompositeProjection::Max)
+                ));
+        if !unchanged {
+            self.composite_projection = Some(match mode {
+                Some(CompositeProjection::Invert) => CompositeProjection::Sum,
+                Some(CompositeProjection::Min) => CompositeProjection::Max,
+                Some(CompositeProjection::Max) => CompositeProjection::Min,
+                Some(CompositeProjection::Sum) | None => CompositeProjection::Invert,
+            });
         }
         Ok(())
     }
