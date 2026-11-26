@@ -2468,6 +2468,7 @@ impl ImageDocument {
         doc.calibration = self.calibration.clone();
         doc.display_range = self.display_range;
         doc.display_lut = self.display_lut.clone();
+        doc.composite_projection = self.composite_projection;
         doc.composite_display = self.composite_display.clone();
         doc.roi = relocated_roi;
         doc.threshold = None;
