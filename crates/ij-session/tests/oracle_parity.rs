@@ -14750,6 +14750,40 @@ fn parity_duplicate_preserves_inverted_gray16_display_lut() {
 }
 
 #[test]
+fn parity_duplicate_preserves_composite_projection_after_invert_luts() {
+    let doc = pattern_16bit("projection-dupe.tif", 2, 2, &[0, 1, 32768, 65535]);
+    let (oracle_doc, stdout) = oracle_duplicate(&doc, r#"run("Invert LUTs");"#, "duplicate");
+    let title = default_duplicate_title(&[doc.title.as_str()], &doc.title);
+    let mut rust_source = doc.clone();
+    rust_source.invert_luts().unwrap();
+    let mut actual = rust_source.duplicate(title, false, None).unwrap();
+    let _ = stdout;
+    assert_eq!(oracle_doc.composite_projection, Some(CompositeProjection::Invert));
+    assert_eq!(actual.composite_projection, oracle_doc.composite_projection);
+    actual.invert_luts().unwrap();
+    assert_eq!(actual.composite_projection, Some(CompositeProjection::Sum));
+}
+
+#[test]
+fn duplicate_preserves_composite_projection_for_single_stack_and_range_modes() {
+    let mut source = duplicate_stack_input();
+    source.invert_luts().unwrap();
+    for (duplicate_stack, range, label) in [
+        (false, None, "single image"),
+        (true, None, "whole stack"),
+        (true, Some((2, 3)), "slice range"),
+    ] {
+        let title = format!("projection-{label}.tif");
+        let duplicated = source.duplicate(title, duplicate_stack, range).unwrap();
+        assert_eq!(
+            duplicated.composite_projection,
+            Some(CompositeProjection::Invert),
+            "{label} duplicate must preserve CompositeProjection"
+        );
+    }
+}
+
+#[test]
 fn parity_convert_to_rgb_rgb_is_a_noop_like_java_oracle() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let pixels: Vec<u32> = (0..32u32)
