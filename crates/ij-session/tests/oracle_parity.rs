@@ -19823,12 +19823,12 @@ fn oracle_new_image(
     width: u32,
     height: u32,
     slices: u32,
-) -> (Option<ImageDocument>, Vec<f64>, f64, f64, String) {
+) -> (ImageDocument, Vec<f64>, f64, f64, String) {
     let seed = ImageDocument::new("seed.tif", 1, 1, PixelPlane::Gray8(vec![0])).unwrap();
-    // getPixel output is collected via a plain macro because the 16/32-bit
-    // white fill's invertLut writes a ColorMap TIFF that load_tiff cannot
-    // represent; its raw values still give a full pixel comparison. The
-    // saveAs leg is attempted separately and tolerated as None.
+    // getPixel output is collected via a plain macro so the raw pixel side is
+    // compared even when the white fill represents whiteness through the
+    // display LUT. The TIFF output is required as well now that grayscale
+    // display LUTs round-trip through ColorMaps.
     let out = bridge
         .eval_macro(&format!(
             "newImage(\"{title}\", \"{type_arg}\", {width}, {height}, {slices}); \
@@ -19844,8 +19844,9 @@ fn oracle_new_image(
             &seed,
             &format!("newImage(\"{title}\", \"{type_arg}\", {width}, {height}, {slices});"),
         )
-        .ok()
-        .and_then(|run| run.output_image);
+        .unwrap()
+        .output_image
+        .expect("oracle must return saved TIFF");
     let mut image_title = String::new();
     let mut range = (f64::NAN, f64::NAN);
     let mut pixels = Vec::new();
@@ -19902,15 +19903,13 @@ fn assert_new_image_matches_oracle(
         oracle_new_image(bridge, "Probe-1", type_arg, width, height, slices);
     let rust = session_new_image("Probe-1", type_arg, width, height, slices);
     assert_eq!(rust.title, title, "title for {type_arg:?}");
-    if let Some(expected) = expected {
-        assert_eq!(
-            (rust.width, rust.height, rust.slices.len()),
-            (expected.width, expected.height, expected.slices.len()),
-            "geometry for {type_arg:?}"
-        );
-    }
-    // Compare in-memory getPixel values, not the TIFF: the inverted-LUT
-    // 16/32-bit white TIFF is unloadable, and an RGB black stack's
+    assert_eq!(
+        (rust.width, rust.height, rust.slices.len()),
+        (expected.width, expected.height, expected.slices.len()),
+        "geometry for {type_arg:?}"
+    );
+    // Compare in-memory getPixel values rather than relying only on TIFF
+    // round-trips; an RGB black stack's
     // transparent slice-2+ zeros round-trip through the TIFF writer as
     // opaque black in Java too.
     let rust_values: Vec<f64> = rust
@@ -19950,6 +19949,54 @@ fn parity_new_image_deterministic_fills_match_java_oracle() {
         "RGB ramp",
     ] {
         assert_new_image_matches_oracle(&bridge, type_arg, 7, 5, 1);
+    }
+}
+
+#[test]
+fn parity_new_image_white_lut_state_matches_java_oracle() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    for (type_arg, inverted) in [
+        ("8-bit white", false),
+        ("16-bit white", true),
+        ("32-bit white", true),
+    ] {
+        let oracle = bridge
+            .eval_macro(&format!(
+                "newImage(\"Probe-White\", \"{type_arg}\", 4, 3, 3);                  print(\"STATE=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,255\"));                  setSlice(2);                  print(\"SLICE2=\"+call(\"tools.oracle.UiProbe.lutState\",\"0,255\"));"
+            ))
+            .unwrap();
+        for prefix in ["STATE=", "SLICE2="] {
+            let state = lut_probe_line(&oracle.stdout, prefix);
+            assert!(
+                state.contains(&format!("inv={inverted}")),
+                "{type_arg} {prefix}: {state}"
+            );
+        }
+
+        let rust = session_new_image("Probe-White", type_arg, 4, 3, 3);
+        assert_eq!(
+            rust.current_lut_is_inverted(),
+            inverted,
+            "{type_arg} Rust inversion state"
+        );
+        if inverted {
+            assert_eq!(
+                rust.display_lut,
+                Some(Lut256::default().inverted()),
+                "{type_arg} Rust display LUT"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("white.tif");
+            save_tiff(&path, &rust).unwrap();
+            let reloaded = load_tiff(&path).unwrap();
+            assert_eq!(
+                reloaded.display_lut,
+                Some(Lut256::default().inverted()),
+                "{type_arg} white TIFF display LUT roundtrip"
+            );
+        } else {
+            assert_eq!(rust.display_lut, None, "{type_arg} must use the default LUT");
+        }
     }
 }
 
@@ -19996,14 +20043,11 @@ fn parity_new_image_noise_distribution_matches_java_oracle() {
     for (type_arg, mean_tolerance, std_tolerance) in
         [("8-bit noise", 2.0, 2.0), ("16-bit noise", 200.0, 300.0), ("32-bit noise", 0.05, 0.05)]
     {
-        let (expected, oracle_pixels, dmin, dmax, _) =
+        let (expected, _oracle_pixels, dmin, dmax, _) =
             oracle_new_image(&bridge, "N", type_arg, 200, 200, 1);
         let rust = session_new_image("N", type_arg, 200, 200, 1);
         let (rmean, rstd) = plane_mean_std(&rust.slices[0]);
-        let oracle_values: Vec<f64> = match &expected {
-            Some(doc) => plane_f64_values(&doc.slices[0]),
-            None => oracle_pixels,
-        };
+        let oracle_values: Vec<f64> = plane_f64_values(&expected.slices[0]);
         let (emean, estd) = f64_mean_std(&oracle_values);
         assert!(
             (rmean - emean).abs() <= mean_tolerance,

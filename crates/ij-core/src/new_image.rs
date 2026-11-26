@@ -4,7 +4,7 @@
 //! and the fill defaults chosen in `IJ.createImage`
 //! (original_imagej/ij/IJ.java 2293-2318).
 
-use crate::{CoreError, DisplayRange, ImageDocument, PixelPlane};
+use crate::{CoreError, DisplayRange, ImageDocument, Lut256, PixelPlane};
 
 /// Bit depth choices in `NewImage.types` order (NewImage.java 34).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +100,8 @@ impl ImageDocument {
     /// (leaving RGB slices at `0x00000000`, not `0xff000000`), and Noise
     /// draws fresh noise per slice.
     ///
-    /// The 16/32-bit White fill's `invertLut()` has no representable LUT on
-    /// `Gray16`/`Gray32` planes, so only the pixel (zero) side is modeled.
+    /// The 16/32-bit White fill keeps zero pixels and inverts the shared
+    /// grayscale display LUT, matching `ip.invertLut()` before `createStack`.
     pub fn new_image(
         title: impl Into<String>,
         image_type: NewImageType,
@@ -145,6 +145,11 @@ impl ImageDocument {
             });
         }
         let mut doc = Self::new_stack(title, width, height, planes)?;
+        if matches!(image_type, NewImageType::Gray16 | NewImageType::Gray32)
+            && fill == NewImageFill::White
+        {
+            doc.display_lut = Some(Lut256::default().inverted());
+        }
         match image_type {
             // NewImage.java 304: the 16-bit default display range is always
             // 0..65535, even for noise.
