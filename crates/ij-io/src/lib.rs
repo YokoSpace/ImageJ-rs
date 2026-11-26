@@ -1,5 +1,6 @@
 use ij_core::{
-    CoreError, DisplayRange, ImageDocument, LineRoi, Lut256, PixelPlane, PolygonRoi, RectRoi, Roi,
+    CompositeProjection, CoreError, DisplayRange, ImageDocument, LineRoi, Lut256, PixelPlane,
+    PolygonRoi, RectRoi, Roi,
 };
 use std::fs;
 use std::io::{self, Write};
@@ -713,10 +714,18 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
         .iter()
         .any(|label| label.as_ref().is_some_and(|label| !label.is_empty()));
     let roi = doc.roi.as_ref().map(encode_roi_metadata).transpose()?;
-    if !has_labels && roi.is_none() {
+    let projection = doc.composite_projection.map(|mode| {
+        match mode {
+            CompositeProjection::Sum => "Sum",
+            CompositeProjection::Min => "Min",
+            CompositeProjection::Max => "Max",
+            CompositeProjection::Invert => "Invert",
+        }
+    });
+    if !has_labels && roi.is_none() && projection.is_none() {
         return Ok(None);
     }
-    let types = u32::from(has_labels) + u32::from(roi.is_some());
+    let types = u32::from(has_labels) + u32::from(roi.is_some()) + u32::from(projection.is_some());
     let header_size = 4 + types * 8;
     let mut counts = Vec::new();
     counts.extend_from_slice(&header_size.to_le_bytes());
@@ -729,6 +738,10 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
     if roi.is_some() {
         data.extend_from_slice(&META_ROI.to_le_bytes());
         data.extend_from_slice(&1u32.to_le_bytes());
+    }
+    if projection.is_some() {
+        data.extend_from_slice(&META_PROPERTIES.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
     }
     let mut payload = Vec::new();
     if has_labels {
@@ -750,6 +763,15 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
             .map_err(|_| IoError::TooLarge("ROI metadata exceeds TIFF limits".into()))?;
         counts.extend_from_slice(&byte_len.to_le_bytes());
         payload.extend_from_slice(&roi);
+    }
+    if let Some(projection) = projection {
+        for value in ["CompositeProjection", projection] {
+            let encoded: Vec<u16> = value.encode_utf16().collect();
+            counts.extend_from_slice(&(encoded.len() as u32 * 2).to_le_bytes());
+            for unit in encoded {
+                payload.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
     }
     data.extend_from_slice(&payload);
     Ok(Some((counts, data)))
@@ -792,8 +814,8 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
 ///
 /// Not part of the Rust model and therefore not written: x/y/z origins, time
 /// units/frame interval/fps/loop, y/z units, density calibration (`cf`/
-/// `vunit`), overlays, image properties, and per-channel
-/// composite display ranges/LUTs.
+/// `vunit`), overlays, image properties other than `CompositeProjection`,
+/// and per-channel composite display ranges/LUTs.
 pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoError> {
     let path = path.as_ref();
     let width = doc.width;
@@ -2131,8 +2153,8 @@ fn read_color_map(bytes: &[u8], start: usize, le: bool) -> Result<Box<Lut256>, I
 ///
 /// Metadata that `ImageDocument` cannot represent is rejected instead of being
 /// dropped: custom channel LUTs (`luts`), non-uniform per-channel display
-/// ranges, image Info/plot metadata, overlay/property metadata,
-/// and origin/time/yunit/zunit/density calibration keys. A uniform per-channel
+/// ranges, image Info/plot metadata, overlay metadata, image properties other
+/// than `CompositeProjection`, and origin/time/yunit/zunit/density calibration keys. A uniform per-channel
 /// display range is restored. A single `roi ` record is restored for rectangle,
 /// oval, polygon and line selections with exact integral coordinates; other
 /// ROI types, fractional subpixel coordinates and presentation/position
@@ -2927,6 +2949,26 @@ fn decode_roi_metadata(bytes: &[u8]) -> Result<Roi, IoError> {
     }
 }
 
+fn decode_metadata_utf16(payload: &[u8], le: bool, what: &str) -> Result<String, IoError> {
+    if payload.len() % 2 != 0 {
+        return Err(IoError::Malformed(format!(
+            "ImageJ TIFF {what} has odd UTF-16 byte length"
+        )));
+    }
+    let units: Vec<u16> = payload
+        .chunks_exact(2)
+        .map(|pair| {
+            if le {
+                u16::from_le_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_be_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect();
+    String::from_utf16(&units)
+        .map_err(|_| IoError::Malformed(format!("ImageJ TIFF {what} is invalid UTF-16")))
+}
+
 /// Validates/restores ImageJ's private metadata block. Custom channel LUTs
 /// cannot be represented and are rejected. A uniform per-channel display range
 /// is representable as the document range; differing ranges are not.
@@ -3039,10 +3081,9 @@ fn apply_imagej_metadata(
                 }
                 roi = Some(decode_roi_metadata(&entry.payloads[0])?);
             }
-            // FileSaver writes overlay and image-property records only when
-            // those ImagePlus features are present. ImageDocument has no
-            // overlay/property model, so loading them would silently discard
-            // selectable state.
+            // FileSaver writes overlay records only when that ImagePlus feature
+            // is present. ImageDocument has no overlay model, so loading one
+            // would silently discard selectable state.
             META_OVERLAY => {
                 if entry.payloads.iter().any(|payload| !payload.is_empty()) {
                     return Err(IoError::UnsupportedFormat(
@@ -3051,11 +3092,36 @@ fn apply_imagej_metadata(
                 }
             }
             META_PROPERTIES => {
-                if entry.payloads.iter().any(|payload| !payload.is_empty()) {
-                    return Err(IoError::UnsupportedFormat(
-                        "ImageJ TIFF contains image-property metadata (`prop`) that ImageDocument cannot represent; refusing to drop it".into(),
+                if entry.payloads.iter().all(|payload| payload.is_empty()) {
+                    continue;
+                }
+                if entry.payloads.len() % 2 != 0 {
+                    return Err(IoError::Malformed(
+                        "ImageJ TIFF image-property metadata is not key/value paired".into(),
                     ));
                 }
+                let mut projection = None;
+                for pair in entry.payloads.chunks_exact(2) {
+                    let key = decode_metadata_utf16(&pair[0], le, "image-property key")?;
+                    let value = decode_metadata_utf16(&pair[1], le, "image-property value")?;
+                    if key != "CompositeProjection" || projection.is_some() {
+                        return Err(IoError::UnsupportedFormat(format!(
+                            "ImageJ TIFF contains image-property metadata (`{key}`) that ImageDocument cannot represent; refusing to drop it"
+                        )));
+                    }
+                    projection = Some(match value.as_str() {
+                        "Sum" => CompositeProjection::Sum,
+                        "Min" => CompositeProjection::Min,
+                        "Max" => CompositeProjection::Max,
+                        "Invert" => CompositeProjection::Invert,
+                        _ => {
+                            return Err(IoError::UnsupportedFormat(format!(
+                                "unsupported CompositeProjection value `{value}` in ImageJ TIFF"
+                            )))
+                        }
+                    });
+                }
+                doc.composite_projection = projection;
             }
             other => {
                 return Err(IoError::UnsupportedFormat(format!(

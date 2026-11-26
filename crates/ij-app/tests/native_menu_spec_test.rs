@@ -419,6 +419,27 @@ fn native_action_queue_dispatches_through_the_app() {
 }
 
 #[test]
+fn invert_luts_menu_action_transforms_display_lut_without_dirtying_image() {
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("luts-ramp", 4, 4).unwrap();
+    let dirty_before = app.is_dirty(id);
+    let spec = app.build_native_menu_spec();
+    let entry = action_node(&spec, AppAction::InvertLuts);
+    assert_eq!(entry.label, "Invert LUTs");
+    assert!(entry.enabled);
+
+    app.perform(AppAction::InvertLuts, &egui::Context::default());
+
+    let image = app.session.get_image(id).unwrap();
+    assert!(image.current_lut_is_inverted());
+    assert_eq!(app.is_dirty(id), dirty_before);
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Invert LUTs\");")
+    );
+}
+
+#[test]
 fn invert_lut_menu_action_inverts_display_lut_without_dirtying_image() {
     let mut app = ImageJApp::new();
     let id = app.open_ramp_8bit("lut-ramp", 4, 4).unwrap();

@@ -46,6 +46,8 @@ pub enum AppAction {
     Threshold,
     /// `Image > Lookup Tables > Invert LUT` (`ij.plugin.LutLoader("invert")`).
     InvertLut,
+    /// `Image > Color > Invert LUTs` (`ij.jar:InvertAllLuts`).
+    InvertLuts,
     InvertStack,
     /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`).
     ZProject,
@@ -250,6 +252,7 @@ const IMAGE_TYPE: &[MenuNode] = &[
     item("RGB Color", None, AppAction::ConvertToRgb),
 ];
 const IMAGE_LOOKUP_TABLES: &[MenuNode] = &[item("Invert LUT", None, AppAction::InvertLut)];
+const IMAGE_COLOR: &[MenuNode] = &[item("Invert LUTs", None, AppAction::InvertLuts)];
 const IMAGE_TRANSFORM: &[MenuNode] = &[
     item("Rotate... ", None, AppAction::Rotate),
     item("Flip Horizontally", None, AppAction::FlipHorizontal),
@@ -261,6 +264,7 @@ const IMAGE_MENU: &[MenuNode] = &[
     submenu("Adjust", IMAGE_ADJUST),
     submenu("Stacks", IMAGE_STACKS),
     submenu("Type", IMAGE_TYPE),
+    submenu("Color", IMAGE_COLOR),
     submenu("Transform", IMAGE_TRANSFORM),
     submenu("Lookup Tables", IMAGE_LOOKUP_TABLES),
     item("Duplicate...", Some("Shift+D"), AppAction::Duplicate),
@@ -802,6 +806,10 @@ impl ImageJApp {
             }
             InvertLut => match self.session.dispatch(ij_session::Command::InvertLut) {
                 Ok(_) => self.status_message = "Invert LUT".into(),
+                Err(error) => self.status_message = error.to_string(),
+            },
+            InvertLuts => match self.session.dispatch(ij_session::Command::InvertLuts) {
+                Ok(_) => self.status_message = "Invert LUTs".into(),
                 Err(error) => self.status_message = error.to_string(),
             },
             SelectAll => {
