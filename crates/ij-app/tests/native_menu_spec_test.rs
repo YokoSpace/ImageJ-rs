@@ -418,6 +418,31 @@ fn native_action_queue_dispatches_through_the_app() {
     assert_eq!(app.open_window_count(), 1);
 }
 
+#[test]
+fn invert_lut_menu_action_inverts_display_lut_without_dirtying_image() {
+    let mut app = ImageJApp::new();
+    let id = app.open_ramp_8bit("lut-ramp", 4, 4).unwrap();
+    let dirty_before = app.is_dirty(id);
+    let spec = app.build_native_menu_spec();
+    let entry = action_node(&spec, AppAction::InvertLut);
+    assert_eq!(entry.label, "Invert LUT");
+    assert!(entry.enabled);
+
+    app.perform(AppAction::InvertLut, &egui::Context::default());
+
+    let image = app.session.get_image(id).unwrap();
+    assert!(image.current_lut_is_inverted());
+    assert_eq!(
+        app.is_dirty(id),
+        dirty_before,
+        "Invert LUT must not change ImagePlus.changes"
+    );
+    assert_eq!(
+        app.session.macro_recorder.last().map(String::as_str),
+        Some("run(\"Invert LUT\");")
+    );
+}
+
 #[cfg(all(target_os = "macos", debug_assertions))]
 #[test]
 fn native_appkit_menu_and_unsaved_quit_smoke() {

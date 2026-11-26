@@ -232,6 +232,10 @@ pub enum Command {
         max: f64,
     },
     ApplyDisplayLut,
+    /// `Image > Lookup Tables > Invert LUT` (`LutLoader.invertLut`,
+    /// LutLoader.java 162-182). Display-only: pixels and display range are
+    /// unchanged and the command does not set `ImagePlus.changes`.
+    InvertLut,
     MakeRectRoi {
         x: i32,
         y: i32,
@@ -1511,6 +1515,11 @@ impl Session {
                 self.active_doc_mut()?.apply_display_lut()?;
                 self.mark_active_dirty();
                 self.macro_recorder.push("run(\"Apply LUT\");".into());
+                Ok(CommandOutcome::Updated)
+            }
+            Command::InvertLut => {
+                self.active_doc_mut()?.invert_lut()?;
+                self.macro_recorder.push("run(\"Invert LUT\");".into());
                 Ok(CommandOutcome::Updated)
             }
             Command::AutoDisplayRange { min, max } => {

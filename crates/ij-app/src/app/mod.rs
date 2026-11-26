@@ -4,7 +4,7 @@ use crate::dialogs::{
     plugin_row_text, split_plugin_class_spec,
 };
 use crate::image_view::ImageView;
-use crate::pixel_render::plane_to_rgba;
+use crate::pixel_render::plane_to_rgba_with_lut;
 use crate::stack_process::{
     PendingStackProcess, StackOperation, StackProcessChoice, StackProcessOutcome,
 };

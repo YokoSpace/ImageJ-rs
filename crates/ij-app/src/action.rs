@@ -44,6 +44,8 @@ pub enum AppAction {
     RoiManager,
     BrightnessContrast,
     Threshold,
+    /// `Image > Lookup Tables > Invert LUT` (`ij.plugin.LutLoader("invert")`).
+    InvertLut,
     InvertStack,
     /// `Image > Stacks > Z Project...` (`ij.plugin.ZProjector`).
     ZProject,
@@ -247,6 +249,7 @@ const IMAGE_TYPE: &[MenuNode] = &[
     item("32-bit", None, AppAction::ConvertTo32Bit),
     item("RGB Color", None, AppAction::ConvertToRgb),
 ];
+const IMAGE_LOOKUP_TABLES: &[MenuNode] = &[item("Invert LUT", None, AppAction::InvertLut)];
 const IMAGE_TRANSFORM: &[MenuNode] = &[
     item("Rotate... ", None, AppAction::Rotate),
     item("Flip Horizontally", None, AppAction::FlipHorizontal),
@@ -259,6 +262,7 @@ const IMAGE_MENU: &[MenuNode] = &[
     submenu("Stacks", IMAGE_STACKS),
     submenu("Type", IMAGE_TYPE),
     submenu("Transform", IMAGE_TRANSFORM),
+    submenu("Lookup Tables", IMAGE_LOOKUP_TABLES),
     item("Duplicate...", Some("Shift+D"), AppAction::Duplicate),
     item("Crop", Some("Shift+X"), AppAction::Crop),
 ];
@@ -796,6 +800,10 @@ impl ImageJApp {
             ConvertToRgb => {
                 let _ = self.convert_to_rgb_active();
             }
+            InvertLut => match self.session.dispatch(ij_session::Command::InvertLut) {
+                Ok(_) => self.status_message = "Invert LUT".into(),
+                Err(error) => self.status_message = error.to_string(),
+            },
             SelectAll => {
                 let _ = self.select_all();
             }

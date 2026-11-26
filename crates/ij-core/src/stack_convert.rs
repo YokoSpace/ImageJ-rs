@@ -514,7 +514,7 @@ fn to_float(plane: &PixelPlane) -> PixelPlane {
 /// `ImageProcessor.convertToRGB()` (TypeConverter.java 248-255): convert to
 /// the displayed 8-bit image, then read it back through its color model.
 fn to_rgb(plane: &PixelPlane, range: DisplayRange) -> PixelPlane {
-    crate::plane_to_displayed_rgb(plane, range, false)
+    crate::plane_to_displayed_rgb(plane, range, false, None)
 }
 
 /// `ImageProcessor.invert()` for the converted processor

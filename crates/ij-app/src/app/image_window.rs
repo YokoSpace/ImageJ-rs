@@ -582,12 +582,13 @@ impl ImageJApp {
         if needs_upload {
             let rgba = {
                 let doc = self.session.get_image(image_id).unwrap();
-                plane_to_rgba(
+                plane_to_rgba_with_lut(
                     doc.plane(),
                     doc.width,
                     doc.height,
                     doc.display_range,
                     doc.threshold,
+                    doc.current_display_lut(),
                 )
             };
 
@@ -894,7 +895,7 @@ impl ImageJApp {
                 let (x, y) = view.screen_to_pixel(pos.x - img_rect.min.x, pos.y - img_rect.min.y);
                 if tool == Tool::Dropper {
                     let doc = self.session.get_image(image_id).unwrap();
-                    let rgba = plane_to_rgba(doc.plane(), doc.width, doc.height, doc.display_range, doc.threshold);
+                    let rgba = plane_to_rgba_with_lut(doc.plane(), doc.width, doc.height, doc.display_range, doc.threshold, doc.current_display_lut());
                     if x >= 0 && y >= 0 && x < doc.width as i32 && y < doc.height as i32 {
                         let index = (y as usize * doc.width as usize + x as usize) * 4;
                         let color = [rgba[index], rgba[index+1], rgba[index+2]];
