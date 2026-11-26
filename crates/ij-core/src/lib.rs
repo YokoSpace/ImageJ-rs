@@ -2433,6 +2433,32 @@ impl ImageDocument {
                 } else {
                     (planes, labels, 1, count, 1, 1)
                 }
+            } else if self.n_channels > 1
+                && self
+                    .composite_display
+                    .as_ref()
+                    .is_some_and(|composite| composite.mode == CompositeDisplayMode::Composite)
+            {
+                // Duplicator.crop delegates composite-mode images to
+                // run(imp, 1, channels, z, z, t, t): the result keeps every
+                // channel at the current Z/T position, not only the current
+                // channel (Duplicator.java 297-301).
+                let z = self.get_slice() as i32;
+                let t = self.get_frame() as i32;
+                let indices: Vec<usize> = (1..=self.n_channels)
+                    .map(|c| self.get_stack_index(c as i32, z, t) as usize - 1)
+                    .collect();
+                (
+                    indices.iter().map(|index| crop(&self.slices[*index])).collect(),
+                    indices
+                        .iter()
+                        .map(|index| self.slice_labels.get(*index).cloned().unwrap_or(None))
+                        .collect(),
+                    self.n_channels,
+                    1,
+                    1,
+                    self.get_channel(),
+                )
             } else {
                 // Duplicator.crop(imp) uses imp.getProcessor(), i.e. the
                 // current stack slice, and stores no Slice_Label on the new
@@ -2469,7 +2495,18 @@ impl ImageDocument {
         doc.display_range = self.display_range;
         doc.display_lut = self.display_lut.clone();
         doc.composite_projection = self.composite_projection;
-        doc.composite_display = self.composite_display.clone();
+        if let Some(composite) = &self.composite_display {
+            if n_channels == self.n_channels && n_channels > 1 {
+                doc.composite_display = Some(composite.clone());
+            } else if n_channels == 1 && !duplicate_stack {
+                let channel = self.get_channel().min(composite.channels.len() as u32).max(1);
+                if let Some(channel) = composite.channels.get((channel - 1) as usize) {
+                    doc.display_range = channel.display_range;
+                    doc.display_lut = (composite.mode != CompositeDisplayMode::Grayscale)
+                        .then(|| channel.lut.clone());
+                }
+            }
+        }
         doc.roi = relocated_roi;
         doc.threshold = None;
         if current_slice != 1 {
@@ -3142,6 +3179,21 @@ impl ImageDocument {
             PixelPlane::ColorRgb(_) => {
                 return Err(CoreError::InvalidOperation("RGB images do not use LUTs"));
             }
+            _ => {}
+        }
+        if self.composite_display.is_some() {
+            let channel_index = (self.get_channel() - 1) as usize;
+            let composite = self.composite_display.as_mut().unwrap();
+            let Some(channel) = composite.channels.get_mut(channel_index) else {
+                return Err(CoreError::InvalidOperation(
+                    "composite channel LUT state does not match image dimensions",
+                ));
+            };
+            channel.lut = channel.lut.inverted();
+            return Ok(());
+        }
+        match &self.slices[index] {
+            PixelPlane::ColorRgb(_) => unreachable!("RGB rejected above"),
             PixelPlane::Color256 { .. } => {
                 for plane in &mut self.slices {
                     if let PixelPlane::Color256 { lut, .. } = plane {
@@ -3226,6 +3278,13 @@ impl ImageDocument {
     /// grayscale planes fall back to ImageJ's default grayscale LUT, which is
     /// represented by `None` until a command materializes an inversion.
     pub fn current_display_lut(&self) -> Option<&Lut256> {
+        if matches!(self.plane(), PixelPlane::ColorRgb(_)) {
+            return None;
+        }
+        if let Some(composite) = &self.composite_display {
+            let channel = (self.get_channel() - 1) as usize;
+            return composite.channels.get(channel).map(|channel| &channel.lut);
+        }
         match self.plane() {
             PixelPlane::Color256 { lut, .. } => Some(lut),
             PixelPlane::ColorRgb(_) => None,
@@ -3237,14 +3296,8 @@ impl ImageDocument {
 
     /// `ImageProcessor.isInvertedLut` for the current display LUT.
     pub fn current_lut_is_inverted(&self) -> bool {
-        match self.plane() {
-            PixelPlane::Color256 { lut, .. } => lut.is_inverted(),
-            PixelPlane::ColorRgb(_) => false,
-            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => self
-                .display_lut
-                .as_ref()
-                .is_some_and(Lut256::is_inverted),
-        }
+        self.current_display_lut()
+            .is_some_and(Lut256::is_inverted)
     }
 
     /// Inverts the current stack slice, matching `run("Invert", "slice")`.

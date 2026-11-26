@@ -26666,6 +26666,113 @@ fn invert_luts_rejects_rgb_without_pixels_or_recording() {
 }
 
 #[test]
+fn parity_invert_lut_then_invert_luts_updates_composite_channel_state() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("comp","8-bit composite-mode",2,2,2,1,1); Stack.setChannel(2); run("Invert LUT"); run("Invert LUTs"); for(c=1;c<=2;c++){Stack.setChannel(c); getLut(r,g,b); print("C"+c+"="+r[0]+","+g[0]+","+b[0]+";"+r[255]+","+g[255]+","+b[255]+" inv="+is("Inverting LUT"));} print("MODE="+Property.get("CompositeProjection"));"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "C1="), "C1=255,255,255;255,0,0 inv=1");
+    assert_eq!(oracle_line(&oracle.stdout, "C2="), "C2=0,255,0;255,255,255 inv=0");
+    assert_eq!(oracle_line(&oracle.stdout, "MODE="), "MODE=Invert");
+
+    let doc0 = ImageDocument::new_hyperstack(
+        "composite.tif",
+        2,
+        2,
+        vec![PixelPlane::Gray8(vec![0, 1, 2, 3]), PixelPlane::Gray8(vec![4, 5, 6, 7])],
+        2,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut doc = doc0.clone();
+    doc.composite_display = Some(CompositeDisplay::new(
+        2,
+        doc.display_range,
+        CompositeDisplayMode::Composite,
+    ));
+    doc.set_position(2, 1, 1);
+    let mut session = Session::new();
+    let id = session.insert_doc(doc);
+    session.dispatch(Command::InvertLut).unwrap();
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust = session.get_image(id).unwrap();
+    let composite = rust.composite_display.as_ref().unwrap();
+    assert_eq!(composite.channels[0].lut.r[0], 255);
+    assert_eq!(composite.channels[0].lut.g[0], 255);
+    assert_eq!(composite.channels[0].lut.r[255], 255);
+    assert_eq!(composite.channels[0].lut.g[255], 0);
+    assert!(composite.channels[0].lut.is_inverted());
+    assert_eq!(composite.channels[1].lut.r[0], 0);
+    assert_eq!(composite.channels[1].lut.g[0], 255);
+    assert_eq!(composite.channels[1].lut.r[255], 255);
+    assert_eq!(composite.channels[1].lut.g[255], 255);
+    assert!(!composite.channels[1].lut.is_inverted());
+    assert_eq!(rust.composite_projection, Some(CompositeProjection::Invert));
+    assert_eq!(rust.slices, doc0.slices);
+}
+
+fn composite_test_doc(mode: CompositeDisplayMode) -> ImageDocument {
+    let mut doc = ImageDocument::new_hyperstack(
+        "composite-dupe.tif",
+        1,
+        1,
+        vec![
+            PixelPlane::Gray8(vec![10]),
+            PixelPlane::Gray8(vec![20]),
+            PixelPlane::Gray8(vec![30]),
+            PixelPlane::Gray8(vec![40]),
+        ],
+        2,
+        2,
+        1,
+    )
+    .unwrap();
+    doc.composite_display = Some(CompositeDisplay::new(2, doc.display_range, mode));
+    doc.set_position(2, 2, 1);
+    doc
+}
+
+#[test]
+fn duplicate_composite_mode_current_position_keeps_all_channels_for_current_zt() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("comp","8-bit composite-mode",1,1,2,2,1); Stack.setSlice(2); Stack.setChannel(2); run("Duplicate...", " "); getDimensions(w,h,c,z,t); getLut(r,g,b); print("DIM="+c+","+z+","+t+" comp="+is("composite")+" lut="+r[0]+","+g[0]+","+b[0]+";"+r[255]+","+g[255]+","+b[255]);"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "DIM="), "DIM=2,1,1 comp=1 lut=0,0,0;0,255,0");
+    let source = composite_test_doc(CompositeDisplayMode::Composite);
+    let original_composite = source.composite_display.clone().unwrap();
+    let duplicated = source.duplicate("dup.tif".into(), false, None).unwrap();
+    assert_eq!(duplicated.get_dimensions().to_vec(), vec![1, 1, 2, 1, 1]);
+    assert_eq!(duplicated.slices, source.slices[2..4].to_vec());
+    assert_eq!(duplicated.get_channel(), 2);
+    let composite = duplicated.composite_display.as_ref().unwrap();
+    assert_eq!(composite.channels, original_composite.channels);
+}
+
+#[test]
+fn duplicate_color_mode_current_channel_becomes_single_channel_image() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("comp","8-bit color-mode",1,1,2,2,1); Stack.setSlice(2); Stack.setChannel(2); run("Duplicate...", " "); getDimensions(w,h,c,z,t); getLut(r,g,b); print("DIM="+c+","+z+","+t+" comp="+is("composite")+" lut="+r[0]+","+g[0]+","+b[0]+";"+r[255]+","+g[255]+","+b[255]);"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "DIM="), "DIM=1,1,1 comp=0 lut=0,0,0;0,255,0");
+    let source = composite_test_doc(CompositeDisplayMode::Color);
+    let channel_lut = source.composite_display.as_ref().unwrap().channels[1].lut.clone();
+    let duplicated = source.duplicate("dup.tif".into(), false, None).unwrap();
+    assert_eq!(duplicated.get_dimensions().to_vec(), vec![1, 1, 1, 1, 1]);
+    assert_eq!(duplicated.slices, vec![source.slices[3].clone()]);
+    assert_eq!(duplicated.composite_display, None);
+    assert_eq!(duplicated.display_lut, Some(channel_lut));
+}
+
+#[test]
 fn parity_invert_luts_noncomposite_multichannel_reuses_one_processor_lut() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let oracle = bridge
