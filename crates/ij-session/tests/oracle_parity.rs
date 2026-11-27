@@ -26772,6 +26772,128 @@ fn duplicate_color_mode_current_channel_becomes_single_channel_image() {
     assert_eq!(duplicated.display_lut, Some(channel_lut));
 }
 
+fn composite_tiff_probe(path: &std::path::Path, label: &str) -> String {
+    format!(
+        "open(\"{}\"); getDimensions(w,h,c,z,t); print(\"{label}OPEN comp=\"+is(\"composite\")+\" dim=\"+c+\",\"+z+\",\"+t+\" modeprop=\"+Property.get(\"CompositeProjection\")); for(ch=1;ch<=c;ch++){{Stack.setChannel(ch); getLut(r,g,b); getMinAndMax(mn,mx); print(\"{label}C\"+ch+\" lut=\"+r[0]+\",\"+g[0]+\",\"+b[0]+\";\"+r[255]+\",\"+g[255]+\",\"+b[255]+\" inv=\"+is(\"Inverting LUT\")+\" range=\"+mn+\",\"+mx);}}",
+        path.display()
+    )
+}
+
+fn composite_tiff_source(mode: CompositeDisplayMode) -> ImageDocument {
+    let mut doc = ImageDocument::new_hyperstack(
+        "composite-roundtrip.tif",
+        2,
+        2,
+        vec![
+            PixelPlane::Gray8(vec![0, 0, 0, 0]),
+            PixelPlane::Gray8(vec![0, 0, 0, 0]),
+        ],
+        2,
+        1,
+        1,
+    )
+    .unwrap();
+    let mut composite = CompositeDisplay::new(2, doc.display_range, mode);
+    composite.channels[0].display_range = DisplayRange { min: 10.0, max: 200.0 };
+    composite.channels[1].display_range = DisplayRange { min: 20.0, max: 220.0 };
+    doc.display_range = composite.channels[0].display_range;
+    doc.composite_display = Some(composite);
+    doc
+}
+
+fn assert_composite_roundtrip_state(doc: &ImageDocument, projection: Option<CompositeProjection>) {
+    assert_eq!(doc.get_dimensions().to_vec(), vec![2, 2, 2, 1, 1]);
+    assert_eq!(doc.composite_projection, projection);
+    let composite = doc.composite_display.as_ref().unwrap();
+    assert_eq!(composite.mode, CompositeDisplayMode::Composite);
+    assert_eq!(composite.channels.len(), 2);
+    assert_eq!(composite.channels[0].display_range, DisplayRange { min: 10.0, max: 200.0 });
+    assert_eq!(composite.channels[1].display_range, DisplayRange { min: 20.0, max: 220.0 });
+}
+
+#[test]
+fn parity_composite_inverted_channel_luts_tiff_roundtrip_matches_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let java_path = directory.path().join("java-composite.tif");
+    let create_and_probe = format!(
+        "newImage(\"comp\",\"8-bit composite-mode\",2,2,2,1,1); Stack.setChannel(1); setMinAndMax(10,200); Stack.setChannel(2); setMinAndMax(20,220); run(\"Invert LUTs\"); saveAs(\"Tiff\",\"{}\"); close();\n{}",
+        java_path.display(),
+        composite_tiff_probe(&java_path, "JAVA_")
+    );
+    let oracle = bridge.eval_macro(&create_and_probe).unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "JAVA_OPEN"), "JAVA_OPEN comp=1 dim=2,1,1 modeprop=Invert");
+    assert_eq!(oracle_line(&oracle.stdout, "JAVA_C1"), "JAVA_C1 lut=255,255,255;255,0,0 inv=1 range=10,200");
+    assert_eq!(oracle_line(&oracle.stdout, "JAVA_C2"), "JAVA_C2 lut=255,255,255;0,255,0 inv=1 range=20,220");
+
+    let source = composite_tiff_source(CompositeDisplayMode::Composite);
+    let mut session = Session::new();
+    let id = session.insert_doc(source);
+    session.dispatch(Command::InvertLuts).unwrap();
+    let rust_doc = session.get_image(id).unwrap().clone();
+    let rust_path = directory.path().join("rust-composite.tif");
+    save_tiff(&rust_path, &rust_doc).unwrap();
+
+    let java_reopen = bridge.eval_macro(&composite_tiff_probe(&rust_path, "RUSTJAVA_")).unwrap();
+    assert_eq!(oracle_line(&java_reopen.stdout, "RUSTJAVA_OPEN"), "RUSTJAVA_OPEN comp=1 dim=2,1,1 modeprop=Invert");
+    assert_eq!(oracle_line(&java_reopen.stdout, "RUSTJAVA_C1"), "RUSTJAVA_C1 lut=255,255,255;255,0,0 inv=1 range=10,200");
+    assert_eq!(oracle_line(&java_reopen.stdout, "RUSTJAVA_C2"), "RUSTJAVA_C2 lut=255,255,255;0,255,0 inv=1 range=20,220");
+
+    let reopened = load_tiff(&rust_path).unwrap();
+    assert_composite_roundtrip_state(&reopened, Some(CompositeProjection::Invert));
+    let composite = reopened.composite_display.as_ref().unwrap();
+    assert_eq!(composite.channels[0].lut.r[0], 255);
+    assert_eq!(composite.channels[0].lut.g[0], 255);
+    assert_eq!(composite.channels[0].lut.r[255], 255);
+    assert_eq!(composite.channels[0].lut.g[255], 0);
+    assert!(composite.channels[0].lut.is_inverted());
+    assert_eq!(composite.channels[1].lut.r[0], 255);
+    assert_eq!(composite.channels[1].lut.g[0], 255);
+    assert_eq!(composite.channels[1].lut.r[255], 0);
+    assert_eq!(composite.channels[1].lut.g[255], 255);
+    assert!(composite.channels[1].lut.is_inverted());
+}
+
+#[test]
+fn parity_composite_default_luts_and_ranges_tiff_roundtrip_matches_java() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let java_path = directory.path().join("java-default-composite.tif");
+    let create_and_probe = format!(
+        "newImage(\"comp\",\"8-bit composite-mode\",2,2,2,1,1); Stack.setChannel(1); setMinAndMax(10,200); Stack.setChannel(2); setMinAndMax(20,220); saveAs(\"Tiff\",\"{}\"); close();\n{}",
+        java_path.display(),
+        composite_tiff_probe(&java_path, "JAVA_")
+    );
+    let oracle = bridge.eval_macro(&create_and_probe).unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "JAVA_OPEN"), "JAVA_OPEN comp=1 dim=2,1,1 modeprop=");
+    assert_eq!(oracle_line(&oracle.stdout, "JAVA_C1"), "JAVA_C1 lut=0,0,0;255,0,0 inv=0 range=10,200");
+    assert_eq!(oracle_line(&oracle.stdout, "JAVA_C2"), "JAVA_C2 lut=0,0,0;0,255,0 inv=0 range=20,220");
+    let java_bytes = std::fs::read(&java_path).unwrap();
+    assert!(!java_bytes.windows(4).any(|window| window == b"luts"));
+
+    let rust_doc = composite_tiff_source(CompositeDisplayMode::Composite);
+    let rust_path = directory.path().join("rust-default-composite.tif");
+    save_tiff(&rust_path, &rust_doc).unwrap();
+    let rust_bytes = std::fs::read(&rust_path).unwrap();
+    assert!(!rust_bytes.windows(4).any(|window| window == b"luts"));
+
+    let java_reopen = bridge.eval_macro(&composite_tiff_probe(&rust_path, "RUSTJAVA_")).unwrap();
+    assert_eq!(oracle_line(&java_reopen.stdout, "RUSTJAVA_OPEN"), "RUSTJAVA_OPEN comp=1 dim=2,1,1 modeprop=");
+    assert_eq!(oracle_line(&java_reopen.stdout, "RUSTJAVA_C1"), "RUSTJAVA_C1 lut=0,0,0;255,0,0 inv=0 range=10,200");
+    assert_eq!(oracle_line(&java_reopen.stdout, "RUSTJAVA_C2"), "RUSTJAVA_C2 lut=0,0,0;0,255,0 inv=0 range=20,220");
+
+    let reopened = load_tiff(&rust_path).unwrap();
+    assert_composite_roundtrip_state(&reopened, None);
+    let composite = reopened.composite_display.as_ref().unwrap();
+    assert_eq!(composite.channels[0].lut.r[0], 0);
+    assert_eq!(composite.channels[0].lut.r[255], 255);
+    assert_eq!(composite.channels[0].lut.g[255], 0);
+    assert_eq!(composite.channels[1].lut.r[255], 0);
+    assert_eq!(composite.channels[1].lut.g[255], 255);
+    assert!(!composite.channels[0].lut.is_inverted());
+    assert!(!composite.channels[1].lut.is_inverted());
+}
+
 #[test]
 fn duplicate_color_mode_after_display_range_change_preserves_channel_range() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();

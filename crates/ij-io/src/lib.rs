@@ -722,10 +722,26 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
             CompositeProjection::Invert => "Invert",
         }
     });
-    if !has_labels && roi.is_none() && projection.is_none() {
+    let composite = doc.composite_display.as_ref();
+    if let Some(composite) = composite {
+        if composite.channels.len() != doc.n_channels as usize {
+            return Err(IoError::UnsupportedFormat(
+                "composite channel LUT count differs from the image channel count".into(),
+            ));
+        }
+    }
+    let write_ranges = composite.is_some();
+    let write_luts = composite.is_some_and(|composite| {
+        composite.custom_luts && composite.mode != ij_core::CompositeDisplayMode::Grayscale
+    });
+    if !has_labels && !write_ranges && !write_luts && roi.is_none() && projection.is_none() {
         return Ok(None);
     }
-    let types = u32::from(has_labels) + u32::from(roi.is_some()) + u32::from(projection.is_some());
+    let types = u32::from(has_labels)
+        + u32::from(write_ranges)
+        + u32::from(write_luts)
+        + u32::from(roi.is_some())
+        + u32::from(projection.is_some());
     let header_size = 4 + types * 8;
     let mut counts = Vec::new();
     counts.extend_from_slice(&header_size.to_le_bytes());
@@ -734,6 +750,14 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
     if has_labels {
         data.extend_from_slice(&META_LABELS.to_le_bytes());
         data.extend_from_slice(&(doc.slice_labels.len() as u32).to_le_bytes());
+    }
+    if write_ranges {
+        data.extend_from_slice(&META_RANGES.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+    }
+    if write_luts {
+        data.extend_from_slice(&META_LUTS.to_le_bytes());
+        data.extend_from_slice(&(doc.n_channels.to_le_bytes()));
     }
     if roi.is_some() {
         data.extend_from_slice(&META_ROI.to_le_bytes());
@@ -755,6 +779,24 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
             counts.extend_from_slice(&byte_len.to_le_bytes());
             for unit in encoded {
                 payload.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+    }
+    if let Some(composite) = composite {
+        let byte_len = u32::try_from(composite.channels.len() * 16)
+            .map_err(|_| IoError::TooLarge("composite display ranges exceed TIFF limits".into()))?;
+        counts.extend_from_slice(&byte_len.to_le_bytes());
+        for channel in &composite.channels {
+            payload.extend_from_slice(&channel.display_range.min.to_le_bytes());
+            payload.extend_from_slice(&channel.display_range.max.to_le_bytes());
+        }
+        if write_luts {
+            for channel in &composite.channels {
+                validate_lut(&channel.lut)?;
+                counts.extend_from_slice(&768u32.to_le_bytes());
+                payload.extend_from_slice(&channel.lut.r);
+                payload.extend_from_slice(&channel.lut.g);
+                payload.extend_from_slice(&channel.lut.b);
             }
         }
     }
@@ -800,6 +842,11 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
 ///   block (FileSaver.java 117, TiffEncoder.writeMetaData 371-472) for
 ///   rectangular, oval, polygon and line selections.
 /// - `slice_labels`: written as ImageJ's UTF-16 `labl` metadata.
+/// - composite display `mode`: written as `mode=` in the ImageDescription.
+/// - composite per-channel display ranges: always written as `rang` metadata.
+/// - composite per-channel LUTs: written as `luts` metadata when
+///   `CompositeDisplay.custom_luts` is set outside grayscale mode
+///   (CompositeImage.hasCustomLuts, CompositeImage.java 728-730).
 ///
 /// Unsupported non-default state is rejected instead of dropped silently:
 ///
@@ -814,8 +861,7 @@ fn encode_document_metadata(doc: &ImageDocument) -> Result<Option<(Vec<u8>, Vec<
 ///
 /// Not part of the Rust model and therefore not written: x/y/z origins, time
 /// units/frame interval/fps/loop, y/z units, density calibration (`cf`/
-/// `vunit`), overlays, image properties other than `CompositeProjection`,
-/// and per-channel composite display ranges/LUTs.
+/// `vunit`), overlays, and image properties other than `CompositeProjection`.
 pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoError> {
     let path = path.as_ref();
     let width = doc.width;
@@ -824,16 +870,37 @@ pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoEr
         return Err(IoError::UnsupportedFormat("empty image stack".into()));
     }
     if doc.composite_display.is_some() {
-        return Err(IoError::UnsupportedFormat(
-            "composite channel LUT metadata is not yet serializable; refusing to drop it".into(),
-        ));
+        if doc.n_channels <= 1 {
+            return Err(IoError::UnsupportedFormat(
+                "single-channel composite LUT state is not restored by ImageJ TIFF open".into(),
+            ));
+        }
+        if matches!(doc.plane(), PixelPlane::ColorRgb(_)) {
+            return Err(IoError::UnsupportedFormat(
+                "RGB images cannot be composite images in ImageJ".into(),
+            ));
+        }
     }
 
     let display_lut = match doc.plane() {
-        PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => doc
-            .display_lut
-            .as_ref()
-            .filter(|lut| !lut.is_default()),
+        PixelPlane::Gray8(_) => {
+            let grayscale_composite = doc
+                .composite_display
+                .as_ref()
+                .is_some_and(|composite| composite.mode == ij_core::CompositeDisplayMode::Grayscale);
+            if grayscale_composite {
+                None
+            } else {
+                doc.current_display_lut().filter(|lut| !lut.is_default())
+            }
+        }
+        PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
+            if doc.composite_display.is_some() {
+                None
+            } else {
+                doc.display_lut.as_ref().filter(|lut| !lut.is_default())
+            }
+        }
         PixelPlane::Color256 { .. } | PixelPlane::ColorRgb(_) => None,
     };
     let infos: Vec<PlaneEncodingInfo> = doc
@@ -1462,6 +1529,15 @@ fn image_description(doc: &ImageDocument) -> Result<Option<String>, IoError> {
     }
     if doc.is_hyperstack() {
         sb.push_str("hyperstack=true\n");
+        has_metadata = true;
+    }
+    if let Some(composite) = &doc.composite_display {
+        let mode = match composite.mode {
+            ij_core::CompositeDisplayMode::Composite => "composite",
+            ij_core::CompositeDisplayMode::Color => "color",
+            ij_core::CompositeDisplayMode::Grayscale => "grayscale",
+        };
+        sb.push_str(&format!("mode={mode}\n"));
         has_metadata = true;
     }
 
@@ -2156,16 +2232,21 @@ fn read_color_map(bytes: &[u8], start: usize, le: bool) -> Result<Box<Lut256>, I
 /// and a LUT that ImageJ would apply to a 16-bit (with description) or 32-bit
 /// display is restored as the document-level display LUT.
 ///
+/// Composite `mode=` metadata reopens a multi-channel non-RGB stack as
+/// `CompositeDisplay`, as do `hyperstack=true` multi-channel files without an
+/// explicit mode (Opener.makeComposite, Opener.java 1101-1117). Their `rang`
+/// and `luts` private metadata restore per-channel display ranges and LUTs.
+///
 /// Metadata that `ImageDocument` cannot represent is rejected instead of being
-/// dropped: custom channel LUTs (`luts`), non-uniform per-channel display
-/// ranges, image Info/plot metadata, overlay metadata, image properties other
-/// than `CompositeProjection`, and origin/time/yunit/zunit/density calibration keys. A uniform per-channel
-/// display range is restored. A single `roi ` record is restored for rectangle,
-/// oval, polygon and line selections with exact integral coordinates; other
-/// ROI types, fractional subpixel coordinates and presentation/position
-/// metadata are rejected explicitly. The composite `mode=` flag is not
-/// modelled. A TIFF without stored min/max for GRAY16/GRAY32 opens with
-/// ImageJ's image-derived range rather than the constructor default.
+/// dropped: image Info/plot metadata, overlay metadata, image properties other
+/// than `CompositeProjection`, and origin/time/yunit/zunit/density calibration keys.
+/// Non-composite per-channel LUT or differing range metadata is also rejected.
+/// A uniform non-composite per-channel display range is restored. A single
+/// `roi ` record is restored for rectangle, oval, polygon and line selections
+/// with exact integral coordinates; other ROI types, fractional subpixel
+/// coordinates and presentation/position metadata are rejected explicitly. A
+/// TIFF without stored min/max for GRAY16/GRAY32 opens with ImageJ's
+/// image-derived range rather than the constructor default.
 pub fn load_tiff(path: impl AsRef<Path>) -> Result<ImageDocument, IoError> {
     let path = path.as_ref();
     if !fs::metadata(path)?.is_file() {
@@ -2525,6 +2606,29 @@ fn apply_metadata(
         // processor's min equals its max, including a stored equal range such
         // as min=5/max=5 (FileOpener.java 300-332).
         doc.display_range = stack_display_range(doc);
+    }
+    if let Some(props) = props {
+        let mode_value = props.get("mode").map(String::as_str);
+        let open_as_hyperstack = props.get("hyperstack").is_some_and(|value| value == "true");
+        // Opener.makeComposite uses either hyperstack=true or a mode= line as
+        // the signal that a multi-channel non-RGB stack reopens as CompositeImage.
+        if (mode_value.is_some() || open_as_hyperstack)
+            && doc.n_channels > 1
+            && !matches!(doc.slices[0], PixelPlane::ColorRgb(_))
+        {
+            let mode = if mode_value.is_some_and(|value| value.starts_with("composite")) {
+                ij_core::CompositeDisplayMode::Composite
+            } else if mode_value.is_some_and(|value| value.starts_with("gray")) {
+                ij_core::CompositeDisplayMode::Grayscale
+            } else {
+                ij_core::CompositeDisplayMode::Color
+            };
+            doc.composite_display = Some(ij_core::CompositeDisplay::new(
+                doc.n_channels,
+                doc.display_range,
+                mode,
+            ));
+        }
     }
     Ok(())
 }
@@ -2974,9 +3078,9 @@ fn decode_metadata_utf16(payload: &[u8], le: bool, what: &str) -> Result<String,
         .map_err(|_| IoError::Malformed(format!("ImageJ TIFF {what} is invalid UTF-16")))
 }
 
-/// Validates/restores ImageJ's private metadata block. Custom channel LUTs
-/// cannot be represented and are rejected. A uniform per-channel display range
-/// is representable as the document range; differing ranges are not.
+/// Validates/restores ImageJ's private metadata block. Composite channel LUTs
+/// and differing per-channel ranges are restored when the description already
+/// created a composite document; outside composite mode they remain rejected.
 fn apply_imagej_metadata(
     doc: &mut ImageDocument,
     entries: &[ImageJMetadata],
@@ -2988,9 +3092,29 @@ fn apply_imagej_metadata(
     for entry in entries {
         match entry.kind {
             META_LUTS => {
-                if entry.payloads.iter().any(|payload| !payload.is_empty()) {
+                if let Some(composite) = &mut doc.composite_display {
+                    let channel_count = composite.channels.len();
+                    let mut saw_channel_lut = false;
+                    for (index, payload) in entry.payloads.iter().take(channel_count).enumerate() {
+                        saw_channel_lut = true;
+                        // CompositeImage.createLutFromBytes falls back to the
+                        // white color LUT for any payload that is not 768 bytes.
+                        composite.channels[index].lut = if payload.len() == 768 {
+                            Lut256 {
+                                r: payload[..256].to_vec(),
+                                g: payload[256..512].to_vec(),
+                                b: payload[512..768].to_vec(),
+                            }
+                        } else {
+                            Lut256::default()
+                        };
+                    }
+                    if saw_channel_lut {
+                        composite.custom_luts = true;
+                    }
+                } else if entry.payloads.iter().any(|payload| !payload.is_empty()) {
                     return Err(IoError::UnsupportedFormat(
-                        "ImageJ TIFF contains custom channel LUT metadata (`luts`) that cannot be represented; refusing to drop it".into(),
+                        "ImageJ TIFF contains custom channel LUT metadata (`luts`) without composite mode metadata; refusing to drop it".into(),
                     ));
                 }
             }
@@ -3006,23 +3130,43 @@ fn apply_imagej_metadata(
                         "ImageJ display-range metadata is not a list of min/max pairs".into(),
                     ));
                 }
-                let mut range: Option<(f64, f64)> = None;
-                for pair in payload.chunks_exact(16) {
-                    let min = read_metadata_f64(pair, le)?;
-                    let max = read_metadata_f64(&pair[8..], le)?;
-                    match range {
-                        None => range = Some((min, max)),
-                        Some((first_min, first_max))
-                            if first_min == min && first_max == max => {}
-                        Some(_) => {
-                            return Err(IoError::UnsupportedFormat(
-                                "ImageJ TIFF has different per-channel display ranges that ImageDocument cannot represent".into(),
-                            ))
+                let ranges: Vec<DisplayRange> = payload
+                    .chunks_exact(16)
+                    .map(|pair| {
+                        Ok(DisplayRange {
+                            min: read_metadata_f64(pair, le)?,
+                            max: read_metadata_f64(&pair[8..], le)?,
+                        })
+                    })
+                    .collect::<Result<_, IoError>>()?;
+                if let Some(composite) = &mut doc.composite_display {
+                    // CompositeImage.setupLuts discards the complete range array
+                    // when its length does not match the channel count.
+                    if ranges.len() == composite.channels.len() {
+                        for (channel, range) in composite.channels.iter_mut().zip(&ranges) {
+                            channel.display_range = *range;
+                        }
+                        if let Some(range) = ranges.first().copied() {
+                            doc.display_range = range;
                         }
                     }
-                }
-                if let Some((min, max)) = range {
-                    uniform_range = Some(DisplayRange { min, max });
+                } else {
+                    let mut range: Option<(f64, f64)> = None;
+                    for DisplayRange { min, max } in ranges {
+                        match range {
+                            None => range = Some((min, max)),
+                            Some((first_min, first_max))
+                                if first_min == min && first_max == max => {}
+                            Some(_) => {
+                                return Err(IoError::UnsupportedFormat(
+                                    "ImageJ TIFF has different per-channel display ranges without composite mode metadata".into(),
+                                ))
+                            }
+                        }
+                    }
+                    if let Some((min, max)) = range {
+                        uniform_range = Some(DisplayRange { min, max });
+                    }
                 }
             }
             META_LABELS => {
@@ -4773,7 +4917,7 @@ mod tests {
     }
 
     #[test]
-    fn tiff_save_rejects_composite_lut_state_without_replacing_existing_file() {
+    fn tiff_composite_channel_luts_and_ranges_roundtrip() {
         let mut doc = ImageDocument::new_hyperstack(
             "composite.tif",
             2,
@@ -4787,8 +4931,46 @@ mod tests {
             1,
         )
         .unwrap();
-        doc.composite_display = Some(CompositeDisplay::new(
+        let mut composite = CompositeDisplay::new(
             2,
+            doc.display_range,
+            CompositeDisplayMode::Composite,
+        );
+        composite.channels[0].display_range = DisplayRange { min: 10.0, max: 200.0 };
+        composite.channels[1].display_range = DisplayRange { min: 20.0, max: 220.0 };
+        composite.channels[0].lut = composite.channels[0].lut.inverted();
+        composite.channels[1].lut = composite.channels[1].lut.inverted();
+        composite.custom_luts = true;
+        doc.display_range = composite.channels[0].display_range;
+        let expected_luts: Vec<Lut256> = composite.channels.iter().map(|channel| channel.lut.clone()).collect();
+        doc.composite_display = Some(composite);
+
+        let path = tmp_tiff("composite_roundtrip");
+        save_tiff(&path, &doc).unwrap();
+        let loaded = load_tiff(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        let composite = loaded.composite_display.as_ref().unwrap();
+        assert_eq!(composite.mode, CompositeDisplayMode::Composite);
+        assert!(composite.custom_luts);
+        assert_eq!(composite.channels[0].display_range, DisplayRange { min: 10.0, max: 200.0 });
+        assert_eq!(composite.channels[1].display_range, DisplayRange { min: 20.0, max: 220.0 });
+        assert_eq!(composite.channels[0].lut, expected_luts[0]);
+        assert_eq!(composite.channels[1].lut, expected_luts[1]);
+        assert_eq!(loaded.display_range, DisplayRange { min: 10.0, max: 200.0 });
+    }
+
+    #[test]
+    fn tiff_save_rejects_single_channel_composite_without_replacing_existing_file() {
+        let mut doc = ImageDocument::new(
+            "composite.tif",
+            2,
+            2,
+            PixelPlane::Gray8(vec![0, 1, 2, 3]),
+        )
+        .unwrap();
+        doc.composite_display = Some(CompositeDisplay::new(
+            1,
             doc.display_range,
             CompositeDisplayMode::Composite,
         ));
@@ -4796,7 +4978,7 @@ mod tests {
         fs::write(&path, b"existing").unwrap();
         let error = save_tiff(&path, &doc).unwrap_err();
         assert!(
-            error.to_string().contains("composite channel LUT"),
+            error.to_string().contains("single-channel composite"),
             "unexpected error: {error}"
         );
         assert_eq!(fs::read(&path).unwrap(), b"existing");
