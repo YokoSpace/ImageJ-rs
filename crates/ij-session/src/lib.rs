@@ -1495,7 +1495,7 @@ impl Session {
                     let doc = self.active_doc_mut()?;
                     let range = DisplayRange { min, max };
                     let changed = preview_original.unwrap_or(doc.display_range) != range;
-                    doc.display_range = range;
+                    doc.set_display_range(range);
                     changed
                 };
                 if changed {
@@ -1509,7 +1509,7 @@ impl Session {
                 let id = self.active_image.ok_or(SessionError::NoActiveImage)?;
                 let original = self.images.get(&id).ok_or(SessionError::NoActiveImage)?.display_range;
                 self.preview_display_ranges.entry(id).or_insert(original);
-                self.active_doc_mut()?.display_range = DisplayRange { min, max };
+                self.active_doc_mut()?.set_display_range(DisplayRange { min, max });
                 Ok(CommandOutcome::Updated)
             }
             Command::ApplyDisplayLut => {
@@ -1538,7 +1538,7 @@ impl Session {
                     let doc = self.active_doc_mut()?;
                     let range = DisplayRange { min, max };
                     let changed = preview_original.unwrap_or(doc.display_range) != range;
-                    doc.display_range = range;
+                    doc.set_display_range(range);
                     changed
                 };
                 if changed {
@@ -1554,7 +1554,7 @@ impl Session {
                     let doc = self.active_doc_mut()?;
                     let range = DisplayRange { min, max };
                     let changed = preview_original.unwrap_or(doc.display_range) != range;
-                    doc.display_range = range;
+                    doc.set_display_range(range);
                     changed
                 };
                 if changed {

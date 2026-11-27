@@ -26773,6 +26773,57 @@ fn duplicate_color_mode_current_channel_becomes_single_channel_image() {
 }
 
 #[test]
+fn duplicate_color_mode_after_display_range_change_preserves_channel_range() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("comp","8-bit color-mode",1,1,2,2,1); Stack.setSlice(2); Stack.setChannel(2); setMinAndMax(10,100); run("Duplicate...", " "); getMinAndMax(mn,mx); print("RANGE="+mn+","+mx);"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "RANGE="), "RANGE=10,100");
+
+    let source = composite_test_doc(CompositeDisplayMode::Color);
+    let mut session = Session::new();
+    session.insert_doc(source.clone());
+    session.dispatch(Command::SetDisplayRange { min: 10.0, max: 100.0 }).unwrap();
+    let updated = session.active_doc().unwrap();
+    assert_eq!(updated.composite_display.as_ref().unwrap().channels[1].display_range, DisplayRange { min: 10.0, max: 100.0 });
+    let duplicated = updated.duplicate("dup.tif".into(), false, None).unwrap();
+    assert_eq!(duplicated.display_range, DisplayRange { min: 10.0, max: 100.0 });
+    assert_eq!(duplicated.slices, vec![source.slices[3].clone()]);
+}
+
+#[test]
+fn composite_mode_above_eight_channels_becomes_color_and_duplicate_is_single_channel() {
+    let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
+    let oracle = bridge
+        .eval_macro(
+            r#"newImage("comp","8-bit composite-mode",1,1,9,1,1); Stack.setChannel(9); run("Duplicate...", " "); getDimensions(w,h,c,z,t); print("DIM="+c+","+z+","+t);"#,
+        )
+        .unwrap();
+    assert_eq!(oracle_line(&oracle.stdout, "DIM="), "DIM=1,1,1");
+
+    let display = CompositeDisplay::new(9, DisplayRange { min: 0.0, max: 255.0 }, CompositeDisplayMode::Composite);
+    assert_eq!(display.mode, CompositeDisplayMode::Color);
+    let mut doc = ImageDocument::new_hyperstack(
+        "nine.tif",
+        1,
+        1,
+        (0..9).map(|i| PixelPlane::Gray8(vec![i])).collect(),
+        9,
+        1,
+        1,
+    )
+    .unwrap();
+    doc.composite_display = Some(display);
+    doc.set_position(9, 1, 1);
+    let duplicated = doc.duplicate("dup.tif".into(), false, None).unwrap();
+    assert_eq!(duplicated.get_dimensions().to_vec(), vec![1, 1, 1, 1, 1]);
+    assert_eq!(duplicated.slices, vec![doc.slices[8].clone()]);
+    assert_eq!(duplicated.composite_display, None);
+}
+
+#[test]
 fn parity_invert_luts_noncomposite_multichannel_reuses_one_processor_lut() {
     let bridge = JavaOracleBridge::locate_from_repo_root(repo_root()).unwrap();
     let oracle = bridge
