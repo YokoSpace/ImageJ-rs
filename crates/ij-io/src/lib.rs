@@ -823,6 +823,11 @@ pub fn save_tiff(path: impl AsRef<Path>, doc: &ImageDocument) -> Result<(), IoEr
     if doc.slices.is_empty() {
         return Err(IoError::UnsupportedFormat("empty image stack".into()));
     }
+    if doc.composite_display.is_some() {
+        return Err(IoError::UnsupportedFormat(
+            "composite channel LUT metadata is not yet serializable; refusing to drop it".into(),
+        ));
+    }
 
     let display_lut = match doc.plane() {
         PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => doc
@@ -3415,6 +3420,7 @@ fn read_tag_u32_vec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ij_core::{CompositeDisplay, CompositeDisplayMode};
     use std::cell::RefCell;
     use std::env;
 
@@ -4764,6 +4770,37 @@ mod tests {
                 y2: -4,
             }),
         );
+    }
+
+    #[test]
+    fn tiff_save_rejects_composite_lut_state_without_replacing_existing_file() {
+        let mut doc = ImageDocument::new_hyperstack(
+            "composite.tif",
+            2,
+            2,
+            vec![
+                PixelPlane::Gray8(vec![0, 1, 2, 3]),
+                PixelPlane::Gray8(vec![4, 5, 6, 7]),
+            ],
+            2,
+            1,
+            1,
+        )
+        .unwrap();
+        doc.composite_display = Some(CompositeDisplay::new(
+            2,
+            doc.display_range,
+            CompositeDisplayMode::Composite,
+        ));
+        let path = tmp_tiff("composite_unsaved");
+        fs::write(&path, b"existing").unwrap();
+        let error = save_tiff(&path, &doc).unwrap_err();
+        assert!(
+            error.to_string().contains("composite channel LUT"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"existing");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -149,6 +149,69 @@ pub enum CompositeProjection {
     Invert,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompositeDisplayMode {
+    Composite,
+    Color,
+    Grayscale,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompositeChannelDisplay {
+    pub lut: Lut256,
+    pub display_range: DisplayRange,
+}
+
+/// CompositeImage's per-channel LUT array. Presence of this value means the
+/// image is composite; ordinary multi-channel ImagePlus values keep using the
+/// shared processor LUT and have `None` here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompositeDisplay {
+    pub mode: CompositeDisplayMode,
+    pub channels: Vec<CompositeChannelDisplay>,
+}
+
+impl CompositeDisplay {
+    /// Default channel LUTs installed by `CompositeImage.setupLuts`: red,
+    /// green, blue, white, cyan, magenta, yellow, then white beyond 7 channels.
+    pub fn new(
+        channel_count: u32,
+        display_range: DisplayRange,
+        mode: CompositeDisplayMode,
+    ) -> Self {
+        const COLORS: [(u8, u8, u8); 8] = [
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 255),
+            (0, 255, 255),
+            (255, 0, 255),
+            (255, 255, 0),
+            (255, 255, 255),
+        ];
+        let channels = (0..channel_count)
+            .map(|index| {
+                let (red, green, blue) = COLORS[index.min(7) as usize];
+                let lut = Lut256 {
+                    r: (0..=255u32).map(|i| (i * u32::from(red) / 255) as u8).collect(),
+                    g: (0..=255u32).map(|i| (i * u32::from(green) / 255) as u8).collect(),
+                    b: (0..=255u32).map(|i| (i * u32::from(blue) / 255) as u8).collect(),
+                };
+                CompositeChannelDisplay { lut, display_range }
+            })
+            .collect();
+        // CompositeImage corrects an impossible composite-mode request to
+        // color mode when there are more than MAX_CHANNELS=8 channels
+        // (CompositeImage.java 66-67).
+        let mode = if mode == CompositeDisplayMode::Composite && channel_count > 8 {
+            CompositeDisplayMode::Color
+        } else {
+            mode
+        };
+        Self { mode, channels }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lut256 {
     pub r: Vec<u8>,
@@ -1601,6 +1664,10 @@ pub struct ImageDocument {
     /// property observed before `InvertAllLuts` first runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composite_projection: Option<CompositeProjection>,
+    /// Per-channel LUT state when this is a CompositeImage. `None` means an
+    /// ordinary ImagePlus, including ordinary non-composite hyperstacks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite_display: Option<CompositeDisplay>,
     pub calibration: Calibration,
     pub roi: Option<Roi>,
     /// Active threshold levels (`ImageProcessor.NO_THRESHOLD` is modelled as
@@ -1678,6 +1745,7 @@ impl ImageDocument {
             display_range,
             display_lut: None,
             composite_projection: None,
+            composite_display: None,
             calibration: Calibration::default(),
             roi: None,
             threshold: None,
@@ -1975,6 +2043,28 @@ impl ImageDocument {
     /// 1850-1875): negatives become zero, zero keeps the current coordinate,
     /// and values above the dimension are clamped. Like ImageJ, changing the
     /// displayed stack index discards the processor snapshot used by Undo.
+    /// CompositeImage.setDisplayRange writes both the current processor range
+    /// and the current channel LUT range (CompositeImage.java 678-686).
+    pub fn set_display_range(&mut self, range: DisplayRange) {
+        self.display_range = range;
+        let current = self.get_channel();
+        if let Some(composite) = &mut self.composite_display {
+            let channel = current.min(composite.channels.len() as u32).max(1);
+            if let Some(channel) = composite.channels.get_mut((channel - 1) as usize) {
+                channel.display_range = range;
+            }
+        }
+    }
+
+    fn sync_composite_display_range(&mut self) {
+        if let Some(composite) = &self.composite_display {
+            let channel = self.get_channel().min(composite.channels.len() as u32).max(1);
+            if let Some(channel) = composite.channels.get((channel - 1) as usize) {
+                self.display_range = channel.display_range;
+            }
+        }
+    }
+
     pub fn set_position(&mut self, channel: i32, slice: i32, frame: i32) {
         self.verify_dimensions();
         let mut c = channel.max(0) as u32;
@@ -2002,6 +2092,7 @@ impl ImageDocument {
             self.snapshot = None;
             self.snapshot_display_range = None;
         }
+        self.sync_composite_display_range();
     }
 
     /// ImagePlus.setPosition(int n) (original_imagej/ij/ImagePlus.java lines
@@ -2027,6 +2118,7 @@ impl ImageDocument {
             return Ok(());
         }
         self.set_current_slice(index as u32);
+        self.sync_composite_display_range();
         // ImagePlus.setSlice calls ip.setSnapshotPixels(null) when it switches
         // processors, so Undo no longer has a snapshot (ImagePlus.java
         // 1997-1999).
@@ -2373,6 +2465,32 @@ impl ImageDocument {
                 } else {
                     (planes, labels, 1, count, 1, 1)
                 }
+            } else if self.n_channels > 1
+                && self
+                    .composite_display
+                    .as_ref()
+                    .is_some_and(|composite| composite.mode == CompositeDisplayMode::Composite)
+            {
+                // Duplicator.crop delegates composite-mode images to
+                // run(imp, 1, channels, z, z, t, t): the result keeps every
+                // channel at the current Z/T position, not only the current
+                // channel (Duplicator.java 297-301).
+                let z = self.get_slice() as i32;
+                let t = self.get_frame() as i32;
+                let indices: Vec<usize> = (1..=self.n_channels)
+                    .map(|c| self.get_stack_index(c as i32, z, t) as usize - 1)
+                    .collect();
+                (
+                    indices.iter().map(|index| crop(&self.slices[*index])).collect(),
+                    indices
+                        .iter()
+                        .map(|index| self.slice_labels.get(*index).cloned().unwrap_or(None))
+                        .collect(),
+                    self.n_channels,
+                    1,
+                    1,
+                    self.get_channel(),
+                )
             } else {
                 // Duplicator.crop(imp) uses imp.getProcessor(), i.e. the
                 // current stack slice, and stores no Slice_Label on the new
@@ -2409,6 +2527,18 @@ impl ImageDocument {
         doc.display_range = self.display_range;
         doc.display_lut = self.display_lut.clone();
         doc.composite_projection = self.composite_projection;
+        if let Some(composite) = &self.composite_display {
+            if n_channels == self.n_channels && n_channels > 1 {
+                doc.composite_display = Some(composite.clone());
+            } else if n_channels == 1 && !duplicate_stack {
+                let channel = self.get_channel().min(composite.channels.len() as u32).max(1);
+                if let Some(channel) = composite.channels.get((channel - 1) as usize) {
+                    doc.display_range = channel.display_range;
+                    doc.display_lut = (composite.mode != CompositeDisplayMode::Grayscale)
+                        .then(|| channel.lut.clone());
+                }
+            }
+        }
         doc.roi = relocated_roi;
         doc.threshold = None;
         if current_slice != 1 {
@@ -3081,6 +3211,21 @@ impl ImageDocument {
             PixelPlane::ColorRgb(_) => {
                 return Err(CoreError::InvalidOperation("RGB images do not use LUTs"));
             }
+            _ => {}
+        }
+        if self.composite_display.is_some() {
+            let channel_index = (self.get_channel() - 1) as usize;
+            let composite = self.composite_display.as_mut().unwrap();
+            let Some(channel) = composite.channels.get_mut(channel_index) else {
+                return Err(CoreError::InvalidOperation(
+                    "composite channel LUT state does not match image dimensions",
+                ));
+            };
+            channel.lut = channel.lut.inverted();
+            return Ok(());
+        }
+        match &self.slices[index] {
+            PixelPlane::ColorRgb(_) => unreachable!("RGB rejected above"),
             PixelPlane::Color256 { .. } => {
                 for plane in &mut self.slices {
                     if let PixelPlane::Color256 { lut, .. } = plane {
@@ -3096,35 +3241,49 @@ impl ImageDocument {
         Ok(())
     }
 
-    /// Applies the single-channel part of `InvertAllLuts.txt`: transform the
-    /// display LUT, then align the observable CompositeProjection property.
-    /// Multi-channel images need per-channel LUT storage and are rejected
-    /// explicitly rather than being treated as one shared LUT.
+    /// Applies `InvertAllLuts.txt`: transform every channel LUT, return to
+    /// channel 1, then align the observable CompositeProjection property.
+    /// Composite images use their per-channel LUT array. Ordinary multi-channel
+    /// ImagePlus values reuse one processor LUT, so the loop transforms that
+    /// shared LUT once per channel (ImagePlus.setSlice reuses the processor).
     pub fn invert_luts(&mut self) -> Result<(), CoreError> {
-        if self.n_channels != 1 {
-            return Err(CoreError::InvalidOperation(
-                "Invert LUTs does not support multi-channel images yet",
-            ));
-        }
         let index = self.current_slice_index();
-        match &self.slices[index] {
-            PixelPlane::ColorRgb(_) => {
-                return Err(CoreError::InvalidOperation("Non-RGB image expected"));
+        if matches!(self.slices[index], PixelPlane::ColorRgb(_)) {
+            return Err(CoreError::InvalidOperation("Non-RGB image expected"));
+        }
+
+        if let Some(composite) = &mut self.composite_display {
+            for channel in &mut composite.channels {
+                channel.lut = channel.lut.complement_hue_rotated();
             }
-            PixelPlane::Color256 { .. } => {
-                for plane in &mut self.slices {
-                    if let PixelPlane::Color256 { lut, .. } = plane {
-                        *lut = Box::new(lut.complement_hue_rotated());
+        } else {
+            for _ in 0..self.n_channels.max(1) {
+                match &self.slices[index] {
+                    PixelPlane::ColorRgb(_) => unreachable!("RGB rejected above"),
+                    PixelPlane::Color256 { .. } => {
+                        for plane in &mut self.slices {
+                            if let PixelPlane::Color256 { lut, .. } = plane {
+                                *lut = Box::new(lut.complement_hue_rotated());
+                            }
+                        }
+                    }
+                    PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
+                        let lut = self.display_lut.clone().unwrap_or_default();
+                        self.display_lut = Some(lut.complement_hue_rotated());
                     }
                 }
             }
-            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => {
-                let lut = self.display_lut.clone().unwrap_or_default();
-                self.display_lut = Some(lut.complement_hue_rotated());
-            }
         }
 
-        let inverted = self.current_lut_is_inverted();
+        self.set_position(1, self.get_slice() as i32, self.get_frame() as i32);
+        let inverted = if let Some(composite) = &self.composite_display {
+            composite
+                .channels
+                .first()
+                .is_some_and(|channel| channel.lut.is_inverted())
+        } else {
+            self.current_lut_is_inverted()
+        };
         let mode = self.composite_projection;
         let unchanged = (inverted
             && matches!(
@@ -3151,6 +3310,13 @@ impl ImageDocument {
     /// grayscale planes fall back to ImageJ's default grayscale LUT, which is
     /// represented by `None` until a command materializes an inversion.
     pub fn current_display_lut(&self) -> Option<&Lut256> {
+        if matches!(self.plane(), PixelPlane::ColorRgb(_)) {
+            return None;
+        }
+        if let Some(composite) = &self.composite_display {
+            let channel = (self.get_channel() - 1) as usize;
+            return composite.channels.get(channel).map(|channel| &channel.lut);
+        }
         match self.plane() {
             PixelPlane::Color256 { lut, .. } => Some(lut),
             PixelPlane::ColorRgb(_) => None,
@@ -3162,14 +3328,8 @@ impl ImageDocument {
 
     /// `ImageProcessor.isInvertedLut` for the current display LUT.
     pub fn current_lut_is_inverted(&self) -> bool {
-        match self.plane() {
-            PixelPlane::Color256 { lut, .. } => lut.is_inverted(),
-            PixelPlane::ColorRgb(_) => false,
-            PixelPlane::Gray8(_) | PixelPlane::Gray16(_) | PixelPlane::Gray32(_) => self
-                .display_lut
-                .as_ref()
-                .is_some_and(Lut256::is_inverted),
-        }
+        self.current_display_lut()
+            .is_some_and(Lut256::is_inverted)
     }
 
     /// Inverts the current stack slice, matching `run("Invert", "slice")`.
