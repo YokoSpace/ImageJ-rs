@@ -204,6 +204,14 @@ impl CompositeDisplay {
                 CompositeChannelDisplay { lut, display_range }
             })
             .collect();
+        // CompositeImage corrects an impossible composite-mode request to
+        // color mode when there are more than MAX_CHANNELS=8 channels
+        // (CompositeImage.java 66-67).
+        let mode = if mode == CompositeDisplayMode::Composite && channel_count > 8 {
+            CompositeDisplayMode::Color
+        } else {
+            mode
+        };
         Self {
             mode,
             channels,
@@ -2043,6 +2051,28 @@ impl ImageDocument {
     /// 1850-1875): negatives become zero, zero keeps the current coordinate,
     /// and values above the dimension are clamped. Like ImageJ, changing the
     /// displayed stack index discards the processor snapshot used by Undo.
+    /// CompositeImage.setDisplayRange writes both the current processor range
+    /// and the current channel LUT range (CompositeImage.java 678-686).
+    pub fn set_display_range(&mut self, range: DisplayRange) {
+        self.display_range = range;
+        let current = self.get_channel();
+        if let Some(composite) = &mut self.composite_display {
+            let channel = current.min(composite.channels.len() as u32).max(1);
+            if let Some(channel) = composite.channels.get_mut((channel - 1) as usize) {
+                channel.display_range = range;
+            }
+        }
+    }
+
+    fn sync_composite_display_range(&mut self) {
+        if let Some(composite) = &self.composite_display {
+            let channel = self.get_channel().min(composite.channels.len() as u32).max(1);
+            if let Some(channel) = composite.channels.get((channel - 1) as usize) {
+                self.display_range = channel.display_range;
+            }
+        }
+    }
+
     pub fn set_position(&mut self, channel: i32, slice: i32, frame: i32) {
         self.verify_dimensions();
         let mut c = channel.max(0) as u32;
@@ -2070,6 +2100,7 @@ impl ImageDocument {
             self.snapshot = None;
             self.snapshot_display_range = None;
         }
+        self.sync_composite_display_range();
     }
 
     /// ImagePlus.setPosition(int n) (original_imagej/ij/ImagePlus.java lines
@@ -2095,6 +2126,7 @@ impl ImageDocument {
             return Ok(());
         }
         self.set_current_slice(index as u32);
+        self.sync_composite_display_range();
         // ImagePlus.setSlice calls ip.setSnapshotPixels(null) when it switches
         // processors, so Undo no longer has a snapshot (ImagePlus.java
         // 1997-1999).
