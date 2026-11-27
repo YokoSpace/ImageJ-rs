@@ -169,6 +169,10 @@ pub struct CompositeChannelDisplay {
 pub struct CompositeDisplay {
     pub mode: CompositeDisplayMode,
     pub channels: Vec<CompositeChannelDisplay>,
+    /// CompositeImage.customLuts: whether channel LUTs were explicitly
+    /// replaced, independent of whether their entries differ from the defaults.
+    #[serde(default)]
+    pub custom_luts: bool,
 }
 
 impl CompositeDisplay {
@@ -200,7 +204,11 @@ impl CompositeDisplay {
                 CompositeChannelDisplay { lut, display_range }
             })
             .collect();
-        Self { mode, channels }
+        Self {
+            mode,
+            channels,
+            custom_luts: false,
+        }
     }
 }
 
@@ -3190,6 +3198,7 @@ impl ImageDocument {
                 ));
             };
             channel.lut = channel.lut.inverted();
+            composite.custom_luts = true;
             return Ok(());
         }
         match &self.slices[index] {
@@ -3224,6 +3233,7 @@ impl ImageDocument {
             for channel in &mut composite.channels {
                 channel.lut = channel.lut.complement_hue_rotated();
             }
+            composite.custom_luts = true;
         } else {
             for _ in 0..self.n_channels.max(1) {
                 match &self.slices[index] {
